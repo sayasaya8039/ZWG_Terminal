@@ -6,11 +6,24 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod app;
 mod shell;
+mod split;
 mod terminal;
 
 use gpui::*;
 
-actions!(zwg, [Quit, NewTab, CloseTab, SplitRight, SplitDown]);
+actions!(
+    zwg,
+    [
+        Quit,
+        NewTab,
+        CloseTab,
+        SplitRight,
+        SplitDown,
+        ClosePane,
+        FocusNext,
+        FocusPrev,
+    ]
+);
 
 fn main() {
     env_logger::Builder::from_env(
@@ -22,7 +35,20 @@ fn main() {
 
     let app = Application::new();
     app.run(|cx: &mut App| {
+        // Global actions
         cx.on_action(|_: &Quit, cx| cx.quit());
+
+        // Keybindings
+        cx.bind_keys([
+            KeyBinding::new("ctrl-shift-t", NewTab, None),
+            KeyBinding::new("ctrl-shift-w", CloseTab, None),
+            KeyBinding::new("ctrl-shift-d", SplitRight, None),
+            KeyBinding::new("ctrl-shift-e", SplitDown, None),
+            KeyBinding::new("ctrl-shift-x", ClosePane, None),
+            KeyBinding::new("ctrl-tab", FocusNext, None),
+            KeyBinding::new("ctrl-shift-tab", FocusPrev, None),
+            KeyBinding::new("ctrl-shift-q", Quit, None),
+        ]);
 
         let app_state = app::AppState::new(cx);
         let state = cx.new(|_cx| app_state);
@@ -43,8 +69,7 @@ fn main() {
         };
 
         cx.open_window(opts, |_window, cx| {
-            let view = cx.new(|cx| app::RootView::new(state.clone(), cx));
-            view
+            cx.new(|cx| app::RootView::new(state.clone(), cx))
         })
         .ok();
     });
