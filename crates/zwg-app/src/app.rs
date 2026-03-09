@@ -182,6 +182,14 @@ impl Render for RootView {
             .map(|(i, t)| (i, t.title.clone(), i == active_tab))
             .collect();
         let tab_count = state.tabs.len();
+        let shell_name = state.tabs.get(active_tab)
+            .map(|t| t.shell.clone())
+            .unwrap_or_default();
+
+        // Collect pane count from active split
+        let pane_count = active_split.as_ref().map(|s| {
+            s.read(cx).all_terminals().len()
+        }).unwrap_or(1);
 
         let _ = state; // release borrow
 
@@ -210,6 +218,8 @@ impl Render for RootView {
                     .overflow_hidden()
                     .children(active_split),
             )
+            // Status bar
+            .child(Self::render_status_bar(&shell_name, pane_count))
     }
 }
 
@@ -311,5 +321,57 @@ impl RootView {
             .border_color(rgb(SURFACE0))
             .children(tab_elements)
             .child(new_tab_btn)
+    }
+
+    fn render_status_bar(shell: &str, pane_count: usize) -> impl IntoElement {
+        let shell_display = shell
+            .rsplit(['\\', '/'])
+            .next()
+            .unwrap_or(shell)
+            .replace(".exe", "");
+
+        let version = env!("CARGO_PKG_VERSION");
+
+        let pane_info = if pane_count > 1 {
+            format!("{}P", pane_count)
+        } else {
+            String::new()
+        };
+
+        div()
+            .h(px(24.0))
+            .w_full()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px(px(12.0))
+            .bg(rgb(MANTLE))
+            .border_t_1()
+            .border_color(rgb(SURFACE0))
+            .text_size(px(11.0))
+            .text_color(rgb(SUBTEXT0))
+            .child({
+                // Left: shell name + pane count
+                let left = div()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .child(shell_display);
+                if pane_info.is_empty() {
+                    left
+                } else {
+                    left.child(
+                        div()
+                            .text_color(rgb(SURFACE1))
+                            .child(pane_info),
+                    )
+                }
+            })
+            .child(
+                // Right: version
+                div()
+                    .text_color(rgb(SURFACE1))
+                    .child(format!("ZWG v{}", version)),
+            )
     }
 }

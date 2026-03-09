@@ -10,7 +10,6 @@ const FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.3;
 
 /// Terminal pane: GPUI component that wraps a TerminalSurface
-#[allow(dead_code)]
 pub struct TerminalPane {
     surface: TerminalSurface,
     focus_handle: FocusHandle,
@@ -20,6 +19,9 @@ pub struct TerminalPane {
     /// Current terminal size in cells
     term_cols: u16,
     term_rows: u16,
+    /// Last known layout size for resize detection
+    last_width: f32,
+    last_height: f32,
 }
 
 impl TerminalPane {
@@ -64,11 +66,20 @@ impl TerminalPane {
             cell_height: FONT_SIZE * LINE_HEIGHT_FACTOR,
             term_cols: 80,
             term_rows: 24,
+            last_width: 0.0,
+            last_height: 0.0,
         }
     }
 
-    #[allow(dead_code)]
+    /// Recalculate terminal grid size from pixel dimensions
     fn handle_resize(&mut self, width_px: f32, height_px: f32) {
+        // Avoid resizing for tiny jitter
+        if (width_px - self.last_width).abs() < 2.0 && (height_px - self.last_height).abs() < 2.0 {
+            return;
+        }
+        self.last_width = width_px;
+        self.last_height = height_px;
+
         let new_cols = (width_px / self.cell_width).floor().max(1.0) as u16;
         let new_rows = (height_px / self.cell_height).floor().max(1.0) as u16;
 
@@ -78,10 +89,23 @@ impl TerminalPane {
             self.surface.resize(new_cols, new_rows);
         }
     }
+
+    /// Get current terminal dimensions for status bar
+    pub fn term_size(&self) -> (u16, u16) {
+        (self.term_cols, self.term_rows)
+    }
 }
 
 impl Render for TerminalPane {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Detect resize from viewport (approximate for single pane)
+        let vp = window.viewport_size();
+        let vp_w: f32 = vp.width.into();
+        let vp_h: f32 = vp.height.into();
+        // Subtract tab bar (36px) and some padding
+        let avail_h = (vp_h - 40.0).max(100.0);
+        self.handle_resize(vp_w, avail_h);
+
         let backend = self.surface.backend.lock();
         let rows = backend.rows;
         let (cursor_x, cursor_y) = backend.cursor_position();
@@ -237,8 +261,6 @@ fn render_styled_text(
         if run.flags & 0x01 != 0 {
             span = span.font_weight(FontWeight::BOLD);
         }
-        // Note: gpui Div doesn't support font_style directly;
-        // italic rendering will need a custom element in future
 
         children.push(span.into_any_element());
         covered_to = end;
