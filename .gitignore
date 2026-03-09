@@ -7,4 +7,4 @@
 *.exp
 .env
 *.log
-vendor/ghostty/
+# vendor/ghostty is a git submodule, do not ignore
