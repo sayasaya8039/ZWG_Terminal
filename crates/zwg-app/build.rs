@@ -4,6 +4,7 @@
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=../../resources/icons/zwg.ico");
 
     // Embed Windows icon and manifest
     #[cfg(windows)]
@@ -12,9 +13,7 @@ fn main() {
         res.set("ProductName", "ZWG Terminal");
         res.set("FileDescription", "ZWG Terminal — Ghostty-powered Windows terminal");
         res.set("LegalCopyright", "MIT License");
-
-        // Icon will be added in Phase 2 when we create the icon
-        // res.set_icon("../../resources/icons/zwg.ico");
+        res.set_icon("../../resources/icons/zwg.ico");
 
         if let Err(e) = res.compile() {
             eprintln!("Warning: Failed to compile Windows resources: {}", e);
