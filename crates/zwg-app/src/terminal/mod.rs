@@ -3,11 +3,14 @@
 pub mod pty;
 pub mod surface;
 pub mod view;
+#[cfg(not(feature = "ghostty_vt"))]
 pub mod vt_parser;
 
+#[cfg(not(feature = "ghostty_vt"))]
 use std::collections::VecDeque;
 
 /// Style information for a run of characters
+#[cfg(not(feature = "ghostty_vt"))]
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct StyleSpan {
@@ -17,6 +20,7 @@ pub struct StyleSpan {
     pub flags: u8,
 }
 
+#[cfg(not(feature = "ghostty_vt"))]
 impl StyleSpan {
     pub fn is_bold(&self) -> bool {
         self.flags & 0x01 != 0
@@ -36,6 +40,7 @@ impl StyleSpan {
 }
 
 /// A single terminal line with text and style runs
+#[cfg(not(feature = "ghostty_vt"))]
 #[derive(Debug, Clone)]
 pub struct TerminalLine {
     pub text: String,
@@ -44,6 +49,7 @@ pub struct TerminalLine {
     pub is_wrapped: bool,
 }
 
+#[cfg(not(feature = "ghostty_vt"))]
 impl TerminalLine {
     pub fn new() -> Self {
         Self {
@@ -61,6 +67,7 @@ impl TerminalLine {
 }
 
 /// Cursor state
+#[cfg(not(feature = "ghostty_vt"))]
 #[derive(Debug, Clone, Copy, Default)]
 pub struct CursorState {
     pub x: u16,
@@ -69,6 +76,7 @@ pub struct CursorState {
     pub shape: CursorShape,
 }
 
+#[cfg(not(feature = "ghostty_vt"))]
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum CursorShape {
     #[default]
@@ -82,6 +90,7 @@ pub const DEFAULT_FG: u32 = 0xcdd6f4;
 pub const DEFAULT_BG: u32 = 0x1e1e2e;
 
 /// Screen buffer holding viewport + scrollback
+#[cfg(not(feature = "ghostty_vt"))]
 pub struct ScreenBuffer {
     pub viewport: VecDeque<TerminalLine>,
     pub scrollback: VecDeque<TerminalLine>,
@@ -99,6 +108,7 @@ pub struct ScreenBuffer {
     pub row_generations: Vec<u64>,
 }
 
+#[cfg(not(feature = "ghostty_vt"))]
 impl ScreenBuffer {
     pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Self {
         Self {

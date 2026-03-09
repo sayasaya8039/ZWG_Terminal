@@ -10,6 +10,7 @@ const FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.3;
 
 /// Terminal pane: GPUI component that wraps a TerminalSurface
+#[allow(dead_code)]
 pub struct TerminalPane {
     surface: TerminalSurface,
     focus_handle: FocusHandle,
@@ -66,6 +67,7 @@ impl TerminalPane {
         }
     }
 
+    #[allow(dead_code)]
     fn handle_resize(&mut self, width_px: f32, height_px: f32) {
         let new_cols = (width_px / self.cell_width).floor().max(1.0) as u16;
         let new_rows = (height_px / self.cell_height).floor().max(1.0) as u16;
