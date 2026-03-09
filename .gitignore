@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+*.pdb
+*.exe
+*.dll
+*.lib
+*.exp
+.env
+*.log
+vendor/ghostty/

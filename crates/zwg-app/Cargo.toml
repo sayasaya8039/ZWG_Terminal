@@ -1,0 +1,37 @@
+[package]
+name = "zwg"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+default-run = "zwg"
+
+[[bin]]
+name = "zwg"
+path = "src/main.rs"
+
+[dependencies]
+gpui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+anyhow.workspace = true
+log.workspace = true
+env_logger.workspace = true
+uuid.workspace = true
+dirs.workspace = true
+parking_lot.workspace = true
+flume.workspace = true
+smallvec.workspace = true
+mimalloc.workspace = true
+windows.workspace = true
+libc.workspace = true
+unicode-width.workspace = true
+ghostty-vt = { path = "../ghostty-vt", optional = true }
+
+[build-dependencies]
+cc = "1"
+winresource = "0.1"
+
+[features]
+default = []
+ghostty_vt = ["dep:ghostty-vt"]

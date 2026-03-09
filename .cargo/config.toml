@@ -1,0 +1,5 @@
+[build]
+rustflags = ["-C", "target-cpu=native", "-C", "link-args=/STACK:8388608"]
+
+[registries.crates-io]
+protocol = "sparse"

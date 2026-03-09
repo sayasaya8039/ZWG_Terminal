@@ -1,0 +1,8 @@
+[package]
+name = "ghostty-vt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ghostty-vt-sys = { path = "../ghostty-vt-sys" }
