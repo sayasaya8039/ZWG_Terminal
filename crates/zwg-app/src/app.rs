@@ -3,6 +3,7 @@
 use gpui::*;
 use uuid::Uuid;
 
+use crate::config::AppConfig;
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::{ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, SplitDown, SplitRight};
 
@@ -28,14 +29,14 @@ pub struct Tab {
 pub struct AppState {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
-    pub default_shell: String,
+    pub config: AppConfig,
 }
 
 impl AppState {
     pub fn new(cx: &mut App) -> Self {
-        let default_shell = crate::shell::detect_default_shell();
+        let config = AppConfig::load();
         let id = Uuid::new_v4();
-        let shell = default_shell.clone();
+        let shell = config.shell.clone();
         let split = cx.new(|cx| SplitContainer::new(&shell, cx));
 
         Self {
@@ -46,13 +47,13 @@ impl AppState {
                 split,
             }],
             active_tab: 0,
-            default_shell,
+            config,
         }
     }
 
     pub fn add_tab(&mut self, cx: &mut App) {
         let id = Uuid::new_v4();
-        let shell = self.default_shell.clone();
+        let shell = self.config.shell.clone();
         let idx = self.tabs.len() + 1;
         let split = cx.new(|cx| SplitContainer::new(&shell, cx));
 
