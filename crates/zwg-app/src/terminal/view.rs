@@ -80,21 +80,19 @@ impl TerminalPane {
 
 impl Render for TerminalPane {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let screen = self.surface.screen.lock();
-        let rows = screen.rows as usize;
-        let cursor_x = screen.cursor.x;
-        let cursor_y = screen.cursor.y;
-        let cursor_visible = screen.cursor.visible;
+        let backend = self.surface.backend.lock();
+        let rows = backend.rows;
+        let (cursor_x, cursor_y) = backend.cursor_position();
 
-        let mut line_elements: Vec<AnyElement> = Vec::with_capacity(rows);
+        let mut line_elements: Vec<AnyElement> = Vec::with_capacity(rows as usize);
 
         for row in 0..rows {
-            let text = screen
-                .visible_line(row)
-                .map(|l| l.text.clone())
-                .unwrap_or_default();
+            let text = backend.row_text(row);
 
-            let is_cursor_row = cursor_visible && row == cursor_y as usize;
+            let is_cursor_row = row == cursor_y;
+
+            #[cfg(feature = "ghostty_vt")]
+            let style_runs = backend.row_style_runs(row);
 
             let row_el = div()
                 .h(px(self.cell_height))
@@ -117,9 +115,17 @@ impl Render for TerminalPane {
                     t
                 };
 
-                let row_with_text = row_el.child(
-                    div().pl(px(4.0)).child(display_text),
+                // Render styled text with style runs
+                #[cfg(feature = "ghostty_vt")]
+                let text_child = render_styled_text(
+                    &display_text,
+                    &style_runs,
+                    self.cell_width,
                 );
+                #[cfg(not(feature = "ghostty_vt"))]
+                let text_child = div().pl(px(4.0)).child(display_text);
+
+                let row_with_text = row_el.child(text_child);
 
                 let cursor_offset = cursor_col as f32 * self.cell_width + 4.0;
                 line_elements.push(
@@ -146,15 +152,25 @@ impl Render for TerminalPane {
                 } else {
                     text
                 };
+
+                #[cfg(feature = "ghostty_vt")]
+                let text_child = render_styled_text(
+                    &display,
+                    &style_runs,
+                    self.cell_width,
+                );
+                #[cfg(not(feature = "ghostty_vt"))]
+                let text_child = div().pl(px(4.0)).child(display);
+
                 line_elements.push(
                     row_el
-                        .child(div().pl(px(4.0)).child(display))
+                        .child(text_child)
                         .into_any_element(),
                 );
             }
         }
 
-        drop(screen);
+        drop(backend);
 
         div()
             .id("terminal-pane")
@@ -166,6 +182,78 @@ impl Render for TerminalPane {
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .children(line_elements)
     }
+}
+
+/// Render a row of text with Ghostty style runs applied
+#[cfg(feature = "ghostty_vt")]
+fn render_styled_text(
+    text: &str,
+    style_runs: &[ghostty_vt::StyleRun],
+    _cell_width: f32,
+) -> Div {
+    let container = div().pl(px(4.0)).flex().flex_row();
+
+    if style_runs.is_empty() || text.is_empty() {
+        return container.child(text.to_string());
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut children: Vec<AnyElement> = Vec::new();
+    let mut covered_to: usize = 0;
+
+    for run in style_runs {
+        let start = (run.start_col.saturating_sub(1)) as usize;
+        let end = run.end_col as usize;
+        if start >= chars.len() {
+            break;
+        }
+        let end = end.min(chars.len());
+
+        // Emit unstyled gap before this run
+        if covered_to < start {
+            let gap: String = chars[covered_to..start].iter().collect();
+            children.push(
+                div()
+                    .child(gap)
+                    .text_color(rgb(DEFAULT_FG))
+                    .into_any_element(),
+            );
+        }
+
+        let segment: String = chars[start..end].iter().collect();
+        let fg = rgb(((run.fg.r as u32) << 16) | ((run.fg.g as u32) << 8) | (run.fg.b as u32));
+        let bg_val = ((run.bg.r as u32) << 16) | ((run.bg.g as u32) << 8) | (run.bg.b as u32);
+
+        let mut span = div().child(segment).text_color(fg);
+
+        // Only set background if it differs from the terminal default
+        if bg_val != DEFAULT_BG {
+            span = span.bg(rgb(bg_val));
+        }
+
+        // Apply text styles from flags
+        if run.flags & 0x01 != 0 {
+            span = span.font_weight(FontWeight::BOLD);
+        }
+        // Note: gpui Div doesn't support font_style directly;
+        // italic rendering will need a custom element in future
+
+        children.push(span.into_any_element());
+        covered_to = end;
+    }
+
+    // Emit trailing unstyled text
+    if covered_to < chars.len() {
+        let tail: String = chars[covered_to..].iter().collect();
+        children.push(
+            div()
+                .child(tail)
+                .text_color(rgb(DEFAULT_FG))
+                .into_any_element(),
+        );
+    }
+
+    container.children(children)
 }
 
 impl TerminalPane {

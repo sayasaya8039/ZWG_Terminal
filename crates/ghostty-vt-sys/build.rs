@@ -39,8 +39,22 @@ fn main() {
     std::fs::create_dir_all(&zig_global_cache).ok();
 
     let prefix_str = prefix.display().to_string();
+    let mut args = vec![
+        "build".to_string(),
+        "-Doptimize=ReleaseFast".to_string(),
+        "-p".to_string(),
+        prefix_str.clone(),
+    ];
+
+    // When targeting MSVC, tell Zig to emit MSVC-compatible objects
+    // so that `link.exe` can resolve symbols like `__chkstk` correctly.
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if target.contains("msvc") {
+        args.push("-Dtarget=x86_64-windows-msvc".to_string());
+    }
+
     let status = Command::new(&zig)
-        .args(["build", "-Doptimize=ReleaseFast", "-p", &prefix_str])
+        .args(&args)
         .env("ZIG_GLOBAL_CACHE_DIR", &zig_global_cache)
         .current_dir(&zig_dir)
         .status()
@@ -53,7 +67,13 @@ fn main() {
     let lib_dir = prefix.join("lib");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=static=ghostty_vt");
-    println!("cargo:rustc-link-lib=c");
+
+    // On MSVC, the C runtime (msvcrt) is linked automatically.
+    // Only emit -lc on non-MSVC targets (e.g. gnu/mingw).
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if !target.contains("msvc") {
+        println!("cargo:rustc-link-lib=c");
+    }
 }
 
 fn find_zig() -> PathBuf {

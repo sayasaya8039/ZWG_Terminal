@@ -33,5 +33,5 @@ cc = "1"
 winresource = "0.1"
 
 [features]
-default = []
+default = ["ghostty_vt"]
 ghostty_vt = ["dep:ghostty-vt"]
