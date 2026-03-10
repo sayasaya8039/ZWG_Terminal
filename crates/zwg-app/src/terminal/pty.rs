@@ -17,7 +17,7 @@ pub struct ConPtyConfig {
 impl Default for ConPtyConfig {
     fn default() -> Self {
         Self {
-            shell: crate::shell::detect_default_shell(),
+            shell: String::new(),
             working_directory: None,
             env: Vec::new(),
             cols: 80,

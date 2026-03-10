@@ -183,18 +183,119 @@ impl Render for RootView {
             .map(|(i, t)| (i, t.title.clone(), i == active_tab))
             .collect();
         let tab_count = state.tabs.len();
-        let shell_name = state.tabs.get(active_tab)
+        let shell_name = state
+            .tabs
+            .get(active_tab)
             .map(|t| t.shell.clone())
             .unwrap_or_default();
 
         // Collect pane count from active split
-        let pane_count = active_split.as_ref().map(|s| {
-            s.read(cx).all_terminals().len()
-        }).unwrap_or(1);
+        let pane_count = active_split
+            .as_ref()
+            .map(|s| s.read(cx).all_terminals().len())
+            .unwrap_or(1);
 
         let _ = state; // release borrow
 
-        let state_entity = self.state.clone();
+        // Build tab elements inline — cx.listener() needs &mut Context<Self>
+        let mut tab_elements: Vec<AnyElement> = Vec::new();
+
+        for (idx, title, is_active) in &tab_infos {
+            let idx = *idx;
+            let is_active = *is_active;
+
+            let mut tab = div()
+                .id(ElementId::Name(format!("tab-{}", idx).into()))
+                .px(px(14.0))
+                .py(px(5.0))
+                .mx(px(2.0))
+                .rounded(px(6.0))
+                .cursor_pointer()
+                .text_size(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .on_mouse_down(
+                    gpui::MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                        this.state.update(cx, |s, _cx| {
+                            s.active_tab = idx;
+                        });
+                        cx.notify();
+                    }),
+                );
+
+            if is_active {
+                tab = tab.bg(rgb(BASE)).text_color(rgb(TEXT));
+            } else {
+                tab = tab
+                    .bg(rgb(MANTLE))
+                    .text_color(rgb(SUBTEXT0))
+                    .hover(|s| s.bg(rgb(SURFACE0)));
+            }
+
+            tab = tab.child(title.clone());
+
+            // Close button (only show if more than 1 tab)
+            if tab_count > 1 {
+                tab = tab.child(
+                    div()
+                        .id(ElementId::Name(format!("tab-close-{}", idx).into()))
+                        .text_size(px(10.0))
+                        .text_color(rgb(SURFACE1))
+                        .hover(|s| s.text_color(rgb(RED)))
+                        .cursor_pointer()
+                        .rounded(px(3.0))
+                        .px(px(3.0))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                this.state.update(cx, |s, _cx| {
+                                    s.close_tab(idx);
+                                });
+                                cx.notify();
+                            }),
+                        )
+                        .child("×"),
+                );
+            }
+
+            tab_elements.push(tab.into_any_element());
+        }
+
+        // New tab button
+        let new_tab_btn = div()
+            .id("new-tab-btn")
+            .px(px(8.0))
+            .py(px(5.0))
+            .mx(px(2.0))
+            .rounded(px(6.0))
+            .cursor_pointer()
+            .text_size(px(14.0))
+            .text_color(rgb(SURFACE1))
+            .hover(|s| s.text_color(rgb(GREEN)).bg(rgb(SURFACE0)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.state.update(cx, |s, cx| {
+                        s.add_tab(cx);
+                    });
+                    cx.notify();
+                }),
+            )
+            .child("+");
+
+        let tab_bar = div()
+            .id("tab-bar")
+            .h(px(36.0))
+            .w_full()
+            .flex()
+            .items_center()
+            .bg(rgb(MANTLE))
+            .border_b_1()
+            .border_color(rgb(SURFACE0))
+            .children(tab_elements)
+            .child(new_tab_btn);
 
         div()
             .id("root")
@@ -211,7 +312,7 @@ impl Render for RootView {
             .on_action(cx.listener(Self::on_focus_next))
             .on_action(cx.listener(Self::on_focus_prev))
             // Tab bar
-            .child(Self::render_tab_bar(&tab_infos, tab_count, state_entity))
+            .child(tab_bar)
             // Active pane area
             .child(
                 div()
@@ -225,105 +326,6 @@ impl Render for RootView {
 }
 
 impl RootView {
-    fn render_tab_bar(
-        tabs: &[(usize, String, bool)],
-        tab_count: usize,
-        state: Entity<AppState>,
-    ) -> impl IntoElement {
-        let mut tab_elements: Vec<AnyElement> = Vec::new();
-
-        for (idx, title, is_active) in tabs {
-            let idx = *idx;
-            let is_active = *is_active;
-            let state_for_click = state.clone();
-            let state_for_close = state.clone();
-
-            let mut tab = div()
-                .id(ElementId::Name(format!("tab-{}", idx).into()))
-                .px(px(14.0))
-                .py(px(5.0))
-                .mx(px(2.0))
-                .rounded(px(6.0))
-                .cursor_pointer()
-                .text_size(px(12.0))
-                .flex()
-                .items_center()
-                .gap(px(8.0))
-                .on_click(move |_event, _window, cx| {
-                    state_for_click.update(cx, |s, cx| {
-                        s.active_tab = idx;
-                        cx.notify();
-                    });
-                });
-
-            if is_active {
-                tab = tab.bg(rgb(BASE)).text_color(rgb(TEXT));
-            } else {
-                tab = tab
-                    .bg(rgb(MANTLE))
-                    .text_color(rgb(SUBTEXT0))
-                    .hover(|s| s.bg(rgb(SURFACE0)));
-            }
-
-            // Tab title
-            tab = tab.child(title.clone());
-
-            // Close button (only show if more than 1 tab)
-            if tab_count > 1 {
-                tab = tab.child(
-                    div()
-                        .id(ElementId::Name(format!("tab-close-{}", idx).into()))
-                        .text_size(px(10.0))
-                        .text_color(rgb(SURFACE1))
-                        .hover(|s| s.text_color(rgb(RED)))
-                        .cursor_pointer()
-                        .rounded(px(3.0))
-                        .px(px(3.0))
-                        .on_click(move |_event, _window, cx| {
-                            state_for_close.update(cx, |s, cx| {
-                                s.close_tab(idx);
-                                cx.notify();
-                            });
-                        })
-                        .child("×"),
-                );
-            }
-
-            tab_elements.push(tab.into_any_element());
-        }
-
-        // New tab button
-        let state_for_new = state.clone();
-        let new_tab_btn = div()
-            .id("new-tab-btn")
-            .px(px(8.0))
-            .py(px(5.0))
-            .mx(px(2.0))
-            .rounded(px(6.0))
-            .cursor_pointer()
-            .text_size(px(14.0))
-            .text_color(rgb(SURFACE1))
-            .hover(|s| s.text_color(rgb(GREEN)).bg(rgb(SURFACE0)))
-            .on_click(move |_event, _window, cx| {
-                state_for_new.update(cx, |s, cx| {
-                    s.add_tab(cx);
-                    cx.notify();
-                });
-            })
-            .child("+");
-
-        div()
-            .h(px(36.0))
-            .w_full()
-            .flex()
-            .items_center()
-            .bg(rgb(MANTLE))
-            .border_b_1()
-            .border_color(rgb(SURFACE0))
-            .children(tab_elements)
-            .child(new_tab_btn)
-    }
-
     fn render_status_bar(shell: &str, pane_count: usize) -> impl IntoElement {
         let shell_display = shell
             .rsplit(['\\', '/'])

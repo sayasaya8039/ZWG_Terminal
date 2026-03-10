@@ -1,7 +1,10 @@
 //! Terminal pane — GPUI view that renders the terminal and handles input
 
+use std::sync::Arc;
+
 use gpui::*;
 
+use super::pty::{ConPtyConfig, spawn_pty};
 use super::surface::TerminalSurface;
 use super::{DEFAULT_BG, DEFAULT_FG};
 
@@ -9,10 +12,26 @@ const FONT_FAMILY: &str = "Cascadia Code";
 const FONT_SIZE: f32 = 14.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.3;
 
+// Catppuccin Mocha palette for status text
+const SUBTEXT0: u32 = 0xa6adc8;
+const SURFACE0: u32 = 0x313244;
+const RED: u32 = 0xf38ba8;
+
+/// Terminal connection state — two-phase init pattern
+enum TerminalState {
+    /// PTY is being spawned in background
+    Pending,
+    /// PTY is connected and running
+    Running,
+    /// PTY spawn failed
+    Failed(String),
+}
+
 /// Terminal pane: GPUI component that wraps a TerminalSurface
 pub struct TerminalPane {
     surface: TerminalSurface,
     focus_handle: FocusHandle,
+    state: TerminalState,
     /// Cached cell dimensions
     cell_width: f32,
     cell_height: f32,
@@ -27,11 +46,49 @@ pub struct TerminalPane {
 impl TerminalPane {
     pub fn new(shell: &str, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        let mut surface = TerminalSurface::new(80, 24);
+        let surface = TerminalSurface::new(80, 24);
 
-        if let Err(e) = surface.spawn(shell) {
-            log::error!("Failed to spawn shell '{}': {}", shell, e);
-        }
+        // Phase A: Return immediately with Pending state (<1ms)
+        // Phase B: Spawn PTY in background thread
+        let shell_owned = shell.to_string();
+        cx.spawn(async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
+            // Run ConPTY creation on background executor (off UI thread)
+            let shell_for_spawn = shell_owned.clone();
+            let pty_result = cx
+                .background_executor()
+                .spawn(async move {
+                    let config = ConPtyConfig {
+                        shell: shell_for_spawn,
+                        cols: 80,
+                        rows: 24,
+                        working_directory: None,
+                        env: Vec::new(),
+                    };
+                    spawn_pty(config)
+                })
+                .await;
+
+            // Phase C: Attach PTY to surface on executor context
+            let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
+                match pty_result {
+                    Ok(pty) => {
+                        if let Err(e) = pane.surface.attach_pty(Arc::new(pty)) {
+                            pane.state = TerminalState::Failed(e.to_string());
+                            log::error!("Failed to attach PTY: {}", e);
+                        } else {
+                            pane.state = TerminalState::Running;
+                            log::info!("PTY connected for shell: {}", shell_owned);
+                        }
+                    }
+                    Err(e) => {
+                        pane.state = TerminalState::Failed(e.to_string());
+                        log::error!("Failed to spawn shell: {}", e);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
 
         // Poll for PTY output every 16ms (~60fps)
         cx.spawn(async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
@@ -62,6 +119,7 @@ impl TerminalPane {
         Self {
             surface,
             focus_handle,
+            state: TerminalState::Pending,
             cell_width: 8.4,
             cell_height: FONT_SIZE * LINE_HEIGHT_FACTOR,
             term_cols: 80,
@@ -73,7 +131,6 @@ impl TerminalPane {
 
     /// Recalculate terminal grid size from pixel dimensions
     fn handle_resize(&mut self, width_px: f32, height_px: f32) {
-        // Avoid resizing for tiny jitter
         if (width_px - self.last_width).abs() < 2.0 && (height_px - self.last_height).abs() < 2.0 {
             return;
         }
@@ -90,23 +147,78 @@ impl TerminalPane {
         }
     }
 
-    /// Get current terminal dimensions for status bar
-    pub fn term_size(&self) -> (u16, u16) {
-        (self.term_cols, self.term_rows)
+    /// Render the "Connecting..." placeholder
+    fn render_pending(&self) -> impl IntoElement {
+        div()
+            .id("terminal-pane")
+            .size_full()
+            .bg(rgb(DEFAULT_BG))
+            .track_focus(&self.focus_handle)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(SUBTEXT0))
+                            .child("Starting shell..."),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(SURFACE0))
+                            .child("Initializing ConPTY"),
+                    ),
+            )
     }
-}
 
-impl Render for TerminalPane {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Detect resize from viewport (approximate for single pane)
+    /// Render the error state
+    fn render_failed(&self, error: &str) -> impl IntoElement {
+        div()
+            .id("terminal-pane")
+            .size_full()
+            .bg(rgb(DEFAULT_BG))
+            .track_focus(&self.focus_handle)
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(rgb(RED))
+                            .child("Failed to start shell"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(rgb(SUBTEXT0))
+                            .child(error.to_string()),
+                    ),
+            )
+    }
+
+    /// Render the running terminal
+    fn render_running(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Detect resize from viewport
         let vp = window.viewport_size();
         let vp_w: f32 = vp.width.into();
         let vp_h: f32 = vp.height.into();
-        // Subtract tab bar (36px) and some padding
         let avail_h = (vp_h - 40.0).max(100.0);
         self.handle_resize(vp_w, avail_h);
 
-        // Snapshot backend state under brief lock — release before building UI
+        // Snapshot backend state under brief lock
         let rows: u16;
         let cursor_x: u16;
         let cursor_y: u16;
@@ -117,7 +229,6 @@ impl Render for TerminalPane {
             let backend = self.surface.backend.lock();
             rows = backend.rows;
             let pos = backend.cursor_position();
-            // ghostty-vt returns 1-based coordinates; convert to 0-based
             cursor_x = pos.0.saturating_sub(1);
             cursor_y = pos.1.saturating_sub(1);
             row_texts = (0..rows).map(|r| backend.row_text(r)).collect();
@@ -126,7 +237,6 @@ impl Render for TerminalPane {
                 row_styles = (0..rows).map(|r| backend.row_style_runs(r)).collect();
             }
         }
-        // Mutex released — PTY reader thread unblocked
 
         let mut line_elements: Vec<AnyElement> = Vec::with_capacity(rows as usize);
 
@@ -159,32 +269,18 @@ impl Render for TerminalPane {
                     t
                 };
 
-                // Split text at cursor position for inline cursor rendering
                 let chars: Vec<char> = display_text.chars().collect();
-                let before_cursor: String = chars[..cursor_col.min(chars.len())].iter().collect();
-                let cursor_char: String = if cursor_col < chars.len() {
-                    chars[cursor_col].to_string()
-                } else {
-                    " ".to_string()
-                };
-                let after_cursor: String = if cursor_col + 1 < chars.len() {
-                    chars[cursor_col + 1..].iter().collect()
-                } else {
-                    String::new()
-                };
+                let before_cursor: String =
+                    chars[..cursor_col.min(chars.len())].iter().collect();
 
                 #[cfg(feature = "ghostty_vt")]
-                let text_child = render_styled_text(
-                    &display_text,
-                    style_runs,
-                    self.cell_width,
-                );
+                let text_child =
+                    render_styled_text(&display_text, style_runs, self.cell_width);
                 #[cfg(not(feature = "ghostty_vt"))]
                 let text_child = div().pl(px(4.0)).child(display_text);
 
                 let row_with_text = row_el.child(text_child);
 
-                // Cursor overlay: use invisible text spacer for pixel-perfect positioning
                 let cursor_overlay = div()
                     .absolute()
                     .top_0()
@@ -197,14 +293,12 @@ impl Render for TerminalPane {
                     .font_family(FONT_FAMILY)
                     .overflow_hidden()
                     .child(
-                        // Invisible spacer: renders same text before cursor
                         div()
                             .pl(px(4.0))
                             .text_color(rgba(0x00000000))
                             .child(before_cursor),
                     )
                     .child(
-                        // Visible cursor block
                         div()
                             .w(px(self.cell_width))
                             .h(px(self.cell_height))
@@ -229,19 +323,12 @@ impl Render for TerminalPane {
                 };
 
                 #[cfg(feature = "ghostty_vt")]
-                let text_child = render_styled_text(
-                    &display,
-                    style_runs,
-                    self.cell_width,
-                );
+                let text_child =
+                    render_styled_text(&display, style_runs, self.cell_width);
                 #[cfg(not(feature = "ghostty_vt"))]
                 let text_child = div().pl(px(4.0)).child(display);
 
-                line_elements.push(
-                    row_el
-                        .child(text_child)
-                        .into_any_element(),
-                );
+                line_elements.push(row_el.child(text_child).into_any_element());
             }
         }
 
@@ -254,6 +341,19 @@ impl Render for TerminalPane {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .children(line_elements)
+    }
+}
+
+impl Render for TerminalPane {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        match &self.state {
+            TerminalState::Pending => self.render_pending().into_any_element(),
+            TerminalState::Failed(err) => {
+                let err = err.clone();
+                self.render_failed(&err).into_any_element()
+            }
+            TerminalState::Running => self.render_running(window, cx).into_any_element(),
+        }
     }
 }
 
@@ -282,7 +382,6 @@ fn render_styled_text(
         }
         let end = end.min(chars.len());
 
-        // Emit unstyled gap before this run
         if covered_to < start {
             let gap: String = chars[covered_to..start].iter().collect();
             children.push(
@@ -295,16 +394,15 @@ fn render_styled_text(
 
         let segment: String = chars[start..end].iter().collect();
         let fg = rgb(((run.fg.r as u32) << 16) | ((run.fg.g as u32) << 8) | (run.fg.b as u32));
-        let bg_val = ((run.bg.r as u32) << 16) | ((run.bg.g as u32) << 8) | (run.bg.b as u32);
+        let bg_val =
+            ((run.bg.r as u32) << 16) | ((run.bg.g as u32) << 8) | (run.bg.b as u32);
 
         let mut span = div().child(segment).text_color(fg);
 
-        // Only set background if it differs from the terminal default
         if bg_val != DEFAULT_BG {
             span = span.bg(rgb(bg_val));
         }
 
-        // Apply text styles from flags
         if run.flags & 0x01 != 0 {
             span = span.font_weight(FontWeight::BOLD);
         }
@@ -313,7 +411,6 @@ fn render_styled_text(
         covered_to = end;
     }
 
-    // Emit trailing unstyled text
     if covered_to < chars.len() {
         let tail: String = chars[covered_to..].iter().collect();
         children.push(
@@ -329,6 +426,11 @@ fn render_styled_text(
 
 impl TerminalPane {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        // Ignore input while PTY is not connected
+        if !matches!(self.state, TerminalState::Running) {
+            return;
+        }
+
         let ks = &event.keystroke;
 
         // Try key_char first (IME / composed input)

@@ -237,12 +237,65 @@ impl TerminalSurface {
         }
     }
 
+    /// Attach an already-spawned PTY and start the reader thread.
+    /// Called from async context after background PTY creation.
+    pub fn attach_pty(&mut self, pty: Arc<PtyPair>) -> std::io::Result<()> {
+        self.pty = Some(pty.clone());
+
+        // Resize PTY to current backend dimensions
+        let (cols, rows) = {
+            let b = self.backend.lock();
+            (b.cols, b.rows)
+        };
+        let _ = pty.resize(cols, rows);
+
+        // Start reader thread (same logic as spawn)
+        let reader = pty.reader();
+        let backend = self.backend.clone();
+        let event_tx = self.event_tx.clone();
+        let stop_flag = self.stop_flag.clone();
+
+        let handle = std::thread::Builder::new()
+            .name("zwg-pty-reader".into())
+            .spawn(move || {
+                let mut buf = [0u8; 65536];
+                loop {
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let n = {
+                        let mut guard = reader.lock();
+                        match guard.read(&mut buf) {
+                            Ok(0) => break,
+                            Ok(n) => n,
+                            Err(_) => break,
+                        }
+                    };
+                    {
+                        let mut b = backend.lock();
+                        b.feed(&buf[..n]);
+                    }
+                    let _ = event_tx.try_send(TerminalEvent::OutputReceived);
+                }
+                log::debug!("PTY reader thread exiting");
+                let _ = event_tx.try_send(TerminalEvent::ProcessExited(0));
+            })?;
+
+        self.reader_handle = Some(handle);
+        Ok(())
+    }
+
     /// Resize the terminal
     pub fn resize(&self, cols: u16, rows: u16) {
         self.backend.lock().resize(cols, rows);
         if let Some(ref pty) = self.pty {
             let _ = pty.resize(cols, rows);
         }
+    }
+
+    /// Check if the PTY is connected
+    pub fn is_connected(&self) -> bool {
+        self.pty.is_some()
     }
 }
 
