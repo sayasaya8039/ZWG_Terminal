@@ -154,10 +154,10 @@ impl AppConfig {
         let path = Self::config_path();
         if path.exists() {
             match std::fs::read_to_string(&path) {
-                Ok(content) => match serde_json::from_str(&content) {
+                Ok(content) => match serde_json::from_str::<AppConfig>(&content) {
                     Ok(config) => {
                         log::info!("Loaded config from {:?}", path);
-                        return config;
+                        return config.validated();
                     }
                     Err(e) => log::warn!("Invalid config file: {}", e),
                 },
@@ -165,6 +165,18 @@ impl AppConfig {
             }
         }
         Self::default()
+    }
+
+    /// Clamp config values to safe ranges
+    fn validated(mut self) -> Self {
+        if self.shell.trim().is_empty() {
+            log::warn!("Empty shell in config, using default");
+            self.shell = crate::shell::detect_default_shell();
+        }
+        self.scrollback_lines = self.scrollback_lines.clamp(100, 100_000);
+        self.font.size = self.font.size.clamp(6.0, 72.0);
+        self.font.line_height = self.font.line_height.clamp(1.0, 3.0);
+        self
     }
 
     /// Save config to disk

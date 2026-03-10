@@ -126,6 +126,18 @@ mod windows_impl {
     };
     use windows::core::{PCWSTR, PWSTR};
 
+    /// Validate that a shell path doesn't contain obvious injection characters
+    fn validate_shell_path(path: &str) -> io::Result<()> {
+        let forbidden = ['|', '&', ';', '`', '$', '(', ')', '{', '}', '<', '>'];
+        if path.chars().any(|c| forbidden.contains(&c)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Shell path contains forbidden character: {}", path),
+            ));
+        }
+        Ok(())
+    }
+
     fn split_shell_command(shell: &str) -> (String, String) {
         let trimmed = shell.trim();
         if trimmed.is_empty() {
@@ -173,6 +185,9 @@ mod windows_impl {
     }
 
     pub fn spawn(config: &ConPtyConfig) -> io::Result<PtyPair> {
+        // Validate shell path before proceeding
+        validate_shell_path(&config.shell)?;
+
         unsafe {
             let mut pty_input_read = HANDLE::default();
             let mut pty_input_write = HANDLE::default();
