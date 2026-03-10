@@ -190,7 +190,7 @@ impl TerminalSurface {
         let handle = std::thread::Builder::new()
             .name("zwg-pty-reader".into())
             .spawn(move || {
-                let mut buf = [0u8; 8192];
+                let mut buf = [0u8; 65536];
                 loop {
                     // H2: check stop flag before blocking read
                     if stop_flag.load(Ordering::Relaxed) {
@@ -206,7 +206,7 @@ impl TerminalSurface {
                         }
                     };
 
-                    // Feed PTY output directly into terminal backend
+                    // Feed PTY output into terminal backend
                     {
                         let mut b = backend.lock();
                         b.feed(&buf[..n]);

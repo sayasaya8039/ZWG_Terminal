@@ -124,7 +124,7 @@ mod windows_impl {
         CreateProcessW, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
         InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
         PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, STARTUPINFOEXW,
-        UpdateProcThreadAttribute, CREATE_UNICODE_ENVIRONMENT,
+        UpdateProcThreadAttribute, CREATE_UNICODE_ENVIRONMENT, STARTF_USESTDHANDLES,
     };
     use windows::core::{PCWSTR, PWSTR};
 
@@ -404,6 +404,12 @@ mod windows_impl {
             let mut si = STARTUPINFOEXW::default();
             si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
             si.lpAttributeList = attr_list;
+            // Fix: Prevent parent's redirected stdout/stderr from being duplicated
+            // to the child. Without this flag, when the parent process runs inside
+            // another terminal (e.g., Claude Code, VS Code), Windows duplicates the
+            // parent's non-console handles to the child, bypassing ConPTY entirely.
+            // See: https://github.com/microsoft/terminal/issues/11276
+            si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
 
             let mut pi = PROCESS_INFORMATION::default();
             let (exe, args) = split_shell_command(&config.shell);

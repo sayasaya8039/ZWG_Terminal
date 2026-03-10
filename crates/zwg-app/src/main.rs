@@ -41,7 +41,7 @@ fn main() {
         // Global actions
         cx.on_action(|_: &Quit, cx| cx.quit());
 
-        // M8: TODO — load keybindings from config file instead of hardcoding
+        // Keybindings
         cx.bind_keys([
             KeyBinding::new("ctrl-shift-t", NewTab, None),
             KeyBinding::new("ctrl-shift-w", CloseTab, None),

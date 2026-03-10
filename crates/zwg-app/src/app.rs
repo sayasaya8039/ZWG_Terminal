@@ -3,9 +3,19 @@
 use gpui::*;
 use uuid::Uuid;
 
-use crate::config::{AppConfig, RenderConfig};
+use crate::config::AppConfig;
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::{ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, SplitDown, SplitRight};
+
+// Catppuccin Mocha palette
+const BASE: u32 = 0x1e1e2e;
+const MANTLE: u32 = 0x181825;
+const SURFACE0: u32 = 0x313244;
+const SURFACE1: u32 = 0x45475a;
+const TEXT: u32 = 0xcdd6f4;
+const SUBTEXT0: u32 = 0xa6adc8;
+const RED: u32 = 0xf38ba8;
+const GREEN: u32 = 0xa6e3a1;
 
 /// Per-tab state
 pub struct Tab {
@@ -20,20 +30,14 @@ pub struct AppState {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     pub config: AppConfig,
-    /// C3: cached render config from active theme
-    pub render_config: RenderConfig,
-    /// L4: monotonic counter for unique tab titles
-    tab_counter: usize,
 }
 
 impl AppState {
     pub fn new(cx: &mut App) -> Self {
         let config = AppConfig::load();
-        let render_config = config.render_config();
         let id = Uuid::new_v4();
         let shell = config.shell.clone();
-        let rc = render_config.clone();
-        let split = cx.new(|cx| SplitContainer::new(&shell, &rc, cx));
+        let split = cx.new(|cx| SplitContainer::new(&shell, cx));
 
         Self {
             tabs: vec![Tab {
@@ -44,19 +48,14 @@ impl AppState {
             }],
             active_tab: 0,
             config,
-            render_config,
-            tab_counter: 1,
         }
     }
 
     pub fn add_tab(&mut self, cx: &mut App) {
         let id = Uuid::new_v4();
         let shell = self.config.shell.clone();
-        // L4: use monotonic counter for unique tab titles
-        self.tab_counter += 1;
-        let idx = self.tab_counter;
-        let rc = self.render_config.clone();
-        let split = cx.new(|cx| SplitContainer::new(&shell, &rc, cx));
+        let idx = self.tabs.len() + 1;
+        let split = cx.new(|cx| SplitContainer::new(&shell, cx));
 
         self.tabs.push(Tab {
             id,
@@ -175,16 +174,6 @@ impl Render for RootView {
         let state = self.state.read(cx);
         let active_tab = state.active_tab;
         let active_split = state.tabs.get(active_tab).map(|t| t.split.clone());
-        // C3: use theme colors from config
-        let theme = &state.render_config.theme;
-        let base = theme.base;
-        let mantle = theme.mantle;
-        let surface0 = theme.surface0;
-        let surface1 = theme.surface1;
-        let text_color = theme.text;
-        let subtext0 = theme.subtext0;
-        let red = theme.red;
-        let green = theme.green;
 
         // Collect tab info for rendering
         let tab_infos: Vec<(usize, String, bool)> = state
@@ -194,17 +183,14 @@ impl Render for RootView {
             .map(|(i, t)| (i, t.title.clone(), i == active_tab))
             .collect();
         let tab_count = state.tabs.len();
-        let shell_name = state
-            .tabs
-            .get(active_tab)
+        let shell_name = state.tabs.get(active_tab)
             .map(|t| t.shell.clone())
             .unwrap_or_default();
 
         // Collect pane count from active split
-        let pane_count = active_split
-            .as_ref()
-            .map(|s| s.read(cx).all_terminals().len())
-            .unwrap_or(1);
+        let pane_count = active_split.as_ref().map(|s| {
+            s.read(cx).all_terminals().len()
+        }).unwrap_or(1);
 
         let _ = state; // release borrow
 
@@ -215,7 +201,7 @@ impl Render for RootView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(base))
+            .bg(rgb(BASE))
             // Action handlers on the root element
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_close_tab))
@@ -225,19 +211,7 @@ impl Render for RootView {
             .on_action(cx.listener(Self::on_focus_next))
             .on_action(cx.listener(Self::on_focus_prev))
             // Tab bar
-            .child(Self::render_tab_bar(
-                &tab_infos,
-                tab_count,
-                state_entity,
-                base,
-                mantle,
-                surface0,
-                surface1,
-                text_color,
-                subtext0,
-                red,
-                green,
-            ))
+            .child(Self::render_tab_bar(&tab_infos, tab_count, state_entity))
             // Active pane area
             .child(
                 div()
@@ -246,31 +220,15 @@ impl Render for RootView {
                     .children(active_split),
             )
             // Status bar
-            .child(Self::render_status_bar(
-                &shell_name,
-                pane_count,
-                mantle,
-                surface0,
-                surface1,
-                subtext0,
-            ))
+            .child(Self::render_status_bar(&shell_name, pane_count))
     }
 }
 
 impl RootView {
-    #[allow(clippy::too_many_arguments)]
     fn render_tab_bar(
         tabs: &[(usize, String, bool)],
         tab_count: usize,
         state: Entity<AppState>,
-        base: u32,
-        mantle: u32,
-        surface0: u32,
-        surface1: u32,
-        text_color: u32,
-        subtext0: u32,
-        red: u32,
-        green: u32,
     ) -> impl IntoElement {
         let mut tab_elements: Vec<AnyElement> = Vec::new();
 
@@ -299,12 +257,12 @@ impl RootView {
                 });
 
             if is_active {
-                tab = tab.bg(rgb(base)).text_color(rgb(text_color));
+                tab = tab.bg(rgb(BASE)).text_color(rgb(TEXT));
             } else {
                 tab = tab
-                    .bg(rgb(mantle))
-                    .text_color(rgb(subtext0))
-                    .hover(|s| s.bg(rgb(surface0)));
+                    .bg(rgb(MANTLE))
+                    .text_color(rgb(SUBTEXT0))
+                    .hover(|s| s.bg(rgb(SURFACE0)));
             }
 
             // Tab title
@@ -316,8 +274,8 @@ impl RootView {
                     div()
                         .id(ElementId::Name(format!("tab-close-{}", idx).into()))
                         .text_size(px(10.0))
-                        .text_color(rgb(surface1))
-                        .hover(|s| s.text_color(rgb(red)))
+                        .text_color(rgb(SURFACE1))
+                        .hover(|s| s.text_color(rgb(RED)))
                         .cursor_pointer()
                         .rounded(px(3.0))
                         .px(px(3.0))
@@ -344,8 +302,8 @@ impl RootView {
             .rounded(px(6.0))
             .cursor_pointer()
             .text_size(px(14.0))
-            .text_color(rgb(surface1))
-            .hover(|s| s.text_color(rgb(green)).bg(rgb(surface0)))
+            .text_color(rgb(SURFACE1))
+            .hover(|s| s.text_color(rgb(GREEN)).bg(rgb(SURFACE0)))
             .on_click(move |_event, _window, cx| {
                 state_for_new.update(cx, |s, cx| {
                     s.add_tab(cx);
@@ -359,21 +317,14 @@ impl RootView {
             .w_full()
             .flex()
             .items_center()
-            .bg(rgb(mantle))
+            .bg(rgb(MANTLE))
             .border_b_1()
-            .border_color(rgb(surface0))
+            .border_color(rgb(SURFACE0))
             .children(tab_elements)
             .child(new_tab_btn)
     }
 
-    fn render_status_bar(
-        shell: &str,
-        pane_count: usize,
-        mantle: u32,
-        surface0: u32,
-        surface1: u32,
-        subtext0: u32,
-    ) -> impl IntoElement {
+    fn render_status_bar(shell: &str, pane_count: usize) -> impl IntoElement {
         let shell_display = shell
             .rsplit(['\\', '/'])
             .next()
@@ -395,11 +346,11 @@ impl RootView {
             .items_center()
             .justify_between()
             .px(px(12.0))
-            .bg(rgb(mantle))
+            .bg(rgb(MANTLE))
             .border_t_1()
-            .border_color(rgb(surface0))
+            .border_color(rgb(SURFACE0))
             .text_size(px(11.0))
-            .text_color(rgb(subtext0))
+            .text_color(rgb(SUBTEXT0))
             .child({
                 // Left: shell name + pane count
                 let left = div()
@@ -410,13 +361,17 @@ impl RootView {
                 if pane_info.is_empty() {
                     left
                 } else {
-                    left.child(div().text_color(rgb(surface1)).child(pane_info))
+                    left.child(
+                        div()
+                            .text_color(rgb(SURFACE1))
+                            .child(pane_info),
+                    )
                 }
             })
             .child(
                 // Right: version
                 div()
-                    .text_color(rgb(surface1))
+                    .text_color(rgb(SURFACE1))
                     .child(format!("ZWG v{}", version)),
             )
     }

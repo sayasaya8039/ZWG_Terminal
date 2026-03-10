@@ -149,36 +149,22 @@ impl AppConfig {
             .join("config.json")
     }
 
-    /// Load config from disk, falling back to defaults.
-    /// L3: returns both the config and any parse error message for UI notification.
+    /// Load config from disk, falling back to defaults
     pub fn load() -> Self {
-        Self::load_with_error().0
-    }
-
-    /// Load config, returning (config, optional error message)
-    pub fn load_with_error() -> (Self, Option<String>) {
         let path = Self::config_path();
         if path.exists() {
             match std::fs::read_to_string(&path) {
                 Ok(content) => match serde_json::from_str::<AppConfig>(&content) {
                     Ok(config) => {
                         log::info!("Loaded config from {:?}", path);
-                        return (config.validated(), None);
+                        return config.validated();
                     }
-                    Err(e) => {
-                        let msg = format!("Invalid config file: {}", e);
-                        log::warn!("{}", msg);
-                        return (Self::default(), Some(msg));
-                    }
+                    Err(e) => log::warn!("Invalid config file: {}", e),
                 },
-                Err(e) => {
-                    let msg = format!("Failed to read config: {}", e);
-                    log::warn!("{}", msg);
-                    return (Self::default(), Some(msg));
-                }
+                Err(e) => log::warn!("Failed to read config: {}", e),
             }
         }
-        (Self::default(), None)
+        Self::default()
     }
 
     /// Clamp config values to safe ranges
@@ -218,43 +204,6 @@ impl AppConfig {
     /// Available theme names
     pub fn available_themes() -> Vec<&'static str> {
         vec!["Catppuccin Mocha", "Catppuccin Latte", "Tokyo Night"]
-    }
-
-    /// C3: Create a RenderConfig from this AppConfig
-    pub fn render_config(&self) -> RenderConfig {
-        RenderConfig::from(self)
-    }
-}
-
-/// C3: Lightweight rendering configuration passed to terminal panes
-#[derive(Debug, Clone)]
-pub struct RenderConfig {
-    pub font_family: String,
-    pub font_size: f32,
-    pub line_height: f32,
-    pub fg_color: u32,
-    pub bg_color: u32,
-    pub theme: Theme,
-}
-
-impl From<&AppConfig> for RenderConfig {
-    fn from(config: &AppConfig) -> Self {
-        let theme = config.active_theme();
-        Self {
-            font_family: config.font.family.clone(),
-            font_size: config.font.size,
-            line_height: config.font.line_height,
-            fg_color: theme.fg,
-            bg_color: theme.bg,
-            theme,
-        }
-    }
-}
-
-impl Default for RenderConfig {
-    fn default() -> Self {
-        let config = AppConfig::default();
-        Self::from(&config)
     }
 }
 
