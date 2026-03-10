@@ -138,6 +138,7 @@ pub struct TerminalSurface {
     pub event_rx: Receiver<TerminalEvent>,
     event_tx: Sender<TerminalEvent>,
     pty: Option<Arc<PtyPair>>,
+    reader_handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl TerminalSurface {
@@ -148,6 +149,7 @@ impl TerminalSurface {
             event_rx,
             event_tx,
             pty: None,
+            reader_handle: None,
         }
     }
 
@@ -172,7 +174,7 @@ impl TerminalSurface {
         let backend = self.backend.clone();
         let event_tx = self.event_tx.clone();
 
-        std::thread::Builder::new()
+        let handle = std::thread::Builder::new()
             .name("zwg-pty-reader".into())
             .spawn(move || {
                 let mut buf = [0u8; 8192];
@@ -195,9 +197,11 @@ impl TerminalSurface {
                     let _ = event_tx.try_send(TerminalEvent::OutputReceived);
                 }
 
+                log::debug!("PTY reader thread exiting");
                 let _ = event_tx.try_send(TerminalEvent::ProcessExited(0));
             })?;
 
+        self.reader_handle = Some(handle);
         Ok(())
     }
 
@@ -218,6 +222,18 @@ impl TerminalSurface {
         self.backend.lock().resize(cols, rows);
         if let Some(ref pty) = self.pty {
             let _ = pty.resize(cols, rows);
+        }
+    }
+}
+
+impl Drop for TerminalSurface {
+    fn drop(&mut self) {
+        // Drop PTY first → ClosePseudoConsole → pipe broken → reader gets EOF
+        self.pty.take();
+
+        // Join the reader thread (should exit promptly after pipe is broken)
+        if let Some(handle) = self.reader_handle.take() {
+            let _ = handle.join();
         }
     }
 }

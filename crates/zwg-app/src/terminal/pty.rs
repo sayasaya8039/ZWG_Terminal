@@ -33,6 +33,9 @@ pub struct PtyPair {
     child_pid: u32,
     #[cfg(windows)]
     pseudo_console: Option<PseudoConsoleHandle>,
+    #[cfg(windows)]
+    #[allow(dead_code)] // kept for Drop cleanup only
+    process_handle: Option<ProcessHandle>,
 }
 
 unsafe impl Send for PtyPair {}
@@ -77,6 +80,34 @@ struct PseudoConsoleHandle(windows::Win32::System::Console::HPCON);
 unsafe impl Send for PseudoConsoleHandle {}
 #[cfg(windows)]
 unsafe impl Sync for PseudoConsoleHandle {}
+
+#[cfg(windows)]
+impl Drop for PseudoConsoleHandle {
+    fn drop(&mut self) {
+        unsafe {
+            windows::Win32::System::Console::ClosePseudoConsole(self.0);
+        }
+        log::debug!("ConPTY pseudo console closed");
+    }
+}
+
+/// RAII wrapper for Windows process handle
+#[cfg(windows)]
+struct ProcessHandle(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for ProcessHandle {}
+#[cfg(windows)]
+unsafe impl Sync for ProcessHandle {}
+
+#[cfg(windows)]
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = windows::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
 
 #[cfg(windows)]
 mod windows_impl {
@@ -160,6 +191,10 @@ mod windows_impl {
             let hpc = CreatePseudoConsole(size, pty_input_read, pty_output_write, 0)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
+            // RAII guard: ClosePseudoConsole on error via Drop
+            let hpc_raw = hpc.0;
+            let mut pc_guard = Some(PseudoConsoleHandle(hpc));
+
             let _ = CloseHandle(pty_input_read);
             let _ = CloseHandle(pty_output_write);
 
@@ -181,7 +216,7 @@ mod windows_impl {
                 attr_list,
                 0,
                 PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                Some(hpc.0 as *const _),
+                Some(hpc_raw as *const _),
                 std::mem::size_of::<HPCON>(),
                 None,
                 None,
@@ -254,7 +289,7 @@ mod windows_impl {
 
             DeleteProcThreadAttributeList(attr_list);
             let _ = CloseHandle(pi.hThread);
-            let _ = CloseHandle(pi.hProcess);
+            // pi.hProcess kept alive via ProcessHandle for child process monitoring
 
             let child_pid = pi.dwProcessId;
             let read_file = File::from_raw_handle(pty_output_read.0 as RawHandle);
@@ -264,7 +299,8 @@ mod windows_impl {
                 master_read: Arc::new(Mutex::new(Box::new(read_file))),
                 master_write: Arc::new(Mutex::new(Box::new(write_file))),
                 child_pid,
-                pseudo_console: Some(PseudoConsoleHandle(hpc)),
+                pseudo_console: pc_guard.take(),
+                process_handle: Some(ProcessHandle(pi.hProcess)),
             })
         }
     }
