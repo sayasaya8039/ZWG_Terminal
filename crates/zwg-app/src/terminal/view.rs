@@ -117,8 +117,9 @@ impl Render for TerminalPane {
             let backend = self.surface.backend.lock();
             rows = backend.rows;
             let pos = backend.cursor_position();
-            cursor_x = pos.0;
-            cursor_y = pos.1;
+            // ghostty-vt returns 1-based coordinates; convert to 0-based
+            cursor_x = pos.0.saturating_sub(1);
+            cursor_y = pos.1.saturating_sub(1);
             row_texts = (0..rows).map(|r| backend.row_text(r)).collect();
             #[cfg(feature = "ghostty_vt")]
             {
