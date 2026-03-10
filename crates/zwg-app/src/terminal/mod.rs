@@ -258,3 +258,146 @@ impl ScreenBuffer {
 // Re-export main types
 pub use surface::TerminalSurface;
 pub use view::TerminalPane;
+
+#[cfg(all(test, not(feature = "ghostty_vt")))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn screen_buffer_new_has_correct_dimensions() {
+        let sb = ScreenBuffer::new(80, 24, 1000);
+        assert_eq!(sb.cols, 80);
+        assert_eq!(sb.rows, 24);
+        assert_eq!(sb.viewport.len(), 24);
+        assert_eq!(sb.scrollback.len(), 0);
+        assert_eq!(sb.cursor.x, 0);
+        assert_eq!(sb.cursor.y, 0);
+        assert!(sb.cursor.visible);
+    }
+
+    #[test]
+    fn write_char_advances_cursor() {
+        let mut sb = ScreenBuffer::new(80, 24, 1000);
+        sb.write_char('A');
+        assert_eq!(sb.cursor.x, 1);
+        assert_eq!(sb.cursor.y, 0);
+        assert_eq!(sb.viewport[0].text.trim_end(), "A");
+    }
+
+    #[test]
+    fn write_char_wraps_at_end_of_line() {
+        let mut sb = ScreenBuffer::new(3, 2, 100);
+        sb.write_char('A');
+        sb.write_char('B');
+        sb.write_char('C'); // fills col 0,1,2 → wraps
+        assert_eq!(sb.cursor.x, 0);
+        assert_eq!(sb.cursor.y, 1);
+        assert!(sb.viewport[0].is_wrapped);
+    }
+
+    #[test]
+    fn write_char_unicode() {
+        let mut sb = ScreenBuffer::new(80, 24, 1000);
+        sb.write_char('あ');
+        sb.write_char('い');
+        assert_eq!(sb.cursor.x, 2);
+        let text = sb.viewport[0].text.trim_end();
+        assert!(text.contains('あ'));
+        assert!(text.contains('い'));
+    }
+
+    #[test]
+    fn scroll_up_moves_line_to_scrollback() {
+        let mut sb = ScreenBuffer::new(80, 2, 100);
+        sb.write_char('A');
+        sb.scroll_up();
+        assert_eq!(sb.scrollback.len(), 1);
+        assert_eq!(sb.viewport.len(), 2);
+        assert!(sb.scrollback[0].text.contains('A'));
+    }
+
+    #[test]
+    fn scroll_up_caps_scrollback() {
+        let mut sb = ScreenBuffer::new(80, 2, 3);
+        for _ in 0..5 {
+            sb.scroll_up();
+        }
+        assert!(sb.scrollback.len() <= 3);
+    }
+
+    #[test]
+    fn resize_shrink_moves_to_scrollback() {
+        let mut sb = ScreenBuffer::new(80, 10, 1000);
+        assert_eq!(sb.viewport.len(), 10);
+        sb.resize(80, 5);
+        assert_eq!(sb.viewport.len(), 5);
+        assert_eq!(sb.scrollback.len(), 5);
+        assert_eq!(sb.cols, 80);
+        assert_eq!(sb.rows, 5);
+    }
+
+    #[test]
+    fn resize_grow_adds_empty_lines() {
+        let mut sb = ScreenBuffer::new(80, 5, 1000);
+        sb.resize(80, 10);
+        assert_eq!(sb.viewport.len(), 10);
+        assert_eq!(sb.rows, 10);
+    }
+
+    #[test]
+    fn resize_clamps_cursor() {
+        let mut sb = ScreenBuffer::new(80, 24, 1000);
+        sb.cursor.x = 79;
+        sb.cursor.y = 23;
+        sb.resize(40, 10);
+        assert!(sb.cursor.x < 40);
+        assert!(sb.cursor.y < 10);
+    }
+
+    #[test]
+    fn visible_line_returns_viewport() {
+        let mut sb = ScreenBuffer::new(80, 3, 100);
+        sb.write_char('X');
+        let line = sb.visible_line(0).unwrap();
+        assert!(line.text.contains('X'));
+    }
+
+    #[test]
+    fn visible_line_out_of_range_returns_none() {
+        let sb = ScreenBuffer::new(80, 3, 100);
+        assert!(sb.visible_line(3).is_none());
+        assert!(sb.visible_line(100).is_none());
+    }
+
+    #[test]
+    fn terminal_line_new_defaults() {
+        let line = TerminalLine::new();
+        assert!(line.text.is_empty());
+        assert!(line.is_dirty);
+        assert!(!line.is_wrapped);
+        assert_eq!(line.styles.len(), 1);
+        assert_eq!(line.styles[0].fg_color, DEFAULT_FG);
+        assert_eq!(line.styles[0].bg_color, DEFAULT_BG);
+    }
+
+    #[test]
+    fn style_span_flags() {
+        let span = StyleSpan {
+            len: 5,
+            fg_color: 0xffffff,
+            bg_color: 0x000000,
+            flags: 0x01 | 0x04 | 0x10, // bold + underline + strikethrough
+        };
+        assert!(span.is_bold());
+        assert!(!span.is_italic());
+        assert!(span.is_underline());
+        assert!(!span.is_inverse());
+        assert!(span.is_strikethrough());
+    }
+
+    #[test]
+    fn cursor_shape_default_is_block() {
+        let shape = CursorShape::default();
+        assert_eq!(shape, CursorShape::Block);
+    }
+}

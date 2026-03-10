@@ -206,3 +206,149 @@ impl AppConfig {
         vec!["Catppuccin Mocha", "Catppuccin Latte", "Tokyo Night"]
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_test_config() -> AppConfig {
+        AppConfig {
+            shell: "cmd.exe".into(),
+            font: FontConfig::default(),
+            theme: "Catppuccin Mocha".into(),
+            scrollback_lines: 10_000,
+            cursor_blink: true,
+            tab_bar_visible: true,
+            status_bar_visible: true,
+        }
+    }
+
+    #[test]
+    fn config_round_trip_serde() {
+        let config = AppConfig {
+            shell: "cmd.exe".into(),
+            font: FontConfig {
+                family: "Consolas".into(),
+                size: 16.0,
+                line_height: 1.5,
+            },
+            theme: "Tokyo Night".into(),
+            scrollback_lines: 5000,
+            cursor_blink: false,
+            tab_bar_visible: true,
+            status_bar_visible: false,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let restored: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.shell, "cmd.exe");
+        assert_eq!(restored.font.family, "Consolas");
+        assert_eq!(restored.font.size, 16.0);
+        assert_eq!(restored.theme, "Tokyo Night");
+        assert_eq!(restored.scrollback_lines, 5000);
+        assert!(!restored.cursor_blink);
+        assert!(!restored.status_bar_visible);
+    }
+
+    #[test]
+    fn config_validated_clamps_scrollback() {
+        let config = AppConfig {
+            scrollback_lines: 0,
+            ..make_test_config()
+        };
+        let v = config.validated();
+        assert_eq!(v.scrollback_lines, 100);
+
+        let config2 = AppConfig {
+            scrollback_lines: 999_999,
+            ..make_test_config()
+        };
+        let v2 = config2.validated();
+        assert_eq!(v2.scrollback_lines, 100_000);
+    }
+
+    #[test]
+    fn config_validated_clamps_font_size() {
+        let mut config = make_test_config();
+        config.font.size = 1.0;
+        assert_eq!(config.validated().font.size, 6.0);
+
+        let mut config2 = make_test_config();
+        config2.font.size = 200.0;
+        assert_eq!(config2.validated().font.size, 72.0);
+    }
+
+    #[test]
+    fn config_validated_clamps_line_height() {
+        let mut config = make_test_config();
+        config.font.line_height = 0.5;
+        assert_eq!(config.validated().font.line_height, 1.0);
+
+        let mut config2 = make_test_config();
+        config2.font.line_height = 5.0;
+        assert_eq!(config2.validated().font.line_height, 3.0);
+    }
+
+    #[test]
+    fn config_validated_empty_shell_uses_default() {
+        let mut config = make_test_config();
+        config.shell = "   ".into();
+        let v = config.validated();
+        assert!(!v.shell.trim().is_empty());
+    }
+
+    #[test]
+    fn config_malformed_json_returns_err() {
+        let bad = r#"{"shell": "cmd.exe", "font": {"broken"#;
+        let result: Result<AppConfig, _> = serde_json::from_str(bad);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn theme_mocha_colors() {
+        let t = Theme::mocha();
+        assert_eq!(t.name, "Catppuccin Mocha");
+        assert_eq!(t.base, 0x1e1e2e);
+        assert_eq!(t.fg, 0xcdd6f4);
+    }
+
+    #[test]
+    fn theme_latte_is_light() {
+        let t = Theme::latte();
+        assert_eq!(t.name, "Catppuccin Latte");
+        assert!(t.bg > 0x800000);
+    }
+
+    #[test]
+    fn active_theme_selects_correctly() {
+        let config = AppConfig {
+            theme: "Tokyo Night".into(),
+            ..make_test_config()
+        };
+        assert_eq!(config.active_theme().name, "Tokyo Night");
+    }
+
+    #[test]
+    fn active_theme_unknown_falls_back_to_mocha() {
+        let config = AppConfig {
+            theme: "Nonexistent".into(),
+            ..make_test_config()
+        };
+        assert_eq!(config.active_theme().name, "Catppuccin Mocha");
+    }
+
+    #[test]
+    fn available_themes_has_three() {
+        let themes = AppConfig::available_themes();
+        assert_eq!(themes.len(), 3);
+        assert!(themes.contains(&"Catppuccin Mocha"));
+        assert!(themes.contains(&"Tokyo Night"));
+    }
+
+    #[test]
+    fn font_config_default_values() {
+        let f = FontConfig::default();
+        assert_eq!(f.family, "Cascadia Code");
+        assert_eq!(f.size, 14.0);
+        assert_eq!(f.line_height, 1.3);
+    }
+}

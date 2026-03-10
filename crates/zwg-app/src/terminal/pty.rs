@@ -184,6 +184,114 @@ mod windows_impl {
         }
     }
 
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn split_empty_returns_powershell() {
+            let (exe, args) = split_shell_command("");
+            assert_eq!(exe, "powershell.exe");
+            assert!(args.is_empty());
+        }
+
+        #[test]
+        fn split_whitespace_only_returns_powershell() {
+            let (exe, args) = split_shell_command("   ");
+            assert_eq!(exe, "powershell.exe");
+            assert!(args.is_empty());
+        }
+
+        #[test]
+        fn split_simple_exe() {
+            let (exe, args) = split_shell_command("cmd.exe");
+            assert_eq!(exe, "cmd.exe");
+            assert!(args.is_empty());
+        }
+
+        #[test]
+        fn split_exe_with_args() {
+            let (exe, args) = split_shell_command("cmd.exe /K echo hello");
+            assert_eq!(exe, "cmd.exe");
+            assert_eq!(args, "/K echo hello");
+        }
+
+        #[test]
+        fn split_quoted_path() {
+            let (exe, args) = split_shell_command(r#""C:\Program Files\shell.exe" --flag"#);
+            assert_eq!(exe, r"C:\Program Files\shell.exe");
+            assert_eq!(args, "--flag");
+        }
+
+        #[test]
+        fn split_quoted_no_args() {
+            let (exe, args) = split_shell_command(r#""C:\shell.exe""#);
+            assert_eq!(exe, r"C:\shell.exe");
+            assert!(args.is_empty());
+        }
+
+        #[test]
+        fn quote_cmd_no_spaces() {
+            assert_eq!(quote_cmd("cmd.exe"), "cmd.exe");
+        }
+
+        #[test]
+        fn quote_cmd_with_spaces() {
+            let q = quote_cmd(r"C:\Program Files\shell.exe");
+            assert!(q.starts_with('"'));
+            assert!(q.ends_with('"'));
+            assert!(q.contains(r"C:\Program Files\shell.exe"));
+        }
+
+        #[test]
+        fn validate_clean_path_ok() {
+            assert!(validate_shell_path("cmd.exe").is_ok());
+            assert!(validate_shell_path(r"C:\Windows\System32\cmd.exe").is_ok());
+            assert!(validate_shell_path("powershell.exe").is_ok());
+        }
+
+        #[test]
+        fn validate_pipe_rejected() {
+            assert!(validate_shell_path("cmd.exe | evil").is_err());
+        }
+
+        #[test]
+        fn validate_ampersand_rejected() {
+            assert!(validate_shell_path("cmd.exe & evil").is_err());
+        }
+
+        #[test]
+        fn validate_semicolon_rejected() {
+            assert!(validate_shell_path("cmd.exe; evil").is_err());
+        }
+
+        #[test]
+        fn validate_backtick_rejected() {
+            assert!(validate_shell_path("cmd.exe `evil`").is_err());
+        }
+
+        #[test]
+        fn validate_dollar_rejected() {
+            assert!(validate_shell_path("$(evil)").is_err());
+        }
+
+        #[test]
+        fn validate_angle_brackets_rejected() {
+            assert!(validate_shell_path("cmd.exe > output").is_err());
+            assert!(validate_shell_path("cmd.exe < input").is_err());
+        }
+
+        #[test]
+        fn validate_braces_rejected() {
+            assert!(validate_shell_path("cmd.exe {evil}").is_err());
+        }
+
+        #[test]
+        fn validate_parens_rejected() {
+            assert!(validate_shell_path("cmd.exe (evil)").is_err());
+        }
+    }
+
     pub fn spawn(config: &ConPtyConfig) -> io::Result<PtyPair> {
         // Validate shell path before proceeding
         validate_shell_path(&config.shell)?;
