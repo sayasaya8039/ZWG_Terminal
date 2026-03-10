@@ -159,6 +159,20 @@ impl Render for TerminalPane {
                     t
                 };
 
+                // Split text at cursor position for inline cursor rendering
+                let chars: Vec<char> = display_text.chars().collect();
+                let before_cursor: String = chars[..cursor_col.min(chars.len())].iter().collect();
+                let cursor_char: String = if cursor_col < chars.len() {
+                    chars[cursor_col].to_string()
+                } else {
+                    " ".to_string()
+                };
+                let after_cursor: String = if cursor_col + 1 < chars.len() {
+                    chars[cursor_col + 1..].iter().collect()
+                } else {
+                    String::new()
+                };
+
                 #[cfg(feature = "ghostty_vt")]
                 let text_child = render_styled_text(
                     &display_text,
@@ -170,23 +184,41 @@ impl Render for TerminalPane {
 
                 let row_with_text = row_el.child(text_child);
 
-                let cursor_offset = cursor_col as f32 * self.cell_width + 4.0;
+                // Cursor overlay: use invisible text spacer for pixel-perfect positioning
+                let cursor_overlay = div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .h(px(self.cell_height))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .text_size(px(FONT_SIZE))
+                    .font_family(FONT_FAMILY)
+                    .overflow_hidden()
+                    .child(
+                        // Invisible spacer: renders same text before cursor
+                        div()
+                            .pl(px(4.0))
+                            .text_color(rgba(0x00000000))
+                            .child(before_cursor),
+                    )
+                    .child(
+                        // Visible cursor block
+                        div()
+                            .w(px(self.cell_width))
+                            .h(px(self.cell_height))
+                            .bg(rgba(0xcdd6f480))
+                            .rounded(px(1.0)),
+                    );
+
                 line_elements.push(
                     div()
                         .h(px(self.cell_height))
                         .w_full()
                         .relative()
                         .child(row_with_text)
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left(px(cursor_offset))
-                                .w(px(self.cell_width))
-                                .h(px(self.cell_height))
-                                .bg(rgba(0xcdd6f480))
-                                .rounded(px(1.0)),
-                        )
+                        .child(cursor_overlay)
                         .into_any_element(),
                 );
             } else {
