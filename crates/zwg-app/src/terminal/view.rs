@@ -106,19 +106,36 @@ impl Render for TerminalPane {
         let avail_h = (vp_h - 40.0).max(100.0);
         self.handle_resize(vp_w, avail_h);
 
-        let backend = self.surface.backend.lock();
-        let rows = backend.rows;
-        let (cursor_x, cursor_y) = backend.cursor_position();
+        // Snapshot backend state under brief lock — release before building UI
+        let rows: u16;
+        let cursor_x: u16;
+        let cursor_y: u16;
+        let mut row_texts: Vec<String>;
+        #[cfg(feature = "ghostty_vt")]
+        let row_styles: Vec<Vec<ghostty_vt::StyleRun>>;
+        {
+            let backend = self.surface.backend.lock();
+            rows = backend.rows;
+            let pos = backend.cursor_position();
+            cursor_x = pos.0;
+            cursor_y = pos.1;
+            row_texts = (0..rows).map(|r| backend.row_text(r)).collect();
+            #[cfg(feature = "ghostty_vt")]
+            {
+                row_styles = (0..rows).map(|r| backend.row_style_runs(r)).collect();
+            }
+        }
+        // Mutex released — PTY reader thread unblocked
 
         let mut line_elements: Vec<AnyElement> = Vec::with_capacity(rows as usize);
 
         for row in 0..rows {
-            let text = backend.row_text(row);
-
+            let ri = row as usize;
+            let text = std::mem::take(&mut row_texts[ri]);
             let is_cursor_row = row == cursor_y;
 
             #[cfg(feature = "ghostty_vt")]
-            let style_runs = backend.row_style_runs(row);
+            let style_runs = &row_styles[ri];
 
             let row_el = div()
                 .h(px(self.cell_height))
@@ -134,18 +151,17 @@ impl Render for TerminalPane {
                 let display_text = if text.is_empty() {
                     " ".repeat(cursor_col + 1)
                 } else {
-                    let mut t = text.clone();
+                    let mut t = text;
                     while t.chars().count() <= cursor_col {
                         t.push(' ');
                     }
                     t
                 };
 
-                // Render styled text with style runs
                 #[cfg(feature = "ghostty_vt")]
                 let text_child = render_styled_text(
                     &display_text,
-                    &style_runs,
+                    style_runs,
                     self.cell_width,
                 );
                 #[cfg(not(feature = "ghostty_vt"))]
@@ -182,7 +198,7 @@ impl Render for TerminalPane {
                 #[cfg(feature = "ghostty_vt")]
                 let text_child = render_styled_text(
                     &display,
-                    &style_runs,
+                    style_runs,
                     self.cell_width,
                 );
                 #[cfg(not(feature = "ghostty_vt"))]
@@ -195,8 +211,6 @@ impl Render for TerminalPane {
                 );
             }
         }
-
-        drop(backend);
 
         div()
             .id("terminal-pane")
