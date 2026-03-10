@@ -305,16 +305,19 @@ export fn ghostty_vt_terminal_dump_viewport_row(
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
 
     const screen = handle.terminal.screens.active;
-    const pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = row } };
-    const pin = screen.pages.pin(pt) orelse return .{ .ptr = null, .len = 0 };
+    const cols = handle.terminal.cols;
+    const tl_pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = row } };
+    const tl_pin = screen.pages.pin(tl_pt) orelse return .{ .ptr = null, .len = 0 };
+    const br_pt: terminal.point.Point = .{ .viewport = .{ .x = if (cols > 0) cols - 1 else 0, .y = row } };
+    const br_pin = screen.pages.pin(br_pt) orelse return .{ .ptr = null, .len = 0 };
 
     const alloc = std.heap.c_allocator;
     var builder: std.Io.Writer.Allocating = .init(alloc);
     defer builder.deinit();
 
     screen.dumpString(&builder.writer, .{
-        .tl = pin,
-        .br = pin,
+        .tl = tl_pin,
+        .br = br_pin,
         .unwrap = false,
     }) catch return .{ .ptr = null, .len = 0 };
 
