@@ -39,6 +39,8 @@ pub struct PtyPair {
 }
 
 unsafe impl Send for PtyPair {}
+// M9: Safety: all fields are behind Arc<Mutex<_>> or are POD types.
+// Windows HANDLE types lack Send/Sync, but our fields are wrapped in Mutex locks.
 unsafe impl Sync for PtyPair {}
 
 impl PtyPair {
@@ -125,6 +127,26 @@ mod windows_impl {
         UpdateProcThreadAttribute, CREATE_UNICODE_ENVIRONMENT,
     };
     use windows::core::{PCWSTR, PWSTR};
+
+    /// H7: RAII wrapper for pipe HANDLEs to prevent leaks on error paths
+    struct PipeHandle(HANDLE);
+    impl Drop for PipeHandle {
+        fn drop(&mut self) {
+            if !self.0.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
+    impl PipeHandle {
+        fn take(mut self) -> HANDLE {
+            let h = self.0;
+            self.0 = HANDLE::default();
+            std::mem::forget(self);
+            h
+        }
+    }
 
     /// Validate that a shell path doesn't contain obvious injection characters
     fn validate_shell_path(path: &str) -> io::Result<()> {
@@ -304,22 +326,33 @@ mod windows_impl {
 
             CreatePipe(&mut pty_input_read, &mut pty_input_write, None, 65536)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            // H7: wrap in RAII immediately to prevent leak if second CreatePipe fails
+            let pty_input_read = PipeHandle(pty_input_read);
+            let pty_input_write = PipeHandle(pty_input_write);
+
             CreatePipe(&mut pty_output_read, &mut pty_output_write, None, 65536)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let pty_output_read = PipeHandle(pty_output_read);
+            let pty_output_write = PipeHandle(pty_output_write);
 
+            // M7: clamp to i16::MAX to prevent overflow on u16→i16 cast
+            let safe_cols = config.cols.min(i16::MAX as u16) as i16;
+            let safe_rows = config.rows.min(i16::MAX as u16) as i16;
             let size = COORD {
-                X: config.cols as i16,
-                Y: config.rows as i16,
+                X: safe_cols.max(1),
+                Y: safe_rows.max(1),
             };
-            let hpc = CreatePseudoConsole(size, pty_input_read, pty_output_write, 0)
+            // H7: PipeHandle RAII will auto-close on error path
+            let hpc = CreatePseudoConsole(size, pty_input_read.0, pty_output_write.0, 0)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
             // RAII guard: ClosePseudoConsole on error via Drop
             let hpc_raw = hpc.0;
             let mut pc_guard = Some(PseudoConsoleHandle(hpc));
 
-            let _ = CloseHandle(pty_input_read);
-            let _ = CloseHandle(pty_output_write);
+            // These handles are now owned by the pseudo console — drop our copies
+            drop(pty_input_read);
+            drop(pty_output_write);
 
             let mut attr_size: usize = 0;
             let _ = InitializeProcThreadAttributeList(
@@ -415,8 +448,9 @@ mod windows_impl {
             // pi.hProcess kept alive via ProcessHandle for child process monitoring
 
             let child_pid = pi.dwProcessId;
-            let read_file = File::from_raw_handle(pty_output_read.0 as RawHandle);
-            let write_file = File::from_raw_handle(pty_input_write.0 as RawHandle);
+            // H7: take ownership from PipeHandle RAII wrappers
+            let read_file = File::from_raw_handle(pty_output_read.take().0 as RawHandle);
+            let write_file = File::from_raw_handle(pty_input_write.take().0 as RawHandle);
 
             Ok(PtyPair {
                 master_read: Arc::new(Mutex::new(Box::new(read_file))),
@@ -432,9 +466,10 @@ mod windows_impl {
 #[cfg(windows)]
 fn windows_resize(pc: &PseudoConsoleHandle, cols: u16, rows: u16) -> io::Result<()> {
     use windows::Win32::System::Console::{COORD, ResizePseudoConsole};
+    // M7: clamp to prevent i16 overflow
     let size = COORD {
-        X: cols as i16,
-        Y: rows as i16,
+        X: cols.min(i16::MAX as u16) as i16,
+        Y: rows.min(i16::MAX as u16) as i16,
     };
     unsafe {
         ResizePseudoConsole(pc.0, size)

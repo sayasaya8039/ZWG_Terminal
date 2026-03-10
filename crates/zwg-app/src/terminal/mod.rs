@@ -8,6 +8,8 @@ pub mod vt_parser;
 
 #[cfg(not(feature = "ghostty_vt"))]
 use std::collections::VecDeque;
+#[cfg(not(feature = "ghostty_vt"))]
+use unicode_width::UnicodeWidthChar;
 
 /// Style information for a run of characters
 #[cfg(not(feature = "ghostty_vt"))]
@@ -140,48 +142,41 @@ impl ScreenBuffer {
         let y = self.cursor.y as usize;
         if y < self.viewport.len() {
             let line = &mut self.viewport[y];
-            let x = self.cursor.x as usize;
+            // C2: cursor.x is in cell columns; convert to char index
+            let char_idx = cell_to_char_index(&line.text, self.cursor.x as usize);
 
-            // Pad to cursor position
-            if line.text.is_ascii() {
-                while line.text.len() <= x {
-                    line.text.push(' ');
-                }
-            } else {
-                while line.text.chars().count() <= x {
-                    line.text.push(' ');
-                }
+            // H4: compute char count once, then pad incrementally
+            let mut current_chars = line.text.chars().count();
+            while current_chars <= char_idx {
+                line.text.push(' ');
+                current_chars += 1;
             }
 
-            // ASCII fast path
-            if line.text.is_ascii() && ch.is_ascii() && x < line.text.len() {
-                unsafe {
-                    line.text.as_bytes_mut()[x] = ch as u8;
-                }
-            } else {
-                let byte_start = line
-                    .text
-                    .char_indices()
-                    .nth(x)
-                    .map(|(i, _)| i)
-                    .unwrap_or(line.text.len());
-                let byte_end = line
-                    .text
-                    .char_indices()
-                    .nth(x + 1)
-                    .map(|(i, _)| i)
-                    .unwrap_or(line.text.len());
-                let mut buf = [0u8; 4];
-                let s = ch.encode_utf8(&mut buf);
-                line.text.replace_range(byte_start..byte_end, s);
-            }
+            // H5: safe string replacement (no unsafe as_bytes_mut)
+            let byte_start = line
+                .text
+                .char_indices()
+                .nth(char_idx)
+                .map(|(i, _)| i)
+                .unwrap_or(line.text.len());
+            let byte_end = line
+                .text
+                .char_indices()
+                .nth(char_idx + 1)
+                .map(|(i, _)| i)
+                .unwrap_or(line.text.len());
+            let mut buf = [0u8; 4];
+            let s = ch.encode_utf8(&mut buf);
+            line.text.replace_range(byte_start..byte_end, s);
 
             line.is_dirty = true;
             self.generation = self.generation.wrapping_add(1);
             if let Some(rg) = self.row_generations.get_mut(y) {
                 *rg = self.generation;
             }
-            self.cursor.x += 1;
+            // C2: advance cursor by unicode display width
+            let char_width = ch.width().unwrap_or(1).max(1) as u16;
+            self.cursor.x += char_width;
             if self.cursor.x >= self.cols {
                 self.cursor.x = 0;
                 self.cursor.y += 1;
@@ -221,6 +216,13 @@ impl ScreenBuffer {
         while self.viewport.len() < rows as usize {
             self.viewport.push_back(TerminalLine::new());
         }
+        // M5: trim scrollback to max_scrollback after resize
+        while self.scrollback.len() > self.max_scrollback {
+            self.scrollback.pop_front();
+        }
+        if self.scroll_offset > self.scrollback.len() {
+            self.scroll_offset = self.scrollback.len();
+        }
         if self.cursor.x >= cols {
             self.cursor.x = cols.saturating_sub(1);
         }
@@ -253,6 +255,21 @@ impl ScreenBuffer {
             self.viewport.get(abs_idx - self.scrollback.len())
         }
     }
+}
+
+/// Convert a cell column position to a character index in the string.
+/// Accounts for wide (CJK) characters occupying 2 cells.
+#[cfg(not(feature = "ghostty_vt"))]
+fn cell_to_char_index(text: &str, cell_col: usize) -> usize {
+    let mut col = 0usize;
+    for (i, ch) in text.chars().enumerate() {
+        if col >= cell_col {
+            return i;
+        }
+        col += ch.width().unwrap_or(1);
+    }
+    // Past the end of text — return char count + remaining cells
+    text.chars().count() + cell_col.saturating_sub(col)
 }
 
 // Re-export main types
@@ -300,7 +317,8 @@ mod tests {
         let mut sb = ScreenBuffer::new(80, 24, 1000);
         sb.write_char('あ');
         sb.write_char('い');
-        assert_eq!(sb.cursor.x, 2);
+        // C2: CJK chars have width 2, so cursor advances by 2 per char
+        assert_eq!(sb.cursor.x, 4);
         let text = sb.viewport[0].text.trim_end();
         assert!(text.contains('あ'));
         assert!(text.contains('い'));

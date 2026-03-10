@@ -1,6 +1,7 @@
 //! Terminal surface — manages PTY + terminal backend
 
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use flume::{Receiver, Sender};
@@ -30,8 +31,15 @@ mod backend {
 
     impl TerminalBackend {
         pub fn new(cols: u16, rows: u16) -> Self {
-            let mut terminal = ghostty_vt::Terminal::new(cols, rows)
-                .expect("failed to create ghostty terminal");
+            // M4: log error but continue — panic in constructor is unrecoverable
+            let mut terminal = match ghostty_vt::Terminal::new(cols, rows) {
+                Ok(t) => t,
+                Err(e) => {
+                    log::error!("Failed to create ghostty terminal: {}. Retrying with defaults.", e);
+                    ghostty_vt::Terminal::new(80, 24)
+                        .expect("ghostty terminal creation failed with defaults")
+                }
+            };
             terminal.set_default_colors(
                 ghostty_vt::Rgb {
                     r: ((DEFAULT_FG >> 16) & 0xFF) as u8,
@@ -139,17 +147,21 @@ pub struct TerminalSurface {
     event_tx: Sender<TerminalEvent>,
     pty: Option<Arc<PtyPair>>,
     reader_handle: Option<std::thread::JoinHandle<()>>,
+    // H2: stop flag for clean reader thread shutdown
+    stop_flag: Arc<AtomicBool>,
 }
 
 impl TerminalSurface {
     pub fn new(cols: u16, rows: u16) -> Self {
-        let (event_tx, event_rx) = flume::unbounded();
+        // H1: bounded(1) — reader only needs to signal "data available"
+        let (event_tx, event_rx) = flume::bounded(4);
         Self {
             backend: Arc::new(Mutex::new(TerminalBackend::new(cols, rows))),
             event_rx,
             event_tx,
             pty: None,
             reader_handle: None,
+            stop_flag: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -173,12 +185,18 @@ impl TerminalSurface {
         let reader = pty.reader();
         let backend = self.backend.clone();
         let event_tx = self.event_tx.clone();
+        let stop_flag = self.stop_flag.clone();
 
         let handle = std::thread::Builder::new()
             .name("zwg-pty-reader".into())
             .spawn(move || {
                 let mut buf = [0u8; 8192];
                 loop {
+                    // H2: check stop flag before blocking read
+                    if stop_flag.load(Ordering::Relaxed) {
+                        break;
+                    }
+
                     let n = {
                         let mut guard = reader.lock();
                         match guard.read(&mut buf) {
@@ -194,10 +212,12 @@ impl TerminalSurface {
                         b.feed(&buf[..n]);
                     }
 
+                    // H1: try_send on bounded channel — drop if full (already notified)
                     let _ = event_tx.try_send(TerminalEvent::OutputReceived);
                 }
 
                 log::debug!("PTY reader thread exiting");
+                // H3/L2: notify process exit
                 let _ = event_tx.try_send(TerminalEvent::ProcessExited(0));
             })?;
 
@@ -228,12 +248,20 @@ impl TerminalSurface {
 
 impl Drop for TerminalSurface {
     fn drop(&mut self) {
+        // H2: signal reader to stop
+        self.stop_flag.store(true, Ordering::Relaxed);
+
         // Drop PTY first → ClosePseudoConsole → pipe broken → reader gets EOF
         self.pty.take();
 
-        // Join the reader thread (should exit promptly after pipe is broken)
+        // H2: join reader in a background thread to avoid blocking UI
         if let Some(handle) = self.reader_handle.take() {
-            let _ = handle.join();
+            std::thread::Builder::new()
+                .name("zwg-pty-cleanup".into())
+                .spawn(move || {
+                    let _ = handle.join();
+                })
+                .ok();
         }
     }
 }

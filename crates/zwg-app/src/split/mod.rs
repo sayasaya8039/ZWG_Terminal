@@ -3,6 +3,7 @@
 use gpui::*;
 use uuid::Uuid;
 
+use crate::config::RenderConfig;
 use crate::terminal::TerminalPane;
 
 /// Direction of a split
@@ -10,6 +11,12 @@ use crate::terminal::TerminalPane;
 pub enum SplitDirection {
     Horizontal, // side by side (left | right)
     Vertical,   // stacked (top / bottom)
+}
+
+/// M2: Events emitted by SplitContainer
+#[derive(Debug, Clone)]
+pub enum SplitContainerEvent {
+    PaneCountChanged(usize),
 }
 
 /// Node in the split tree
@@ -31,16 +38,20 @@ pub struct SplitContainer {
     root: SplitNode,
     focused_id: Uuid,
     shell: String,
+    /// C3: render config passed to new terminal panes
+    render_config: RenderConfig,
 }
 
 impl SplitContainer {
-    pub fn new(shell: &str, cx: &mut Context<Self>) -> Self {
+    pub fn new(shell: &str, render_config: &RenderConfig, cx: &mut Context<Self>) -> Self {
         let id = Uuid::new_v4();
-        let terminal = cx.new(|cx| TerminalPane::new(shell, cx));
+        let rc = render_config.clone();
+        let terminal = cx.new(|cx| TerminalPane::new(shell, &rc, cx));
         Self {
             root: SplitNode::Leaf { id, terminal },
             focused_id: id,
             shell: shell.to_string(),
+            render_config: render_config.clone(),
         }
     }
 
@@ -48,8 +59,9 @@ impl SplitContainer {
     pub fn split(&mut self, direction: SplitDirection, cx: &mut Context<Self>) {
         let target_id = self.focused_id;
         let shell = self.shell.clone();
+        let rc = self.render_config.clone();
         let new_id = Uuid::new_v4();
-        let new_terminal = cx.new(|cx| TerminalPane::new(&shell, cx));
+        let new_terminal = cx.new(|cx| TerminalPane::new(&shell, &rc, cx));
 
         self.root = Self::split_node(
             std::mem::replace(
@@ -137,13 +149,16 @@ impl SplitContainer {
 
         // Use existing terminal clone as dummy (no new PTY spawned)
         let dummy_terminal = self.first_terminal();
-        let (new_root, sibling_id) = Self::remove_node(std::mem::replace(
-            &mut self.root,
-            SplitNode::Leaf {
-                id: Uuid::nil(),
-                terminal: dummy_terminal,
-            },
-        ), target_id);
+        let (new_root, sibling_id) = Self::remove_node(
+            std::mem::replace(
+                &mut self.root,
+                SplitNode::Leaf {
+                    id: Uuid::nil(),
+                    terminal: dummy_terminal,
+                },
+            ),
+            target_id,
+        );
 
         if let Some(root) = new_root {
             self.root = root;
@@ -161,7 +176,10 @@ impl SplitContainer {
     fn remove_node(node: SplitNode, target_id: Uuid) -> (Option<SplitNode>, Option<Uuid>) {
         match node {
             SplitNode::Branch {
-                direction, ratio, first, second,
+                direction,
+                ratio,
+                first,
+                second,
             } => {
                 // Check if first child is the target
                 if let SplitNode::Leaf { id, .. } = first.as_ref() {
@@ -224,10 +242,7 @@ impl SplitContainer {
         result
     }
 
-    fn collect_terminals(
-        node: &SplitNode,
-        out: &mut Vec<(Uuid, Entity<TerminalPane>)>,
-    ) {
+    fn collect_terminals(node: &SplitNode, out: &mut Vec<(Uuid, Entity<TerminalPane>)>) {
         match node {
             SplitNode::Leaf { id, terminal } => out.push((*id, terminal.clone())),
             SplitNode::Branch { first, second, .. } => {
@@ -277,24 +292,23 @@ pub enum FocusDir {
 impl Render for SplitContainer {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let focused_id = self.focused_id;
-        Self::render_node(&self.root, focused_id)
+        // C3: pass theme colors to render_node
+        let blue = self.render_config.theme.blue;
+        let surface0 = self.render_config.theme.surface0;
+        Self::render_node(&self.root, focused_id, blue, surface0)
     }
 }
 
 impl SplitContainer {
-    fn render_node(node: &SplitNode, focused_id: Uuid) -> Div {
+    fn render_node(node: &SplitNode, focused_id: Uuid, focus_color: u32, border_color: u32) -> Div {
         match node {
             SplitNode::Leaf { id, terminal } => {
                 let is_focused = *id == focused_id;
                 let mut el = div().size_full().child(terminal.clone());
                 if is_focused {
-                    el = el
-                        .border_2()
-                        .border_color(rgb(0x89b4fa)); // Catppuccin blue
+                    el = el.border_2().border_color(rgb(focus_color));
                 } else {
-                    el = el
-                        .border_1()
-                        .border_color(rgb(0x313244)); // Catppuccin surface0
+                    el = el.border_1().border_color(rgb(border_color));
                 }
                 el
             }
@@ -304,8 +318,8 @@ impl SplitContainer {
                 first,
                 second,
             } => {
-                let first_el = Self::render_node(first, focused_id);
-                let second_el = Self::render_node(second, focused_id);
+                let first_el = Self::render_node(first, focused_id, focus_color, border_color);
+                let second_el = Self::render_node(second, focused_id, focus_color, border_color);
                 let r = *ratio;
 
                 match direction {
@@ -318,7 +332,7 @@ impl SplitContainer {
                             div()
                                 .w(px(1.0))
                                 .h_full()
-                                .bg(rgb(0x313244)), // divider
+                                .bg(rgb(border_color)),
                         )
                         .child(second_el.flex_grow().flex_basis(relative(1.0 - r))),
                     SplitDirection::Vertical => div()
@@ -330,7 +344,7 @@ impl SplitContainer {
                             div()
                                 .h(px(1.0))
                                 .w_full()
-                                .bg(rgb(0x313244)), // divider
+                                .bg(rgb(border_color)),
                         )
                         .child(second_el.flex_grow().flex_basis(relative(1.0 - r))),
                 }
@@ -339,4 +353,5 @@ impl SplitContainer {
     }
 }
 
-impl EventEmitter<()> for SplitContainer {}
+// M2: typed event emitter
+impl EventEmitter<SplitContainerEvent> for SplitContainer {}

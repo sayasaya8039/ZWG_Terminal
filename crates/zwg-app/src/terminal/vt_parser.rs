@@ -23,6 +23,27 @@ const ANSI_COLORS: [u32; 16] = [
     0xcdd6f4, // 15: bright white (Text)
 ];
 
+/// H8: Convert 256-color index to RGB u32
+fn color_256(idx: usize) -> u32 {
+    if idx < 16 {
+        ANSI_COLORS[idx]
+    } else if idx < 232 {
+        // 6x6x6 color cube (indices 16-231)
+        let i = idx - 16;
+        let b = (i % 6) as u32;
+        let g = ((i / 6) % 6) as u32;
+        let r = (i / 36) as u32;
+        let to_byte = |v: u32| if v == 0 { 0u32 } else { 55 + v * 40 };
+        (to_byte(r) << 16) | (to_byte(g) << 8) | to_byte(b)
+    } else if idx < 256 {
+        // Grayscale ramp (indices 232-255)
+        let v = (8 + (idx - 232) * 10) as u32;
+        (v << 16) | (v << 8) | v
+    } else {
+        super::DEFAULT_FG
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ParserState {
     Ground,
@@ -36,8 +57,12 @@ pub struct VtParser {
     state: ParserState,
     params: Vec<u16>,
     current_param: u16,
-    osc_buf: String,
+    osc_buf: Vec<u8>,
     has_param: bool,
+    // C1: UTF-8 decode state machine
+    utf8_buf: [u8; 4],
+    utf8_len: u8,
+    utf8_expected: u8,
 }
 
 impl VtParser {
@@ -46,8 +71,11 @@ impl VtParser {
             state: ParserState::Ground,
             params: Vec::with_capacity(16),
             current_param: 0,
-            osc_buf: String::new(),
+            osc_buf: Vec::new(),
             has_param: false,
+            utf8_buf: [0; 4],
+            utf8_len: 0,
+            utf8_expected: 0,
         }
     }
 
@@ -55,6 +83,15 @@ impl VtParser {
     pub fn process(&mut self, data: &[u8], screen: &mut ScreenBuffer) {
         for &byte in data {
             self.process_byte(byte, screen);
+        }
+    }
+
+    /// Flush any incomplete UTF-8 sequence as replacement characters
+    fn flush_utf8_incomplete(&mut self, screen: &mut ScreenBuffer) {
+        if self.utf8_expected > 0 {
+            screen.write_char(char::REPLACEMENT_CHARACTER);
+            self.utf8_len = 0;
+            self.utf8_expected = 0;
         }
     }
 
@@ -98,13 +135,55 @@ impl VtParser {
                 // Other control chars — ignore
             }
             _ => {
-                // Printable character — handle UTF-8
+                // C1: UTF-8 decode state machine
                 if byte < 0x80 {
+                    // ASCII — flush any incomplete UTF-8 sequence, then write
+                    self.flush_utf8_incomplete(screen);
                     screen.write_char(byte as char);
+                } else if byte & 0xC0 == 0x80 {
+                    // Continuation byte (10xxxxxx)
+                    if self.utf8_expected > 0 {
+                        self.utf8_buf[self.utf8_len as usize] = byte;
+                        self.utf8_len += 1;
+                        if self.utf8_len == self.utf8_expected {
+                            // Sequence complete — decode
+                            let s = &self.utf8_buf[..self.utf8_len as usize];
+                            match std::str::from_utf8(s) {
+                                Ok(decoded) => {
+                                    for ch in decoded.chars() {
+                                        screen.write_char(ch);
+                                    }
+                                }
+                                Err(_) => {
+                                    screen.write_char(char::REPLACEMENT_CHARACTER);
+                                }
+                            }
+                            self.utf8_len = 0;
+                            self.utf8_expected = 0;
+                        }
+                    } else {
+                        // Stray continuation byte
+                        screen.write_char(char::REPLACEMENT_CHARACTER);
+                    }
                 } else {
-                    // Simple UTF-8 handling: treat as individual bytes for now
-                    // Full UTF-8 decoding will come with Ghostty VT in Phase 1
-                    screen.write_char(char::REPLACEMENT_CHARACTER);
+                    // Start byte — flush any incomplete, start new sequence
+                    self.flush_utf8_incomplete(screen);
+                    let expected = if byte & 0xE0 == 0xC0 {
+                        2
+                    } else if byte & 0xF0 == 0xE0 {
+                        3
+                    } else if byte & 0xF8 == 0xF0 {
+                        4
+                    } else {
+                        0 // invalid
+                    };
+                    if expected > 0 {
+                        self.utf8_buf[0] = byte;
+                        self.utf8_len = 1;
+                        self.utf8_expected = expected;
+                    } else {
+                        screen.write_char(char::REPLACEMENT_CHARACTER);
+                    }
                 }
             }
         }
@@ -389,11 +468,9 @@ impl VtParser {
                         38 => {
                             // Extended foreground
                             if i + 2 < self.params.len() && self.params[i + 1] == 5 {
-                                // 256-color
+                                // H8: 256-color (0-15: ANSI, 16-231: 6x6x6 cube, 232-255: grayscale)
                                 let idx = self.params[i + 2] as usize;
-                                if idx < 16 {
-                                    screen.current_fg = ANSI_COLORS[idx];
-                                }
+                                screen.current_fg = color_256(idx);
                                 i += 2;
                             } else if i + 4 < self.params.len() && self.params[i + 1] == 2 {
                                 // RGB
@@ -411,10 +488,9 @@ impl VtParser {
                         48 => {
                             // Extended background
                             if i + 2 < self.params.len() && self.params[i + 1] == 5 {
+                                // H8: 256-color
                                 let idx = self.params[i + 2] as usize;
-                                if idx < 16 {
-                                    screen.current_bg = ANSI_COLORS[idx];
-                                }
+                                screen.current_bg = color_256(idx);
                                 i += 2;
                             } else if i + 4 < self.params.len() && self.params[i + 1] == 2 {
                                 let r = self.params[i + 2] as u32;
@@ -543,22 +619,25 @@ impl VtParser {
                 self.state = ParserState::Ground;
             }
             0x1b => {
-                // ESC might terminate OSC (ST = ESC \)
-                // Simplified: just execute
+                // L5: ESC starts ST (ESC \). Execute OSC and transition to Escape
+                // state so the backslash is consumed properly.
                 self.execute_osc(screen);
-                self.state = ParserState::Ground;
+                self.state = ParserState::Escape;
             }
             _ => {
+                // M6: store raw bytes, decode as UTF-8 in execute_osc
                 if self.osc_buf.len() < 4096 {
-                    self.osc_buf.push(byte as char);
+                    self.osc_buf.push(byte);
                 }
             }
         }
     }
 
     fn execute_osc(&self, screen: &mut ScreenBuffer) {
+        // M6: decode OSC buffer as UTF-8 (lossy)
+        let osc_str = String::from_utf8_lossy(&self.osc_buf);
         // OSC 0 or 2: Set window title
-        if let Some(rest) = self.osc_buf.strip_prefix("0;").or(self.osc_buf.strip_prefix("2;")) {
+        if let Some(rest) = osc_str.strip_prefix("0;").or_else(|| osc_str.strip_prefix("2;")) {
             screen.title = Some(rest.to_string());
         }
     }
