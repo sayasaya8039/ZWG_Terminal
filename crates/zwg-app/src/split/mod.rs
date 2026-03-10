@@ -113,6 +113,18 @@ impl SplitContainer {
         }
     }
 
+    /// Get the first terminal Entity (cheap clone, no PTY spawn)
+    fn first_terminal(&self) -> Entity<TerminalPane> {
+        Self::get_first_terminal(&self.root)
+    }
+
+    fn get_first_terminal(node: &SplitNode) -> Entity<TerminalPane> {
+        match node {
+            SplitNode::Leaf { terminal, .. } => terminal.clone(),
+            SplitNode::Branch { first, .. } => Self::get_first_terminal(first),
+        }
+    }
+
     /// Close the focused pane. Returns false if it's the last pane.
     pub fn close_focused(&mut self, cx: &mut Context<Self>) -> bool {
         let target_id = self.focused_id;
@@ -123,11 +135,13 @@ impl SplitContainer {
             }
         }
 
+        // Use existing terminal clone as dummy (no new PTY spawned)
+        let dummy_terminal = self.first_terminal();
         let (new_root, sibling_id) = Self::remove_node(std::mem::replace(
             &mut self.root,
             SplitNode::Leaf {
                 id: Uuid::nil(),
-                terminal: cx.new(|cx| TerminalPane::new(&self.shell, cx)),
+                terminal: dummy_terminal,
             },
         ), target_id);
 
@@ -147,7 +161,7 @@ impl SplitContainer {
     fn remove_node(node: SplitNode, target_id: Uuid) -> (Option<SplitNode>, Option<Uuid>) {
         match node {
             SplitNode::Branch {
-                first, second, ..
+                direction, ratio, first, second,
             } => {
                 // Check if first child is the target
                 if let SplitNode::Leaf { id, .. } = first.as_ref() {
@@ -163,14 +177,14 @@ impl SplitContainer {
                         return (Some(*first), Some(sid));
                     }
                 }
-                // Recurse into children
+                // Recurse into children — preserve original direction and ratio
                 let (new_first, sid1) = Self::remove_node(*first, target_id);
                 if let Some(nf) = new_first {
                     if sid1.is_some() {
                         return (
                             Some(SplitNode::Branch {
-                                direction: SplitDirection::Horizontal,
-                                ratio: 0.5,
+                                direction,
+                                ratio,
                                 first: Box::new(nf),
                                 second,
                             }),
@@ -181,8 +195,8 @@ impl SplitContainer {
                     if let Some(ns) = new_second {
                         return (
                             Some(SplitNode::Branch {
-                                direction: SplitDirection::Horizontal,
-                                ratio: 0.5,
+                                direction,
+                                ratio,
                                 first: Box::new(nf),
                                 second: Box::new(ns),
                             }),
