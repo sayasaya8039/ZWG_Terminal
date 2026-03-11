@@ -4,6 +4,7 @@ use gpui::*;
 use uuid::Uuid;
 
 use crate::config::AppConfig;
+use crate::shell::{self, ShellType};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::{ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, SplitDown, SplitRight};
 
@@ -25,11 +26,20 @@ pub struct Tab {
     pub split: Entity<SplitContainer>,
 }
 
+/// Shell entry for the dropdown menu
+#[derive(Clone)]
+pub struct ShellEntry {
+    pub shell_type: ShellType,
+    pub command: String,
+    pub display_name: String,
+}
+
 /// Global application state
 pub struct AppState {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     pub config: AppConfig,
+    pub available_shells: Vec<ShellEntry>,
 }
 
 impl AppState {
@@ -38,6 +48,25 @@ impl AppState {
         let id = Uuid::new_v4();
         let shell = config.shell.clone();
         let split = cx.new(|cx| SplitContainer::new(&shell, cx));
+
+        // Cache available shells at startup
+        let available_shells = shell::detect_available_shells()
+            .into_iter()
+            .map(|(st, cmd)| {
+                let display_name = match st {
+                    ShellType::PowerShell => "Windows PowerShell".to_string(),
+                    ShellType::Pwsh => "PowerShell 7".to_string(),
+                    ShellType::Cmd => "Command Prompt".to_string(),
+                    ShellType::Wsl => "WSL".to_string(),
+                    ShellType::GitBash => "Git Bash".to_string(),
+                };
+                ShellEntry {
+                    shell_type: st,
+                    command: cmd,
+                    display_name,
+                }
+            })
+            .collect();
 
         Self {
             tabs: vec![Tab {
@@ -48,6 +77,7 @@ impl AppState {
             }],
             active_tab: 0,
             config,
+            available_shells,
         }
     }
 
@@ -61,6 +91,20 @@ impl AppState {
             id,
             title: format!("Terminal {}", idx),
             shell,
+            split,
+        });
+        self.active_tab = self.tabs.len() - 1;
+    }
+
+    pub fn add_tab_with_shell(&mut self, shell: &str, cx: &mut App) {
+        let id = Uuid::new_v4();
+        let idx = self.tabs.len() + 1;
+        let split = cx.new(|cx| SplitContainer::new(shell, cx));
+
+        self.tabs.push(Tab {
+            id,
+            title: format!("Terminal {}", idx),
+            shell: shell.to_string(),
             split,
         });
         self.active_tab = self.tabs.len() - 1;
@@ -84,11 +128,15 @@ impl AppState {
 /// Root view containing tab bar + split container
 pub struct RootView {
     state: Entity<AppState>,
+    show_shell_menu: bool,
 }
 
 impl RootView {
     pub fn new(state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
-        Self { state }
+        Self {
+            state,
+            show_shell_menu: false,
+        }
     }
 
     fn on_new_tab(&mut self, _action: &NewTab, _window: &mut Window, cx: &mut Context<Self>) {
@@ -263,13 +311,12 @@ impl Render for RootView {
             tab_elements.push(tab.into_any_element());
         }
 
-        // New tab button
+        // New tab button (+)
         let new_tab_btn = div()
             .id("new-tab-btn")
             .px(px(8.0))
             .py(px(5.0))
-            .mx(px(2.0))
-            .rounded(px(6.0))
+            .rounded_l(px(6.0))
             .cursor_pointer()
             .text_size(px(14.0))
             .text_color(rgb(SURFACE1))
@@ -277,6 +324,7 @@ impl Render for RootView {
             .on_mouse_down(
                 gpui::MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.show_shell_menu = false;
                     this.state.update(cx, |s, cx| {
                         s.add_tab(cx);
                     });
@@ -284,6 +332,50 @@ impl Render for RootView {
                 }),
             )
             .child("+");
+
+        // Shell dropdown button (▽)
+        let dropdown_btn = div()
+            .id("shell-dropdown-btn")
+            .px(px(4.0))
+            .py(px(5.0))
+            .rounded_r(px(6.0))
+            .cursor_pointer()
+            .text_size(px(10.0))
+            .text_color(rgb(SURFACE1))
+            .hover(|s| s.text_color(rgb(GREEN)).bg(rgb(SURFACE0)))
+            .on_mouse_down(
+                gpui::MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.show_shell_menu = !this.show_shell_menu;
+                    cx.notify();
+                }),
+            )
+            .child("▾");
+
+        // Combined + and ▽ button group
+        let btn_group = div()
+            .ml(px(2.0))
+            .flex()
+            .items_center()
+            .child(new_tab_btn)
+            .child(
+                div()
+                    .h(px(16.0))
+                    .w(px(1.0))
+                    .bg(rgb(SURFACE0)),
+            )
+            .child(dropdown_btn);
+
+        // Shell dropdown menu (overlay)
+        let show_menu = self.show_shell_menu;
+        let shell_entries: Vec<(usize, String, String)> = self
+            .state
+            .read(cx)
+            .available_shells
+            .iter()
+            .enumerate()
+            .map(|(i, e)| (i, e.display_name.clone(), e.command.clone()))
+            .collect();
 
         let tab_bar = div()
             .id("tab-bar")
@@ -295,7 +387,78 @@ impl Render for RootView {
             .border_b_1()
             .border_color(rgb(SURFACE0))
             .children(tab_elements)
-            .child(new_tab_btn);
+            .child(btn_group);
+
+        // Build shell dropdown menu if open
+        let shell_menu = if show_menu {
+            let mut menu_items: Vec<AnyElement> = Vec::new();
+            for (idx, display_name, command) in shell_entries {
+                let cmd = command.clone();
+                menu_items.push(
+                    div()
+                        .id(ElementId::Name(format!("shell-item-{}", idx).into()))
+                        .px(px(12.0))
+                        .py(px(6.0))
+                        .w_full()
+                        .cursor_pointer()
+                        .text_size(px(12.0))
+                        .text_color(rgb(TEXT))
+                        .hover(|s| s.bg(rgb(SURFACE0)))
+                        .on_mouse_down(
+                            gpui::MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                this.show_shell_menu = false;
+                                let cmd = cmd.clone();
+                                this.state.update(cx, |s, cx| {
+                                    s.add_tab_with_shell(&cmd, cx);
+                                });
+                                cx.notify();
+                            }),
+                        )
+                        .child(display_name)
+                        .into_any_element(),
+                );
+            }
+
+            Some(
+                div()
+                    .id("shell-dropdown-menu")
+                    .absolute()
+                    .top(px(36.0))
+                    .right(px(0.0))
+                    .w(px(200.0))
+                    .bg(rgb(MANTLE))
+                    .border_1()
+                    .border_color(rgb(SURFACE0))
+                    .rounded(px(6.0))
+                    .shadow_lg()
+                    .py(px(4.0))
+                    .children(menu_items),
+            )
+        } else {
+            None
+        };
+
+        // Click-outside overlay to close the menu
+        let backdrop = if show_menu {
+            Some(
+                div()
+                    .id("shell-menu-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .on_mouse_down(
+                        gpui::MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.show_shell_menu = false;
+                            cx.notify();
+                        }),
+                    ),
+            )
+        } else {
+            None
+        };
 
         div()
             .id("root")
@@ -303,6 +466,7 @@ impl Render for RootView {
             .flex()
             .flex_col()
             .bg(rgb(BASE))
+            .relative()
             // Action handlers on the root element
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_close_tab))
@@ -322,6 +486,9 @@ impl Render for RootView {
             )
             // Status bar
             .child(Self::render_status_bar(&shell_name, pane_count))
+            // Shell dropdown overlay (backdrop + menu)
+            .children(backdrop)
+            .children(shell_menu)
     }
 }
 
