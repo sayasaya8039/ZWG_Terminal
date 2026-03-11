@@ -35,7 +35,8 @@ const YELLOW: u32 = 0xFEBC2E;
 const ACCENT: u32 = 0x0A84FF;
 const ACCENT_ALT: u32 = 0x34C759;
 const BACKDROP: u32 = 0x00000088;
-const UI_FONT: &str = "Inter";
+const UI_FONT: &str = "Yu Gothic UI";
+const MONO_FONT: &str = "Consolas";
 
 /// Minimum interval between window state saves.
 const WINDOW_STATE_SAVE_INTERVAL_SECS: u64 = 2;
@@ -3973,7 +3974,7 @@ impl RootView {
                     )
                     .child(
                         div()
-                            .font_family("JetBrains Mono")
+                            .font_family(MONO_FONT)
                             .text_size(px(12.0))
                             .text_color(rgb(if is_selected { TEXT } else { TEXT_SOFT }))
                             .child(group_name),
@@ -4033,7 +4034,7 @@ impl RootView {
                                 )
                                 .child(
                                     div()
-                                        .font_family("JetBrains Mono")
+                                        .font_family(MONO_FONT)
                                         .text_size(px(11.0))
                                         .text_color(rgb(SUBTEXT1))
                                         .child("Enter:確定 Esc:閉じる"),
@@ -4231,7 +4232,7 @@ impl RootView {
                                         .px(px(12.0))
                                         .flex()
                                         .items_center()
-                                        .font_family("JetBrains Mono")
+                                        .font_family(MONO_FONT)
                                         .text_size(px(12.0))
                                         .text_color(rgb(TEXT))
                                         .child(if editing {
@@ -4312,7 +4313,7 @@ impl RootView {
                             .w(px(260.0))
                             .px(px(10.0))
                             .py(px(8.0))
-                            .font_family("JetBrains Mono")
+                            .font_family(MONO_FONT)
                             .text_size(px(12.0))
                             .text_color(rgb(TEXT))
                             .child(snippet.title.clone()),
@@ -4324,7 +4325,7 @@ impl RootView {
                             .py(px(8.0))
                             .border_l_1()
                             .border_color(rgba(0xffffff08))
-                            .font_family("JetBrains Mono")
+                            .font_family(MONO_FONT)
                             .text_size(px(12.0))
                             .text_color(rgb(TEXT_SOFT))
                             .child(preview),
@@ -4336,7 +4337,7 @@ impl RootView {
                             .py(px(8.0))
                             .border_l_1()
                             .border_color(rgba(0xffffff08))
-                            .font_family("JetBrains Mono")
+                            .font_family(MONO_FONT)
                             .text_size(px(11.0))
                             .text_color(rgb(SUBTEXT1))
                             .text_right()
@@ -4397,7 +4398,7 @@ impl RootView {
                                 )
                                 .child(
                                     div()
-                                        .font_family("JetBrains Mono")
+                                        .font_family(MONO_FONT)
                                         .text_size(px(11.0))
                                         .text_color(rgb(SUBTEXT1))
                                         .child("Ctrl+N:新規 Enter:編集 Del:削除"),
@@ -4756,7 +4757,7 @@ impl RootView {
                                 )
                                 .child(
                                     div()
-                                        .font_family("JetBrains Mono")
+                                        .font_family(MONO_FONT)
                                         .text_size(px(11.0))
                                         .text_color(rgb(SUBTEXT1))
                                         .child("Tab:項目切替 Ctrl+Enter:保存"),
@@ -4812,7 +4813,7 @@ impl RootView {
                                                 .px(px(12.0))
                                                 .flex()
                                                 .items_center()
-                                                .font_family("JetBrains Mono")
+                                                .font_family(MONO_FONT)
                                                 .text_size(px(12.0))
                                                 .text_color(rgb(TEXT))
                                                 .cursor_pointer()
@@ -4865,7 +4866,7 @@ impl RootView {
                                                 }))
                                                 .bg(rgba(0xffffff08))
                                                 .p(px(12.0))
-                                                .font_family("JetBrains Mono")
+                                                .font_family(MONO_FONT)
                                                 .text_size(px(12.0))
                                                 .text_color(rgb(TEXT))
                                                 .cursor_pointer()
@@ -4979,7 +4980,7 @@ impl RootView {
                                 )
                                 .child(
                                     div()
-                                        .font_family("JetBrains Mono")
+                                        .font_family(MONO_FONT)
                                         .text_size(px(11.0))
                                         .text_color(rgb(SUBTEXT1))
                                         .child("smux 互換: UTF-8 / Shift_JIS"),
@@ -5333,7 +5334,7 @@ impl RootView {
             .child(settings_section_heading("フォント"))
             .child(settings_row(
                 "フォントファミリー",
-                select_box("JetBrains Mono", 180.0),
+                select_box("Consolas", 180.0),
             ))
             .child(settings_row(
                 "フォントサイズ",
@@ -5511,7 +5512,7 @@ impl RootView {
                             .bg(rgba(0xffffff10))
                             .border_1()
                             .border_color(rgba(0xffffff10))
-                            .font_family("JetBrains Mono")
+                            .font_family(MONO_FONT)
                             .text_size(px(12.0))
                             .text_color(rgb(SUBTEXT0))
                             .child(*keys),
@@ -6900,7 +6901,7 @@ fn light_pattern_chip(
         .justify_between()
         .child(
             div()
-                .font_family("JetBrains Mono")
+                .font_family(MONO_FONT)
                 .text_size(px(11.0))
                 .text_color(rgba(0x374151FF))
                 .child(pattern),
@@ -7016,7 +7017,7 @@ fn light_preview_box(title: &'static str, body: &'static str, sub: &'static str)
                 )
                 .child(
                     div()
-                        .font_family("JetBrains Mono")
+                        .font_family(MONO_FONT)
                         .text_size(px(11.0))
                         .text_color(rgba(0x6B7280FF))
                         .child(sub),
@@ -7304,7 +7305,7 @@ fn input_box(value: &'static str, width: f32, mono: bool) -> Div {
         .child(value);
 
     if mono {
-        input = input.font_family("JetBrains Mono");
+        input = input.font_family(MONO_FONT);
     } else {
         input = input.font_family(UI_FONT);
     }
@@ -7329,7 +7330,7 @@ fn input_box_dynamic(value: String, width: f32, mono: bool) -> Div {
         .child(value);
 
     if mono {
-        input = input.font_family("JetBrains Mono");
+        input = input.font_family(MONO_FONT);
     } else {
         input = input.font_family(UI_FONT);
     }

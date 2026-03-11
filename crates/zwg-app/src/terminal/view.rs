@@ -8,7 +8,7 @@ use super::pty::{ConPtyConfig, spawn_pty};
 use super::surface::TerminalSurface;
 use super::{DEFAULT_BG, DEFAULT_FG, TerminalSettings};
 
-const FONT_FAMILY: &str = "JetBrains Mono";
+const FONT_FAMILY: &str = "Consolas";
 const FONT_SIZE: f32 = 13.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.5;
 pub const CELL_WIDTH_ESTIMATE: f32 = 8.4;
