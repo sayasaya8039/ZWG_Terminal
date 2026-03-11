@@ -54,14 +54,21 @@ impl Snippet {
         }
     }
 
-    pub(crate) fn matches_query(&self, needle: &str) -> bool {
+    pub(crate) fn matches_query(&self, needle: &str, ignore_case: bool) -> bool {
         if needle.is_empty() {
             return true;
         }
 
-        self.title.to_lowercase().contains(needle)
-            || self.content.to_lowercase().contains(needle)
-            || self.group.to_lowercase().contains(needle)
+        if ignore_case {
+            let needle = needle.to_lowercase();
+            self.title.to_lowercase().contains(&needle)
+                || self.content.to_lowercase().contains(&needle)
+                || self.group.to_lowercase().contains(&needle)
+        } else {
+            self.title.contains(needle)
+                || self.content.contains(needle)
+                || self.group.contains(needle)
+        }
     }
 
     pub(crate) fn metric(&self) -> usize {
@@ -402,6 +409,14 @@ impl SnippetStore {
         self.items.remove(index);
         self.save()?;
         Ok(true)
+    }
+
+    pub fn clear_all(&mut self) -> io::Result<()> {
+        self.items.clear();
+        if self.groups.is_empty() {
+            self.groups.push(DEFAULT_GROUP_NAME.to_string());
+        }
+        self.save()
     }
 
     pub fn move_snippet_up(&mut self, index: usize) -> io::Result<Option<usize>> {

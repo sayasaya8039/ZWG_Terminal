@@ -20,6 +20,10 @@ pub struct SnippetPalette {
     selected_store_index: Option<usize>,
     queue_mode: SnippetQueueMode,
     queue: VecDeque<String>,
+    ignore_case: bool,
+    min_text_length: usize,
+    exclude_patterns: Vec<String>,
+    favorites_only: bool,
 }
 
 impl SnippetPalette {
@@ -36,6 +40,10 @@ impl SnippetPalette {
             selected_store_index: None,
             queue_mode: SnippetQueueMode::Off,
             queue: VecDeque::new(),
+            ignore_case: true,
+            min_text_length: 1,
+            exclude_patterns: Vec::new(),
+            favorites_only: false,
         };
         palette.sync_selection();
         palette
@@ -63,6 +71,7 @@ impl SnippetPalette {
 
     pub fn hide(&mut self) {
         self.visible = false;
+        self.favorites_only = false;
     }
 
     pub fn toggle(&mut self) {
@@ -123,6 +132,23 @@ impl SnippetPalette {
 
     pub fn set_active_group(&mut self, group: Option<String>) {
         self.active_group = group;
+        self.sync_selection();
+    }
+
+    pub fn set_favorites_only(&mut self, favorites_only: bool) {
+        self.favorites_only = favorites_only;
+        self.sync_selection();
+    }
+
+    pub fn set_filter_preferences(
+        &mut self,
+        ignore_case: bool,
+        min_text_length: usize,
+        exclude_patterns: Vec<String>,
+    ) {
+        self.ignore_case = ignore_case;
+        self.min_text_length = min_text_length.max(1);
+        self.exclude_patterns = exclude_patterns;
         self.sync_selection();
     }
 
@@ -405,6 +431,19 @@ impl SnippetPalette {
         }
     }
 
+    pub fn clear_all(&mut self) -> bool {
+        match self.store.clear_all() {
+            Ok(()) => {
+                self.sync_selection();
+                true
+            }
+            Err(error) => {
+                log::warn!("Failed to clear snippets: {}", error);
+                false
+            }
+        }
+    }
+
     pub fn toggle_favorite(&mut self, index: usize) -> Option<bool> {
         match self.store.toggle_favorite(index) {
             Ok(is_favorite) => {
@@ -504,6 +543,17 @@ impl SnippetPalette {
         }
     }
 
+    pub fn set_queue_mode(&mut self, mode: SnippetQueueMode) {
+        self.queue_mode = mode;
+        if mode == SnippetQueueMode::Off {
+            self.queue.clear();
+        }
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.queue.len()
+    }
+
     pub fn export_csv(&self) -> std::io::Result<PathBuf> {
         self.store.export_csv()
     }
@@ -553,6 +603,24 @@ impl SnippetPalette {
 
     pub fn select_store_index(&mut self, index: usize) {
         self.selected_store_index = Some(index);
+        self.sync_selection();
+    }
+
+    pub fn item_count(&self) -> usize {
+        self.store.items().len()
+    }
+
+    pub fn favorite_count(&self) -> usize {
+        self.store
+            .items()
+            .iter()
+            .filter(|snippet| snippet.is_favorite)
+            .count()
+    }
+
+    pub fn reload_from_disk(&mut self) {
+        let path = self.store.path().to_path_buf();
+        self.store = SnippetStore::load_from_path(path);
         self.sync_selection();
     }
 
@@ -607,7 +675,7 @@ impl SnippetPalette {
     }
 
     fn filtered_indices(&self) -> Vec<usize> {
-        let query = self.query.trim().to_lowercase();
+        let query = self.query.trim().to_string();
         let active_group = self.active_group.as_deref();
 
         self.store
@@ -618,7 +686,18 @@ impl SnippetPalette {
                 let matches_group = active_group
                     .map(|group| snippet.group.eq_ignore_ascii_case(group))
                     .unwrap_or(true);
-                (matches_group && snippet.matches_query(&query)).then_some(index)
+                let passes_len = snippet.content.trim().chars().count() >= self.min_text_length;
+                let passes_patterns = self.exclude_patterns.iter().all(|pattern| {
+                    let pattern = pattern.trim();
+                    pattern.is_empty() || !snippet.matches_query(pattern, self.ignore_case)
+                });
+                let passes_favorites = !self.favorites_only || snippet.is_favorite;
+                (matches_group
+                    && passes_len
+                    && passes_patterns
+                    && passes_favorites
+                    && snippet.matches_query(&query, self.ignore_case))
+                .then_some(index)
             })
             .collect()
     }

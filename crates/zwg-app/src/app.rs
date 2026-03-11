@@ -1,12 +1,14 @@
 //! Application state and root view — Figma-aligned macOS terminal chrome
 
+use std::io::Write;
 use std::time::Instant;
 
+use gpui::prelude::FluentBuilder;
 use gpui::*;
 
 use crate::config::{AppConfig, WindowState, set_launch_on_login};
 use crate::shell::{self, ShellType};
-use crate::snippets::{CsvEncoding, SnippetPalette, SnippetQueueMode};
+use crate::snippets::{CsvEncoding, SnippetPalette, SnippetQueueMode, SnippetSettings};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::terminal::TerminalSettings;
 use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
@@ -108,6 +110,65 @@ impl SettingsCategory {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
+enum SnippetSettingsCategory {
+    General,
+    Hotkeys,
+    Display,
+    Filters,
+    Templates,
+    Notifications,
+    Data,
+    Advanced,
+}
+
+impl SnippetSettingsCategory {
+    fn all() -> &'static [SnippetSettingsCategory] {
+        &[
+            Self::General,
+            Self::Hotkeys,
+            Self::Display,
+            Self::Filters,
+            Self::Templates,
+            Self::Notifications,
+            Self::Data,
+            Self::Advanced,
+        ]
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::General => "一般",
+            Self::Hotkeys => "ホットキー",
+            Self::Display => "表示",
+            Self::Filters => "フィルタ",
+            Self::Templates => "定型文",
+            Self::Notifications => "通知",
+            Self::Data => "データ管理",
+            Self::Advanced => "詳細設定",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnippetSettingsTextField {
+    ShowWindowHotkey,
+    PasteAsPlainTextHotkey,
+    QuickPasteHotkey,
+    ShowFavoritesHotkey,
+    ShowTemplatesHotkey,
+    FilterPatternInput,
+    ExcludeApps,
+}
+
+#[derive(Clone)]
+struct SnippetNotice {
+    title: String,
+    detail: String,
+    created_at: Instant,
+    duration_ms: u64,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum SnippetGroupEditMode {
     None,
     Rename(usize),
@@ -181,9 +242,15 @@ pub struct RootView {
     focus_handle: FocusHandle,
     show_shell_menu: bool,
     show_settings: bool,
+    show_snippet_settings: bool,
     show_close_confirm: bool,
     show_snippet_context_menu: bool,
     snippet_palette: SnippetPalette,
+    snippet_settings: SnippetSettings,
+    snippet_settings_draft: Option<SnippetSettings>,
+    snippet_settings_category: SnippetSettingsCategory,
+    snippet_settings_active_text: Option<SnippetSettingsTextField>,
+    snippet_notice: Option<SnippetNotice>,
     snippet_group_editor: Option<SnippetGroupEditorState>,
     snippet_list_editor: Option<SnippetListEditorState>,
     snippet_editor: Option<SnippetEditorState>,
@@ -275,14 +342,33 @@ impl AppState {
 
 impl RootView {
     pub fn new(state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
+        let launch_on_startup = state.read(_cx).config.launch_on_login;
+        let mut snippet_settings = SnippetSettings::load();
+        snippet_settings.general.launch_on_startup = launch_on_startup;
+        let mut snippet_palette = SnippetPalette::load();
+        snippet_palette.set_filter_preferences(
+            snippet_settings.filters.ignore_case,
+            snippet_settings.filters.min_text_length,
+            snippet_settings.filters.exclude_patterns.clone(),
+        );
+        if snippet_settings.advanced.fifo_mode {
+            snippet_palette.set_queue_mode(SnippetQueueMode::Fifo);
+        }
+
         Self {
             state,
             focus_handle: _cx.focus_handle(),
             show_shell_menu: false,
             show_settings: false,
+            show_snippet_settings: false,
             show_close_confirm: false,
             show_snippet_context_menu: false,
-            snippet_palette: SnippetPalette::load(),
+            snippet_palette,
+            snippet_settings,
+            snippet_settings_draft: None,
+            snippet_settings_category: SnippetSettingsCategory::General,
+            snippet_settings_active_text: None,
+            snippet_notice: None,
             snippet_group_editor: None,
             snippet_list_editor: None,
             snippet_editor: None,
@@ -291,6 +377,268 @@ impl RootView {
             last_bounds: None,
             last_save_time: Instant::now(),
             bounds_dirty: false,
+        }
+    }
+
+    fn open_snippet_settings(&mut self, cx: &mut Context<Self>) {
+        let mut draft = self.snippet_settings.clone();
+        draft.general.launch_on_startup = self.state.read(cx).config.launch_on_login;
+        self.show_snippet_settings = true;
+        self.show_settings = false;
+        self.show_shell_menu = false;
+        self.show_snippet_context_menu = false;
+        self.show_close_confirm = false;
+        self.snippet_palette.hide();
+        self.snippet_settings_category = SnippetSettingsCategory::General;
+        self.snippet_settings_active_text = None;
+        self.snippet_settings_draft = Some(draft);
+    }
+
+    fn close_snippet_settings(&mut self, save: bool, cx: &mut Context<Self>) {
+        if save {
+            if let Some(draft) = self.snippet_settings_draft.take() {
+                self.snippet_settings = draft.validated();
+                self.apply_snippet_settings(cx);
+                if let Err(err) = self.snippet_settings.save() {
+                    log::warn!("Failed to save snippet settings: {}", err);
+                    self.show_snippet_notice("設定の保存に失敗しました", err.to_string(), 2500, cx);
+                }
+            }
+        } else {
+            self.snippet_settings_draft = None;
+        }
+
+        self.show_snippet_settings = false;
+        self.snippet_settings_active_text = None;
+    }
+
+    fn apply_snippet_settings(&mut self, cx: &mut Context<Self>) {
+        self.snippet_palette.set_filter_preferences(
+            self.snippet_settings.filters.ignore_case,
+            self.snippet_settings.filters.min_text_length,
+            self.snippet_settings.filters.exclude_patterns.clone(),
+        );
+        self.snippet_palette
+            .set_queue_mode(if self.snippet_settings.advanced.fifo_mode {
+                SnippetQueueMode::Fifo
+            } else if self.snippet_palette.queue_mode() == SnippetQueueMode::Fifo {
+                SnippetQueueMode::Off
+            } else {
+                self.snippet_palette.queue_mode()
+            });
+
+        let launch_on_login = self.snippet_settings.general.launch_on_startup;
+        self.persist_config_update(cx, |config| {
+            config.launch_on_login = launch_on_login;
+        });
+        if let Err(err) = set_launch_on_login(launch_on_login) {
+            log::warn!(
+                "Failed to update launch-on-login setting from snippet settings: {}",
+                err
+            );
+        }
+    }
+
+    fn show_snippet_notice(
+        &mut self,
+        title: impl Into<String>,
+        detail: impl Into<String>,
+        duration_ms: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.snippet_notice = Some(SnippetNotice {
+            title: title.into(),
+            detail: detail.into(),
+            created_at: Instant::now(),
+            duration_ms,
+        });
+        cx.notify();
+    }
+
+    fn maybe_clear_snippet_notice(&mut self) {
+        if self
+            .snippet_notice
+            .as_ref()
+            .map(|notice| notice.created_at.elapsed().as_millis() >= notice.duration_ms as u128)
+            .unwrap_or(false)
+        {
+            self.snippet_notice = None;
+        }
+    }
+
+    fn play_snippet_sound(&self) {
+        if !self.snippet_settings.general.play_sound {
+            return;
+        }
+        print!("\x07");
+        let _ = std::io::stdout().flush();
+    }
+
+    fn update_snippet_settings_draft<F>(&mut self, cx: &mut Context<Self>, mutate: F)
+    where
+        F: FnOnce(&mut SnippetSettings),
+    {
+        if let Some(draft) = self.snippet_settings_draft.as_mut() {
+            mutate(draft);
+            cx.notify();
+        }
+    }
+
+    fn cycle_snippet_setting(value: &mut String, options: &[&str]) {
+        let current = options
+            .iter()
+            .position(|candidate| value.eq_ignore_ascii_case(candidate))
+            .unwrap_or(0);
+        *value = options[(current + 1) % options.len()].to_string();
+    }
+
+    fn add_snippet_exclude_pattern(&mut self, cx: &mut Context<Self>) {
+        self.update_snippet_settings_draft(cx, |draft| {
+            if let Some(pattern) = draft.filters.exclude_patterns.last_mut() {
+                let trimmed = pattern.trim().to_string();
+                if trimmed.is_empty() {
+                    draft.filters.exclude_patterns.pop();
+                } else {
+                    *pattern = trimmed;
+                    draft.filters.exclude_patterns.push(String::new());
+                }
+            } else {
+                draft.filters.exclude_patterns.push(String::new());
+            }
+        });
+        self.snippet_settings_active_text = Some(SnippetSettingsTextField::FilterPatternInput);
+    }
+
+    fn finalize_snippet_pattern_input(&mut self, cx: &mut Context<Self>) {
+        self.update_snippet_settings_draft(cx, |draft| {
+            draft.filters.exclude_patterns = draft
+                .filters
+                .exclude_patterns
+                .iter()
+                .map(|pattern| pattern.trim())
+                .filter(|pattern| !pattern.is_empty())
+                .map(str::to_string)
+                .collect();
+        });
+        self.snippet_settings_active_text = None;
+    }
+
+    fn remove_snippet_exclude_pattern(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.update_snippet_settings_draft(cx, |draft| {
+            if index < draft.filters.exclude_patterns.len() {
+                draft.filters.exclude_patterns.remove(index);
+            }
+        });
+    }
+
+    fn export_snippet_settings_json(&mut self, cx: &mut Context<Self>) {
+        let Some(draft) = self.snippet_settings_draft.as_ref().cloned() else {
+            return;
+        };
+        let default_name = "zwg-snippet-settings.json";
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+        match draft.save_to_path(&path) {
+            Ok(()) => self.show_snippet_notice(
+                "設定を書き出しました",
+                path.display().to_string(),
+                2200,
+                cx,
+            ),
+            Err(err) => {
+                self.show_snippet_notice("設定の書き出しに失敗しました", err.to_string(), 2600, cx)
+            }
+        }
+    }
+
+    fn import_snippet_settings_json(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        match crate::snippets::SnippetSettings::import_from_path(&path) {
+            Ok(imported) => {
+                self.snippet_settings_draft = Some(imported);
+                self.snippet_settings_active_text = None;
+                self.show_snippet_notice(
+                    "設定を読み込みました",
+                    path.display().to_string(),
+                    2200,
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(err) => {
+                self.show_snippet_notice("設定の読込に失敗しました", err.to_string(), 2600, cx)
+            }
+        }
+    }
+
+    fn backup_snippets_to_file(&mut self, cx: &mut Context<Self>) {
+        let default_name = "zwg-snippets-backup.json";
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .set_file_name(default_name)
+            .save_file()
+        else {
+            return;
+        };
+
+        match std::fs::copy(self.snippet_palette.store_path(), &path) {
+            Ok(_) => self.show_snippet_notice(
+                "定型文をバックアップしました",
+                path.display().to_string(),
+                2200,
+                cx,
+            ),
+            Err(err) => {
+                self.show_snippet_notice("バックアップに失敗しました", err.to_string(), 2600, cx)
+            }
+        }
+    }
+
+    fn restore_snippet_backup(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter("JSON", &["json"])
+            .pick_file()
+        else {
+            return;
+        };
+
+        match std::fs::copy(&path, self.snippet_palette.store_path()) {
+            Ok(_) => {
+                self.snippet_palette.reload_from_disk();
+                self.show_snippet_notice(
+                    "定型文を復元しました",
+                    path.display().to_string(),
+                    2200,
+                    cx,
+                );
+                cx.notify();
+            }
+            Err(err) => self.show_snippet_notice("復元に失敗しました", err.to_string(), 2600, cx),
+        }
+    }
+
+    fn clear_all_snippets(&mut self, cx: &mut Context<Self>) {
+        if self.snippet_palette.clear_all() {
+            self.show_snippet_notice("全ての定型文を削除しました", "", 1800, cx);
+            cx.notify();
+        } else {
+            self.show_snippet_notice(
+                "定型文の削除に失敗しました",
+                "snippets.json を確認してください",
+                2200,
+                cx,
+            );
         }
     }
 
@@ -360,8 +708,10 @@ impl RootView {
     ) {
         self.show_shell_menu = false;
         self.show_settings = false;
+        self.show_snippet_settings = false;
         self.show_close_confirm = false;
         self.show_snippet_context_menu = false;
+        self.snippet_palette.set_favorites_only(false);
         self.snippet_palette.toggle();
         if self.snippet_palette.is_visible() {
             self.focus_handle.focus(window);
@@ -394,6 +744,7 @@ impl RootView {
         if should_confirm {
             self.show_shell_menu = false;
             self.show_settings = false;
+            self.show_snippet_settings = false;
             self.show_snippet_context_menu = false;
             self.snippet_palette.hide();
             self.show_close_confirm = true;
@@ -518,6 +869,20 @@ impl RootView {
             }
         }
 
+        self.play_snippet_sound();
+        if self.snippet_settings.notifications.show_paste_notification {
+            let preview = content.lines().next().unwrap_or("").trim().to_string();
+            self.show_snippet_notice(
+                "定型文を送信しました",
+                if preview.is_empty() {
+                    "空の内容でした".to_string()
+                } else {
+                    preview
+                },
+                self.snippet_settings.notifications.notification_duration,
+                cx,
+            );
+        }
         self.snippet_palette.hide();
         self.focus_active_terminal(window, cx);
         cx.notify();
@@ -542,6 +907,20 @@ impl RootView {
             }
         }
 
+        self.play_snippet_sound();
+        if self.snippet_settings.notifications.show_paste_notification {
+            let preview = content.lines().next().unwrap_or("").trim().to_string();
+            self.show_snippet_notice(
+                "キューから送信しました",
+                if preview.is_empty() {
+                    "空の内容でした".to_string()
+                } else {
+                    preview
+                },
+                self.snippet_settings.notifications.notification_duration,
+                cx,
+            );
+        }
         self.focus_active_terminal(window, cx);
         cx.notify();
     }
@@ -719,19 +1098,52 @@ impl RootView {
         let Some(editor) = self.snippet_editor.as_ref().cloned() else {
             return;
         };
+        let trim_whitespace = self.snippet_settings.filters.trim_whitespace;
+        let max_len = self.snippet_settings.advanced.max_clipboard_size;
+        let mut title = editor.title;
+        let mut content = editor.content;
+        if trim_whitespace {
+            title = title.trim().to_string();
+            content = content.trim().to_string();
+        }
+        if content.chars().count() > max_len {
+            content = content.chars().take(max_len).collect();
+        }
         let group_name = self
             .snippet_palette
             .group_name_at(editor.group_index)
             .unwrap_or("General")
             .to_string();
+        if self.snippet_settings.filters.ignore_duplicates {
+            let duplicate = self
+                .snippet_palette
+                .store()
+                .items()
+                .iter()
+                .enumerate()
+                .find(|(index, snippet)| {
+                    let same_entry = match editor.mode {
+                        SnippetEditorMode::Edit(current) => *index == current,
+                        SnippetEditorMode::Add => false,
+                    };
+                    !same_entry
+                        && snippet.title == title
+                        && snippet.content == content
+                        && snippet.group.eq_ignore_ascii_case(&group_name)
+                })
+                .is_some();
+            if duplicate {
+                return;
+            }
+        }
         let selected_store_index = match editor.mode {
             SnippetEditorMode::Add => {
                 self.snippet_palette
-                    .add_snippet(editor.title, editor.content, Some(&group_name))
+                    .add_snippet(title, content, Some(&group_name))
             }
             SnippetEditorMode::Edit(store_index) => self
                 .snippet_palette
-                .update_snippet(store_index, editor.title, editor.content, Some(&group_name))
+                .update_snippet(store_index, title, content, Some(&group_name))
                 .then_some(store_index),
         };
 
@@ -938,11 +1350,197 @@ impl RootView {
         true
     }
 
+    fn handle_snippet_settings_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.show_snippet_settings {
+            return false;
+        }
+
+        if event.keystroke.modifiers.control && event.keystroke.key == "s" {
+            self.close_snippet_settings(true, cx);
+            cx.notify();
+            return true;
+        }
+
+        match event.keystroke.key.as_ref() {
+            "escape" => {
+                self.close_snippet_settings(false, cx);
+                cx.notify();
+                return true;
+            }
+            "enter" => {
+                if self.snippet_settings_active_text
+                    == Some(SnippetSettingsTextField::FilterPatternInput)
+                {
+                    self.finalize_snippet_pattern_input(cx);
+                    cx.notify();
+                    return true;
+                }
+                return false;
+            }
+            "backspace" => {
+                if let Some(draft) = self.snippet_settings_draft.as_mut() {
+                    match self.snippet_settings_active_text {
+                        Some(SnippetSettingsTextField::ShowWindowHotkey) => {
+                            draft.hotkeys.show_window.pop();
+                            cx.notify();
+                            return true;
+                        }
+                        Some(SnippetSettingsTextField::PasteAsPlainTextHotkey) => {
+                            draft.hotkeys.paste_as_plain_text.pop();
+                            cx.notify();
+                            return true;
+                        }
+                        Some(SnippetSettingsTextField::QuickPasteHotkey) => {
+                            draft.hotkeys.quick_paste.pop();
+                            cx.notify();
+                            return true;
+                        }
+                        Some(SnippetSettingsTextField::ShowFavoritesHotkey) => {
+                            draft.hotkeys.show_favorites.pop();
+                            cx.notify();
+                            return true;
+                        }
+                        Some(SnippetSettingsTextField::ShowTemplatesHotkey) => {
+                            draft.hotkeys.show_templates.pop();
+                            cx.notify();
+                            return true;
+                        }
+                        Some(SnippetSettingsTextField::FilterPatternInput) => {
+                            if let Some(pattern) = draft.filters.exclude_patterns.last_mut() {
+                                pattern.pop();
+                                cx.notify();
+                                return true;
+                            }
+                        }
+                        Some(SnippetSettingsTextField::ExcludeApps) => {
+                            draft.advanced.exclude_apps.pop();
+                            cx.notify();
+                            return true;
+                        }
+                        None => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(text) = &event.keystroke.key_char {
+            if text.is_empty() || event.keystroke.modifiers.control {
+                return false;
+            }
+            if let Some(draft) = self.snippet_settings_draft.as_mut() {
+                match self.snippet_settings_active_text {
+                    Some(SnippetSettingsTextField::ShowWindowHotkey) => {
+                        draft.hotkeys.show_window.push_str(text);
+                    }
+                    Some(SnippetSettingsTextField::PasteAsPlainTextHotkey) => {
+                        draft.hotkeys.paste_as_plain_text.push_str(text);
+                    }
+                    Some(SnippetSettingsTextField::QuickPasteHotkey) => {
+                        draft.hotkeys.quick_paste.push_str(text);
+                    }
+                    Some(SnippetSettingsTextField::ShowFavoritesHotkey) => {
+                        draft.hotkeys.show_favorites.push_str(text);
+                    }
+                    Some(SnippetSettingsTextField::ShowTemplatesHotkey) => {
+                        draft.hotkeys.show_templates.push_str(text);
+                    }
+                    Some(SnippetSettingsTextField::FilterPatternInput) => {
+                        if let Some(pattern) = draft.filters.exclude_patterns.last_mut() {
+                            pattern.push_str(text);
+                        }
+                    }
+                    Some(SnippetSettingsTextField::ExcludeApps) => {
+                        draft.advanced.exclude_apps.push_str(text);
+                    }
+                    None => return false,
+                }
+                cx.notify();
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn handle_custom_snippet_hotkeys(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if self.show_snippet_settings
+            || self.show_settings
+            || self.snippet_group_editor.is_some()
+            || self.snippet_list_editor.is_some()
+            || self.snippet_editor.is_some()
+            || self.snippet_csv_dialog.is_some()
+        {
+            return false;
+        }
+
+        let hotkeys = &self.snippet_settings.hotkeys;
+        if hotkey_matches(event, &hotkeys.show_templates) {
+            self.show_shell_menu = false;
+            self.show_settings = false;
+            self.show_snippet_context_menu = false;
+            self.snippet_palette.set_favorites_only(false);
+            self.snippet_palette.show();
+            self.focus_handle.focus(window);
+            cx.notify();
+            return true;
+        }
+
+        if hotkey_matches(event, &hotkeys.show_favorites) {
+            self.show_shell_menu = false;
+            self.show_settings = false;
+            self.show_snippet_context_menu = false;
+            self.snippet_palette.set_favorites_only(true);
+            self.snippet_palette.show();
+            self.focus_handle.focus(window);
+            cx.notify();
+            return true;
+        }
+
+        if hotkey_matches(event, &hotkeys.quick_paste) {
+            self.snippet_palette.set_favorites_only(true);
+            self.snippet_palette.show();
+            self.activate_selected_snippet(window, cx);
+            return true;
+        }
+
+        if hotkey_matches(event, &hotkeys.paste_as_plain_text) {
+            if self.snippet_palette.is_visible() {
+                self.activate_selected_snippet(window, cx);
+                return true;
+            }
+        }
+
+        if hotkey_matches(event, &hotkeys.show_window) {
+            self.focus_handle.focus(window);
+            cx.notify();
+            return true;
+        }
+
+        false
+    }
+
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.handle_snippet_editor_key(event, cx)
+        if self.handle_snippet_settings_key(event, window, cx)
+            || self.handle_snippet_editor_key(event, cx)
             || self.handle_snippet_group_editor_key(event, cx)
             || self.handle_snippet_list_editor_key(event, window, cx)
         {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.handle_custom_snippet_hotkeys(event, window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -1566,8 +2164,14 @@ impl RootView {
 
         let panel_w = (viewport_w - 48.0).clamp(640.0, 860.0);
         let panel_h = (viewport_h - 64.0).clamp(420.0, 600.0);
-        let top = ((viewport_h - panel_h) * 0.5).max(24.0);
-        let left = ((viewport_w - panel_w) * 0.5).max(24.0);
+        let display_settings = self.snippet_settings.display.clone();
+        let (top, left) = snippet_modal_origin(
+            &display_settings.window_position,
+            viewport_w,
+            viewport_h,
+            panel_w,
+            panel_h,
+        );
         let query_is_empty = self.snippet_palette.query().is_empty();
         let display_text = if query_is_empty {
             "検索...".to_string()
@@ -1616,7 +2220,7 @@ impl RootView {
                 .rounded(px(16.0))
                 .border_1()
                 .border_color(rgba(0xD9DADDFF))
-                .bg(rgb(0xFFFFFF))
+                .bg(rgba(rgba_with_alpha(0xFFFFFF, display_settings.transparency)))
                 .shadow_lg()
                 .overflow_hidden()
                 .flex()
@@ -1777,10 +2381,7 @@ impl RootView {
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                                        this.show_settings = true;
-                                                        this.show_shell_menu = false;
-                                                        this.show_snippet_context_menu = false;
-                                                        this.snippet_palette.hide();
+                                                        this.open_snippet_settings(cx);
                                                         cx.notify();
                                                     }),
                                                 ),
@@ -1832,9 +2433,10 @@ impl RootView {
                                 )
                                 .child(
                                     div()
+                                        .id("snippet-list-scroll")
                                         .flex_1()
                                         .w_full()
-                                        .overflow_hidden()
+                                        .overflow_scroll()
                                         .px(px(10.0))
                                         .py(px(12.0))
                                 .children(if filtered_items.is_empty() {
@@ -1913,18 +2515,20 @@ impl RootView {
                                                                 .child(
                                                                     div()
                                                                         .font_family(UI_FONT)
-                                                                        .text_size(px(12.0))
+                                                                        .text_size(px(display_settings.font_size as f32 - 2.0))
                                                                         .font_weight(FontWeight::MEDIUM)
                                                                         .text_color(rgba(0x374151FF))
                                                                         .child(title.clone()),
                                                                 )
-                                                                .child(
-                                                                    div()
-                                                                        .font_family(UI_FONT)
-                                                                        .text_size(px(11.0))
-                                                                        .text_color(rgba(0x9CA3AFFF))
-                                                                        .child(summary),
-                                                                )
+                                                                .when(display_settings.show_preview, |node| {
+                                                                    node.child(
+                                                                        div()
+                                                                            .font_family(UI_FONT)
+                                                                            .text_size(px(display_settings.font_size as f32 - 3.0))
+                                                                            .text_color(rgba(0x9CA3AFFF))
+                                                                            .child(summary),
+                                                                    )
+                                                                })
                                                                 .child(
                                                                     div()
                                                                         .font_family(UI_FONT)
@@ -2083,6 +2687,934 @@ impl RootView {
                         ),
                 ));
         Some(panel.into_any_element())
+    }
+
+    fn render_snippet_settings_panel(
+        &mut self,
+        viewport_w: f32,
+        viewport_h: f32,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.show_snippet_settings {
+            return None;
+        }
+
+        let Some(settings) = self.snippet_settings_draft.clone() else {
+            return None;
+        };
+
+        let panel_w = 780.0;
+        let panel_h = 560.0;
+        let (top, left) = snippet_modal_origin(
+            &settings.display.window_position,
+            viewport_w,
+            viewport_h,
+            panel_w,
+            panel_h,
+        );
+
+        let categories = SnippetSettingsCategory::all()
+            .iter()
+            .copied()
+            .map(|category| {
+                light_settings_tab(
+                    category.label(),
+                    category == self.snippet_settings_category,
+                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                        this.snippet_settings_category = category;
+                        this.snippet_settings_active_text = None;
+                        cx.notify();
+                    }),
+                )
+                .into_any_element()
+            })
+            .collect::<Vec<_>>();
+
+        Some(
+            div()
+                .id("snippet-settings-panel")
+                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.close_snippet_settings(false, cx);
+                    cx.notify();
+                }))
+                .absolute()
+                .top(px(top))
+                .left(px(left))
+                .w(px(panel_w))
+                .h(px(panel_h))
+                .rounded(px(14.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(rgba(0xD9DADDFF))
+                .bg(rgb(0xFFFFFF))
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(px(28.0))
+                        .px(px(14.0))
+                        .bg(rgb(0xF4F4F5))
+                        .border_b_1()
+                        .border_color(rgba(0xE5E7EBFF))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(div().w(px(10.0)).h(px(10.0)).rounded_full().bg(rgb(RED)))
+                                .child(div().w(px(10.0)).h(px(10.0)).rounded_full().bg(rgb(YELLOW)))
+                                .child(div().w(px(10.0)).h(px(10.0)).rounded_full().bg(rgb(GREEN))),
+                        )
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(11.0))
+                                .text_color(rgba(0x6B7280FF))
+                                .child("設定"),
+                        )
+                        .child(div().w(px(46.0))),
+                )
+                .child(
+                    div()
+                        .h(px(40.0))
+                        .px(px(16.0))
+                        .border_b_1()
+                        .border_color(rgba(0xE5E7EBFF))
+                        .bg(rgb(0xFAFAFB))
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .w(px(24.0))
+                                .h(px(24.0))
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .hover(|style| style.bg(rgba(0xEEF2F7FF)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.close_snippet_settings(false, cx);
+                                        cx.notify();
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(14.0))
+                                        .text_color(rgba(0x4B5563FF))
+                                        .child("<"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(16.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgba(0x1F2937FF))
+                                .child("設定"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .w(px(160.0))
+                                .h_full()
+                                .bg(rgb(0xF6F7F8))
+                                .border_r_1()
+                                .border_color(rgba(0xE5E7EBFF))
+                                .p(px(8.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .children(categories),
+                        )
+                        .child(
+                            div()
+                                .id("snippet-settings-content-scroll")
+                                .flex_1()
+                                .h_full()
+                                .bg(rgb(0xFFFFFF))
+                                .overflow_scroll()
+                                .p(px(20.0))
+                                .children(Some(self.render_snippet_settings_content(cx))),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(44.0))
+                        .px(px(14.0))
+                        .border_t_1()
+                        .border_color(rgba(0xE5E7EBFF))
+                        .bg(rgb(0xFAFAFB))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(10.0))
+                                .text_color(rgba(0x9CA3AFFF))
+                                .child(format!("ZWG snippets v{}", env!("CARGO_PKG_VERSION"))),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(light_secondary_button(
+                                    "キャンセル",
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.close_snippet_settings(false, cx);
+                                        cx.notify();
+                                    }),
+                                ))
+                                .child(light_primary_button(
+                                    "保存",
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.close_snippet_settings(true, cx);
+                                        cx.notify();
+                                    }),
+                                )),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_snippet_settings_content(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        match self.snippet_settings_category {
+            SnippetSettingsCategory::General => {
+                self.render_snippet_settings_general(cx).into_any_element()
+            }
+            SnippetSettingsCategory::Hotkeys => {
+                self.render_snippet_settings_hotkeys(cx).into_any_element()
+            }
+            SnippetSettingsCategory::Display => {
+                self.render_snippet_settings_display(cx).into_any_element()
+            }
+            SnippetSettingsCategory::Filters => {
+                self.render_snippet_settings_filters(cx).into_any_element()
+            }
+            SnippetSettingsCategory::Templates => self
+                .render_snippet_settings_templates(cx)
+                .into_any_element(),
+            SnippetSettingsCategory::Notifications => self
+                .render_snippet_settings_notifications(cx)
+                .into_any_element(),
+            SnippetSettingsCategory::Data => {
+                self.render_snippet_settings_data(cx).into_any_element()
+            }
+            SnippetSettingsCategory::Advanced => {
+                self.render_snippet_settings_advanced(cx).into_any_element()
+            }
+        }
+    }
+
+    fn render_snippet_settings_general(&mut self, cx: &mut Context<Self>) -> Div {
+        let settings = self
+            .snippet_settings_draft
+            .clone()
+            .unwrap_or_else(|| self.snippet_settings.clone());
+        let general = settings.general;
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(18.0))
+            .child(light_section_title("一般設定"))
+            .child(light_toggle_row(
+                "起動時に自動起動",
+                "Windows 起動時に ZWG Terminal を自動起動します",
+                general.launch_on_startup,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.general.launch_on_startup = !draft.general.launch_on_startup;
+                    });
+                }),
+            ))
+            .child(light_toggle_row(
+                "メニューバーに表示",
+                "タイトルバーの定型文ボタンを表示します",
+                general.show_in_taskbar,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.general.show_in_taskbar = !draft.general.show_in_taskbar;
+                    });
+                }),
+            ))
+            .child(light_toggle_row(
+                "トレイに最小化",
+                "ウィンドウを閉じたときにトレイ運用を優先します",
+                general.minimize_to_tray,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.general.minimize_to_tray = !draft.general.minimize_to_tray;
+                    });
+                }),
+            ))
+            .child(light_toggle_row(
+                "サウンドを再生",
+                "定型文を送信したときにシステムサウンドを鳴らします",
+                general.play_sound,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.general.play_sound = !draft.general.play_sound;
+                    });
+                }),
+            ))
+            .child(light_toggle_row(
+                "自動更新チェック",
+                "更新確認フラグを保存します",
+                general.check_updates,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.general.check_updates = !draft.general.check_updates;
+                    });
+                }),
+            ))
+            .child(light_slider_row(
+                "最大履歴数",
+                format!(
+                    "保存する定型文の上限として扱います: {}",
+                    general.max_history_items
+                ),
+                general.max_history_items.to_string(),
+                general.max_history_items as f32 / 5000.0,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.general.max_history_items =
+                            draft.general.max_history_items.saturating_sub(100).max(100);
+                    });
+                }),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.general.max_history_items =
+                            (draft.general.max_history_items + 100).min(5000);
+                    });
+                }),
+            ))
+    }
+
+    fn render_snippet_settings_hotkeys(&mut self, cx: &mut Context<Self>) -> Div {
+        let settings = self
+            .snippet_settings_draft
+            .clone()
+            .unwrap_or_else(|| self.snippet_settings.clone());
+        let hotkeys = settings.hotkeys;
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(light_section_title("ホットキー設定"))
+            .child(light_editable_row(
+                "ウィンドウを表示",
+                "現在のウィンドウを前面フォーカスします",
+                hotkeys.show_window,
+                self.snippet_settings_active_text == Some(SnippetSettingsTextField::ShowWindowHotkey),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.snippet_settings_active_text = Some(SnippetSettingsTextField::ShowWindowHotkey);
+                    cx.notify();
+                }),
+            ))
+            .child(light_editable_row(
+                "プレーンテキストとして貼り付け",
+                "パレット表示中の選択定型文を送信します",
+                hotkeys.paste_as_plain_text,
+                self.snippet_settings_active_text
+                    == Some(SnippetSettingsTextField::PasteAsPlainTextHotkey),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.snippet_settings_active_text =
+                        Some(SnippetSettingsTextField::PasteAsPlainTextHotkey);
+                    cx.notify();
+                }),
+            ))
+            .child(light_editable_row(
+                "クイック貼り付け",
+                "お気に入りの先頭項目を即送信します",
+                hotkeys.quick_paste,
+                self.snippet_settings_active_text == Some(SnippetSettingsTextField::QuickPasteHotkey),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.snippet_settings_active_text = Some(SnippetSettingsTextField::QuickPasteHotkey);
+                    cx.notify();
+                }),
+            ))
+            .child(light_editable_row(
+                "お気に入りを表示",
+                "お気に入りのみ表示した定型文パレットを開きます",
+                hotkeys.show_favorites,
+                self.snippet_settings_active_text
+                    == Some(SnippetSettingsTextField::ShowFavoritesHotkey),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.snippet_settings_active_text =
+                        Some(SnippetSettingsTextField::ShowFavoritesHotkey);
+                    cx.notify();
+                }),
+            ))
+            .child(light_editable_row(
+                "定型文を表示",
+                "通常の定型文パレットを開きます",
+                hotkeys.show_templates,
+                self.snippet_settings_active_text
+                    == Some(SnippetSettingsTextField::ShowTemplatesHotkey),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.snippet_settings_active_text =
+                        Some(SnippetSettingsTextField::ShowTemplatesHotkey);
+                    cx.notify();
+                }),
+            ))
+            .child(light_info_box(
+                "入力欄をクリックしてからキー文字を打ち込めます。保存後に現在のウィンドウ内で有効になります。",
+            ))
+    }
+
+    fn render_snippet_settings_display(&mut self, cx: &mut Context<Self>) -> Div {
+        let settings = self
+            .snippet_settings_draft
+            .clone()
+            .unwrap_or_else(|| self.snippet_settings.clone());
+        let display = settings.display;
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(light_section_title("表示設定"))
+            .child(light_cycle_row(
+                "テーマ",
+                "定型文パレットの配色テーマです",
+                theme_label(&display.theme),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        Self::cycle_snippet_setting(
+                            &mut draft.display.theme,
+                            &["light", "dark", "auto"],
+                        );
+                    });
+                }),
+            ))
+            .child(light_cycle_row(
+                "ウィンドウの表示位置",
+                "定型文パレットと設定モーダルの初期位置です",
+                window_position_label(&display.window_position),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        Self::cycle_snippet_setting(
+                            &mut draft.display.window_position,
+                            &[
+                                "center",
+                                "cursor",
+                                "topLeft",
+                                "topRight",
+                                "bottomLeft",
+                                "bottomRight",
+                            ],
+                        );
+                    });
+                }),
+            ))
+            .child(light_cycle_row(
+                "1ページあたりの表示件数",
+                "パレットの可視行数目安として扱います",
+                format!("{}件", display.items_per_page),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        let options = [10, 20, 50, 100];
+                        let current = options
+                            .iter()
+                            .position(|value| *value == draft.display.items_per_page)
+                            .unwrap_or(1);
+                        draft.display.items_per_page = options[(current + 1) % options.len()];
+                    });
+                }),
+            ))
+            .child(light_slider_row(
+                "フォントサイズ",
+                format!("定型文パレットの UI スケール: {}px", display.font_size),
+                format!("{}px", display.font_size),
+                display.font_size as f32 / 20.0,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.display.font_size = draft.display.font_size.saturating_sub(1).max(10);
+                    });
+                }),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.display.font_size = (draft.display.font_size + 1).min(20);
+                    });
+                }),
+            ))
+            .child(light_slider_row(
+                "透明度",
+                format!("モーダル背景の不透明度: {}%", display.transparency),
+                format!("{}%", display.transparency),
+                display.transparency as f32 / 100.0,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.display.transparency =
+                            draft.display.transparency.saturating_sub(5).max(50);
+                    });
+                }),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.display.transparency = (draft.display.transparency + 5).min(100);
+                    });
+                }),
+            ))
+            .child(light_toggle_row(
+                "プレビューを表示",
+                "定型文カードに内容の 1 行目を表示します",
+                display.show_preview,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.display.show_preview = !draft.display.show_preview;
+                    });
+                }),
+            ))
+    }
+
+    fn render_snippet_settings_filters(&mut self, cx: &mut Context<Self>) -> Div {
+        let settings = self
+            .snippet_settings_draft
+            .clone()
+            .unwrap_or_else(|| self.snippet_settings.clone());
+        let filters = settings.filters;
+        let editing_pattern = if self.snippet_settings_active_text
+            == Some(SnippetSettingsTextField::FilterPatternInput)
+        {
+            filters.exclude_patterns.last().cloned().unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(light_section_title("フィルタ設定"))
+            .child(light_toggle_row(
+                "大文字小文字を無視",
+                "検索時にケースを無視します",
+                filters.ignore_case,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.filters.ignore_case = !draft.filters.ignore_case;
+                    });
+                }),
+            ))
+            .child(light_toggle_row(
+                "前後の空白を除去",
+                "定型文保存時の余分な空白を抑制します",
+                filters.trim_whitespace,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.filters.trim_whitespace = !draft.filters.trim_whitespace;
+                    });
+                }),
+            ))
+            .child(light_toggle_row(
+                "重複を無視",
+                "同一内容の登録抑止フラグを保存します",
+                filters.ignore_duplicates,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.filters.ignore_duplicates = !draft.filters.ignore_duplicates;
+                    });
+                }),
+            ))
+            .child(light_slider_row(
+                "最小文字数",
+                format!(
+                    "この文字数未満の定型文は一覧から除外します: {}",
+                    filters.min_text_length
+                ),
+                filters.min_text_length.to_string(),
+                filters.min_text_length.min(20) as f32 / 20.0,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.filters.min_text_length =
+                            draft.filters.min_text_length.saturating_sub(1).max(1);
+                    });
+                }),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.filters.min_text_length =
+                            (draft.filters.min_text_length + 1).min(1000);
+                    });
+                }),
+            ))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(light_section_subtitle("除外パターン"))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(light_text_input_box(
+                                editing_pattern,
+                                "例: password",
+                                self.snippet_settings_active_text
+                                    == Some(SnippetSettingsTextField::FilterPatternInput),
+                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    this.update_snippet_settings_draft(cx, |draft| {
+                                        if draft.filters.exclude_patterns.last().is_none()
+                                            || draft
+                                                .filters
+                                                .exclude_patterns
+                                                .last()
+                                                .map(|pattern| !pattern.is_empty())
+                                                .unwrap_or(false)
+                                        {
+                                            draft.filters.exclude_patterns.push(String::new());
+                                        }
+                                    });
+                                    this.snippet_settings_active_text =
+                                        Some(SnippetSettingsTextField::FilterPatternInput);
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(light_square_button(
+                                "+",
+                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    if this.snippet_settings_active_text
+                                        == Some(SnippetSettingsTextField::FilterPatternInput)
+                                    {
+                                        this.finalize_snippet_pattern_input(cx);
+                                    } else {
+                                        this.add_snippet_exclude_pattern(cx);
+                                    }
+                                    cx.notify();
+                                }),
+                            )),
+                    )
+                    .children(
+                        filters
+                            .exclude_patterns
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, pattern)| !pattern.trim().is_empty())
+                            .map(|(index, pattern)| {
+                                light_pattern_chip(
+                                    pattern.clone(),
+                                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                        this.remove_snippet_exclude_pattern(index, cx);
+                                    }),
+                                )
+                                .into_any_element()
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+            )
+    }
+
+    fn render_snippet_settings_templates(&mut self, cx: &mut Context<Self>) -> Div {
+        let items = self.snippet_palette.store().items().to_vec();
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .child(
+                div()
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(light_section_title("定型文管理"))
+                    .child(light_outline_button(
+                        "新規作成",
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.open_snippet_editor(SnippetEditorMode::Add, None);
+                            cx.notify();
+                        }),
+                    )),
+            )
+            .children(if items.is_empty() {
+                vec![light_empty_state("定型文が登録されていません").into_any_element()]
+            } else {
+                items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, item)| {
+                        let preview = item.content.replace('\n', " ");
+                        light_template_card(
+                            item.title.clone(),
+                            item.group.clone(),
+                            preview,
+                            item.is_favorite,
+                            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                this.open_snippet_editor(SnippetEditorMode::Edit(index), None);
+                                cx.notify();
+                            }),
+                            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                let _ = this.snippet_palette.delete_snippet(index);
+                                cx.notify();
+                            }),
+                        )
+                        .into_any_element()
+                    })
+                    .collect::<Vec<_>>()
+            })
+    }
+
+    fn render_snippet_settings_notifications(&mut self, cx: &mut Context<Self>) -> Div {
+        let settings = self
+            .snippet_settings_draft
+            .clone()
+            .unwrap_or_else(|| self.snippet_settings.clone());
+        let notifications = settings.notifications;
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(light_section_title("通知設定"))
+            .child(light_toggle_row(
+                "コピー時に通知",
+                "定型文設定の保存や入出力結果を通知します",
+                notifications.show_copy_notification,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.notifications.show_copy_notification =
+                            !draft.notifications.show_copy_notification;
+                    });
+                }),
+            ))
+            .child(light_toggle_row(
+                "貼り付け時に通知",
+                "定型文送信時にトーストを表示します",
+                notifications.show_paste_notification,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.notifications.show_paste_notification =
+                            !draft.notifications.show_paste_notification;
+                    });
+                }),
+            ))
+            .child(light_cycle_row(
+                "通知の表示位置",
+                "簡易トーストの表示位置です",
+                notification_position_label(&notifications.notification_position),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        Self::cycle_snippet_setting(
+                            &mut draft.notifications.notification_position,
+                            &["topLeft", "topRight", "bottomLeft", "bottomRight"],
+                        );
+                    });
+                }),
+            ))
+            .child(light_slider_row(
+                "通知の表示時間",
+                format!(
+                    "{} 秒表示します",
+                    notifications.notification_duration as f32 / 1000.0
+                ),
+                format!("{}ms", notifications.notification_duration),
+                notifications.notification_duration as f32 / 5000.0,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.notifications.notification_duration = draft
+                            .notifications
+                            .notification_duration
+                            .saturating_sub(500)
+                            .max(1000);
+                    });
+                }),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.notifications.notification_duration =
+                            (draft.notifications.notification_duration + 500).min(5000);
+                    });
+                }),
+            ))
+            .child(light_preview_box(
+                "通知のプレビュー",
+                "定型文を送信しました",
+                "echo \"Hello, world!\"",
+            ))
+    }
+
+    fn render_snippet_settings_data(&mut self, cx: &mut Context<Self>) -> Div {
+        let settings_size = std::fs::metadata(crate::snippets::SnippetSettings::default_path())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+        let snippets_size = std::fs::metadata(self.snippet_palette.store_path())
+            .map(|metadata| metadata.len())
+            .unwrap_or(0);
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(14.0))
+            .child(light_section_title("データ管理"))
+            .child(light_action_card(
+                "設定のエクスポート",
+                "現在の定型文設定を JSON として書き出します",
+                "設定をエクスポート",
+                false,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.export_snippet_settings_json(cx);
+                }),
+            ))
+            .child(light_action_card(
+                "設定のインポート",
+                "以前書き出した JSON を読み込みます",
+                "設定をインポート",
+                false,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.import_snippet_settings_json(cx);
+                }),
+            ))
+            .child(
+                div()
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(rgba(0xE5E7EBFF))
+                    .bg(rgb(0xFFFFFF))
+                    .p(px(14.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(10.0))
+                    .child(light_section_subtitle("バックアップ"))
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .child(light_secondary_button(
+                                "バックアップ作成",
+                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    this.backup_snippets_to_file(cx);
+                                }),
+                            ))
+                            .child(light_secondary_button(
+                                "バックアップ復元",
+                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    this.restore_snippet_backup(cx);
+                                }),
+                            )),
+                    ),
+            )
+            .child(light_action_card(
+                "データの削除",
+                "全ての定型文を即時削除します。元に戻せません",
+                "全ての定型文を削除",
+                true,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.clear_all_snippets(cx);
+                }),
+            ))
+            .child(light_storage_card(
+                self.snippet_palette.item_count(),
+                self.snippet_palette.favorite_count(),
+                self.snippet_palette.queue_len(),
+                settings_size + snippets_size,
+            ))
+    }
+
+    fn render_snippet_settings_advanced(&mut self, cx: &mut Context<Self>) -> Div {
+        let settings = self
+            .snippet_settings_draft
+            .clone()
+            .unwrap_or_else(|| self.snippet_settings.clone());
+        let advanced = settings.advanced;
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(light_section_title("詳細設定"))
+            .child(light_toggle_row(
+                "自動保存",
+                "設定値の即時保存フラグを保持します",
+                advanced.auto_save,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.advanced.auto_save = !draft.advanced.auto_save;
+                    });
+                }),
+            ))
+            .child(light_toggle_row(
+                "クリップボード監視",
+                "将来の連携用フラグを保持します",
+                advanced.monitor_clipboard,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.advanced.monitor_clipboard = !draft.advanced.monitor_clipboard;
+                    });
+                }),
+            ))
+            .child(light_toggle_row(
+                "FIFO モード",
+                "保存後に定型文キューを FIFO にします",
+                advanced.fifo_mode,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.advanced.fifo_mode = !draft.advanced.fifo_mode;
+                    });
+                }),
+            ))
+            .child(light_toggle_row(
+                "パスワード保護",
+                "保護フラグを保持します",
+                advanced.enable_password,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.advanced.enable_password = !draft.advanced.enable_password;
+                    });
+                }),
+            ))
+            .child(light_slider_row(
+                "最大クリップボードサイズ",
+                format!("登録可能な本文上限: {} 文字", advanced.max_clipboard_size),
+                advanced.max_clipboard_size.to_string(),
+                advanced.max_clipboard_size as f32 / 50_000.0,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.advanced.max_clipboard_size = draft
+                            .advanced
+                            .max_clipboard_size
+                            .saturating_sub(1000)
+                            .max(1000);
+                    });
+                }),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.update_snippet_settings_draft(cx, |draft| {
+                        draft.advanced.max_clipboard_size =
+                            (draft.advanced.max_clipboard_size + 1000).min(50_000);
+                    });
+                }),
+            ))
+            .child(light_editable_multiline_row(
+                "除外するアプリケーション",
+                "カンマ区切りで管理用メモを保存します",
+                advanced.exclude_apps,
+                self.snippet_settings_active_text == Some(SnippetSettingsTextField::ExcludeApps),
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.snippet_settings_active_text = Some(SnippetSettingsTextField::ExcludeApps);
+                    cx.notify();
+                }),
+            ))
+            .child(light_warning_box(
+                "詳細設定の一部は将来のクリップボード機能拡張に向けた保存項目です。",
+            ))
     }
 
     fn render_snippet_context_menu(
@@ -3861,6 +5393,8 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.maybe_clear_snippet_notice();
+
         let bounds = window.bounds();
         let new_state = WindowState {
             x: f32::from(bounds.origin.x),
@@ -3995,7 +5529,7 @@ impl Render for RootView {
             tab_elements.push(tab.into_any_element());
         }
 
-        let titlebar_actions = div()
+        let mut titlebar_actions = div()
             .flex()
             .items_center()
             .gap(px(4.0))
@@ -4003,6 +5537,7 @@ impl Render for RootView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                     this.show_settings = false;
+                    this.show_snippet_settings = false;
                     this.show_snippet_context_menu = false;
                     this.snippet_palette.hide();
                     this.show_shell_menu = true;
@@ -4014,22 +5549,27 @@ impl Render for RootView {
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                         this.show_settings = false;
+                        this.show_snippet_settings = false;
                         this.show_snippet_context_menu = false;
                         this.snippet_palette.hide();
                         this.show_shell_menu = true;
                         cx.notify();
                     }),
                 ),
-            )
-            .child(
+            );
+
+        if self.snippet_settings.general.show_in_taskbar {
+            titlebar_actions = titlebar_actions.child(
                 chrome_button("title-snippets", "ui/snippets.svg")
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, window, cx| {
                             this.show_shell_menu = false;
                             this.show_settings = false;
+                            this.show_snippet_settings = false;
                             this.show_close_confirm = false;
                             this.show_snippet_context_menu = false;
+                            this.snippet_palette.set_favorites_only(false);
                             this.snippet_palette.toggle();
                             if this.snippet_palette.is_visible() {
                                 this.focus_handle.focus(window);
@@ -4044,25 +5584,29 @@ impl Render for RootView {
                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                             this.show_shell_menu = false;
                             this.show_settings = false;
+                            this.show_snippet_settings = false;
                             this.show_close_confirm = false;
                             this.snippet_palette.hide();
                             this.show_snippet_context_menu = !this.show_snippet_context_menu;
                             cx.notify();
                         }),
                     ),
-            )
-            .child(
-                chrome_button("title-settings", "ui/settings.svg").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                        this.show_shell_menu = false;
-                        this.show_snippet_context_menu = false;
-                        this.snippet_palette.hide();
-                        this.show_settings = true;
-                        cx.notify();
-                    }),
-                ),
             );
+        }
+
+        titlebar_actions = titlebar_actions.child(
+            chrome_button("title-settings", "ui/settings.svg").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.show_shell_menu = false;
+                    this.show_snippet_context_menu = false;
+                    this.show_snippet_settings = false;
+                    this.snippet_palette.hide();
+                    this.show_settings = true;
+                    cx.notify();
+                }),
+            ),
+        );
 
         let title_bar = div()
             .id("title-bar")
@@ -4115,6 +5659,20 @@ impl Render for RootView {
             Some(
                 div()
                     .id("settings-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba(BACKDROP)),
+            )
+        } else {
+            None
+        };
+
+        let snippet_settings_backdrop = if self.show_snippet_settings {
+            Some(
+                div()
+                    .id("snippet-settings-backdrop")
                     .absolute()
                     .top_0()
                     .left_0()
@@ -4197,6 +5755,13 @@ impl Render for RootView {
             ))
             .children(settings_backdrop)
             .children(self.render_settings_panel(new_state.width, new_state.height, window, cx))
+            .children(snippet_settings_backdrop)
+            .children(self.render_snippet_settings_panel(
+                new_state.width,
+                new_state.height,
+                window,
+                cx,
+            ))
             .children(self.render_snippet_context_menu(
                 new_state.width,
                 new_state.height,
@@ -4219,6 +5784,10 @@ impl Render for RootView {
             ))
             .children(self.render_snippet_editor(new_state.width, new_state.height, window, cx))
             .children(self.render_snippet_csv_dialog(new_state.width, new_state.height, window, cx))
+            .children(render_snippet_notice(
+                self.snippet_notice.as_ref(),
+                &self.snippet_settings.notifications.notification_position,
+            ))
             .children(close_confirm_backdrop)
             .children(self.render_close_confirm_dialog(new_state.width, new_state.height, cx))
     }
@@ -4405,6 +5974,810 @@ fn snippet_list_icon_button(
         .hover(move |style| style.bg(hover_bg))
         .child(svg().path(icon_path).size(px(12.0)).text_color(icon_color))
         .on_mouse_down(MouseButton::Left, listener)
+}
+
+fn render_snippet_notice(notice: Option<&SnippetNotice>, position: &str) -> Option<AnyElement> {
+    let notice = notice?;
+    let (top, left, right, bottom) = match position {
+        "topLeft" => (16.0, Some(16.0), None, None),
+        "bottomLeft" => (0.0, Some(16.0), None, Some(16.0)),
+        "bottomRight" => (0.0, None, Some(16.0), Some(16.0)),
+        _ => (16.0, None, Some(16.0), None),
+    };
+    let mut card = div()
+        .id("snippet-notice")
+        .absolute()
+        .w(px(280.0))
+        .rounded(px(12.0))
+        .border_1()
+        .border_color(rgba(0xBFDBFEFF))
+        .bg(rgba(0xEFF6FFFF))
+        .shadow_lg()
+        .p(px(12.0))
+        .flex()
+        .flex_col()
+        .gap(px(4.0));
+
+    if let Some(right) = right {
+        card = card.right(px(right));
+    }
+    if let Some(left) = left {
+        card = card.left(px(left));
+    }
+    if let Some(bottom) = bottom {
+        card = card.bottom(px(bottom));
+    } else {
+        card = card.top(px(top));
+    }
+
+    Some(
+        card.child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(12.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgba(0x1D4ED8FF))
+                .child(notice.title.clone()),
+        )
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(11.0))
+                .text_color(rgba(0x334155FF))
+                .child(notice.detail.clone()),
+        )
+        .into_any_element(),
+    )
+}
+
+fn snippet_modal_origin(
+    position: &str,
+    viewport_w: f32,
+    viewport_h: f32,
+    panel_w: f32,
+    panel_h: f32,
+) -> (f32, f32) {
+    match position {
+        "topLeft" => (24.0, 24.0),
+        "topRight" => (24.0, (viewport_w - panel_w - 24.0).max(24.0)),
+        "bottomLeft" => ((viewport_h - panel_h - 24.0).max(24.0), 24.0),
+        "bottomRight" => (
+            (viewport_h - panel_h - 24.0).max(24.0),
+            (viewport_w - panel_w - 24.0).max(24.0),
+        ),
+        _ => (
+            ((viewport_h - panel_h) * 0.5).max(24.0),
+            ((viewport_w - panel_w) * 0.5).max(24.0),
+        ),
+    }
+}
+
+fn light_settings_tab(
+    label: &'static str,
+    active: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .w_full()
+        .px(px(12.0))
+        .py(px(10.0))
+        .rounded(px(8.0))
+        .cursor_pointer()
+        .font_family(UI_FONT)
+        .text_size(px(12.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(if active {
+            rgba(0xFFFFFFFF)
+        } else {
+            rgba(0x374151FF)
+        })
+        .bg(if active {
+            rgba(0x3B82F6FF)
+        } else {
+            rgba(0x00000000)
+        })
+        .hover(|style| style.bg(rgba(0xE5E7EBFF)))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(label)
+}
+
+fn light_section_title(label: &'static str) -> Div {
+    div()
+        .font_family(UI_FONT)
+        .text_size(px(18.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgba(0x1F2937FF))
+        .child(label)
+}
+
+fn light_section_subtitle(label: &'static str) -> Div {
+    div()
+        .font_family(UI_FONT)
+        .text_size(px(13.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgba(0x374151FF))
+        .child(label)
+}
+
+fn light_toggle_row(
+    title: &'static str,
+    description: impl Into<String>,
+    checked: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    light_form_row(title, description, light_toggle_control(checked, listener))
+}
+
+fn light_cycle_row(
+    title: &'static str,
+    description: impl Into<String>,
+    value: impl Into<String>,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    light_form_row(title, description, light_cycle_box(value.into(), listener))
+}
+
+fn light_slider_row(
+    title: &'static str,
+    description: impl Into<String>,
+    value: impl Into<String>,
+    ratio: f32,
+    minus_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    plus_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    light_form_row(
+        title,
+        description,
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(light_square_button("-", minus_listener))
+            .child(light_slider_bar(ratio, value.into()))
+            .child(light_square_button("+", plus_listener)),
+    )
+}
+
+fn light_editable_row(
+    title: &'static str,
+    description: impl Into<String>,
+    value: impl Into<String>,
+    active: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    light_form_row(
+        title,
+        description,
+        light_text_input_box(value.into(), "", active, listener),
+    )
+}
+
+fn light_editable_multiline_row(
+    title: &'static str,
+    description: impl Into<String>,
+    value: impl Into<String>,
+    active: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    light_form_row(
+        title,
+        description,
+        light_text_area_box(value.into(), active, listener),
+    )
+}
+
+fn light_form_row(
+    title: &'static str,
+    description: impl Into<String>,
+    control: impl IntoElement,
+) -> Div {
+    div()
+        .w_full()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(rgba(0xE5E7EBFF))
+        .bg(rgb(0xFFFFFF))
+        .p(px(14.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(16.0))
+        .child(
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .gap(px(3.0))
+                .child(
+                    div()
+                        .font_family(UI_FONT)
+                        .text_size(px(13.0))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(rgba(0x1F2937FF))
+                        .child(title),
+                )
+                .child(
+                    div()
+                        .font_family(UI_FONT)
+                        .text_size(px(11.0))
+                        .text_color(rgba(0x6B7280FF))
+                        .child(description.into()),
+                ),
+        )
+        .child(control)
+}
+
+fn light_toggle_control(
+    checked: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .w(px(38.0))
+        .h(px(22.0))
+        .rounded_full()
+        .cursor_pointer()
+        .bg(if checked {
+            rgba(0x111827FF)
+        } else {
+            rgba(0xD1D5DBFF)
+        })
+        .p(px(2.0))
+        .flex()
+        .justify_start()
+        .when(checked, |style| style.justify_end())
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(
+            div()
+                .w(px(18.0))
+                .h(px(18.0))
+                .rounded_full()
+                .bg(rgb(0xFFFFFF)),
+        )
+}
+
+fn light_cycle_box(
+    value: String,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .min_w(px(140.0))
+        .h(px(34.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(rgba(0xD1D5DBFF))
+        .bg(rgb(0xF9FAFB))
+        .px(px(12.0))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_between()
+        .hover(|style| style.bg(rgba(0xF3F4F6FF)))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(12.0))
+                .text_color(rgba(0x374151FF))
+                .child(value),
+        )
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(10.0))
+                .text_color(rgba(0x9CA3AFFF))
+                .child("v"),
+        )
+}
+
+fn light_text_input_box(
+    value: String,
+    placeholder: &'static str,
+    active: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .min_w(px(180.0))
+        .h(px(34.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(if active {
+            rgba(0x60A5FAFF)
+        } else {
+            rgba(0xD1D5DBFF)
+        })
+        .bg(rgb(0xFFFFFF))
+        .px(px(12.0))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(12.0))
+                .text_color(if value.is_empty() {
+                    rgba(0x9CA3AFFF)
+                } else {
+                    rgba(0x111827FF)
+                })
+                .child(if value.is_empty() {
+                    placeholder.to_string()
+                } else {
+                    value
+                }),
+        )
+}
+
+fn light_text_area_box(
+    value: String,
+    active: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .w(px(260.0))
+        .min_h(px(72.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(if active {
+            rgba(0x60A5FAFF)
+        } else {
+            rgba(0xD1D5DBFF)
+        })
+        .bg(rgb(0xFFFFFF))
+        .p(px(10.0))
+        .cursor_pointer()
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(12.0))
+                .text_color(if value.is_empty() {
+                    rgba(0x9CA3AFFF)
+                } else {
+                    rgba(0x111827FF)
+                })
+                .child(if value.is_empty() {
+                    "例: 1Password, KeePassXC".to_string()
+                } else {
+                    value
+                }),
+        )
+}
+
+fn light_square_button(
+    label: &'static str,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .w(px(28.0))
+        .h(px(28.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(rgba(0xD1D5DBFF))
+        .bg(rgb(0xFFFFFF))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .hover(|style| style.bg(rgba(0xF3F4F6FF)))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(13.0))
+                .text_color(rgba(0x374151FF))
+                .child(label),
+        )
+}
+
+fn light_slider_bar(ratio: f32, value: String) -> Div {
+    let fill = ratio.clamp(0.0, 1.0) * 120.0;
+    div()
+        .w(px(120.0))
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(11.0))
+                .text_color(rgba(0x6B7280FF))
+                .child(value),
+        )
+        .child(
+            div()
+                .w(px(120.0))
+                .h(px(8.0))
+                .rounded_full()
+                .bg(rgba(0xE5E7EBFF))
+                .child(
+                    div()
+                        .w(px(fill))
+                        .h(px(8.0))
+                        .rounded_full()
+                        .bg(rgba(0x111827FF)),
+                ),
+        )
+}
+
+fn light_primary_button(
+    label: &'static str,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .px(px(14.0))
+        .py(px(8.0))
+        .rounded(px(8.0))
+        .bg(rgba(0x111827FF))
+        .cursor_pointer()
+        .font_family(UI_FONT)
+        .text_size(px(12.0))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(rgba(0xFFFFFFFF))
+        .hover(|style| style.bg(rgba(0x1F2937FF)))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(label)
+}
+
+fn light_secondary_button(
+    label: &'static str,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .px(px(14.0))
+        .py(px(8.0))
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(rgba(0xD1D5DBFF))
+        .bg(rgb(0xFFFFFF))
+        .cursor_pointer()
+        .font_family(UI_FONT)
+        .text_size(px(12.0))
+        .text_color(rgba(0x374151FF))
+        .hover(|style| style.bg(rgba(0xF9FAFBFF)))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(label)
+}
+
+fn light_outline_button(
+    label: &'static str,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    light_secondary_button(label, listener)
+}
+
+fn light_info_box(message: &'static str) -> Div {
+    div()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(rgba(0xBFDBFEFF))
+        .bg(rgba(0xEFF6FFFF))
+        .p(px(12.0))
+        .font_family(UI_FONT)
+        .text_size(px(11.0))
+        .text_color(rgba(0x1D4ED8FF))
+        .child(message)
+}
+
+fn light_warning_box(message: &'static str) -> Div {
+    div()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(rgba(0xFDE68AFF))
+        .bg(rgba(0xFEFCE8FF))
+        .p(px(12.0))
+        .font_family(UI_FONT)
+        .text_size(px(11.0))
+        .text_color(rgba(0x92400EFF))
+        .child(message)
+}
+
+fn light_pattern_chip(
+    pattern: String,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .w_full()
+        .rounded(px(8.0))
+        .border_1()
+        .border_color(rgba(0xE5E7EBFF))
+        .bg(rgb(0xF9FAFB))
+        .px(px(10.0))
+        .py(px(8.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .font_family("JetBrains Mono")
+                .text_size(px(11.0))
+                .text_color(rgba(0x374151FF))
+                .child(pattern),
+        )
+        .child(light_square_button("x", listener))
+}
+
+fn light_template_card(
+    title: String,
+    group: String,
+    preview: String,
+    favorite: bool,
+    edit_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    delete_listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(rgba(0xE5E7EBFF))
+        .bg(rgb(0xFFFFFF))
+        .p(px(14.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(
+            div()
+                .w_full()
+                .flex()
+                .items_start()
+                .justify_between()
+                .gap(px(12.0))
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(4.0))
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(13.0))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(rgba(0x111827FF))
+                                .child(if favorite {
+                                    format!("{}  *", title)
+                                } else {
+                                    title
+                                }),
+                        )
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(10.0))
+                                .text_color(rgba(0x6B7280FF))
+                                .child(group),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(light_secondary_button("編集", edit_listener))
+                        .child(
+                            div()
+                                .px(px(12.0))
+                                .py(px(8.0))
+                                .rounded(px(8.0))
+                                .bg(rgba(0xDC2626FF))
+                                .cursor_pointer()
+                                .font_family(UI_FONT)
+                                .text_size(px(12.0))
+                                .text_color(rgba(0xFFFFFFFF))
+                                .hover(|style| style.bg(rgba(0xB91C1CFF)))
+                                .on_mouse_down(MouseButton::Left, delete_listener)
+                                .child("削除"),
+                        ),
+                ),
+        )
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(11.0))
+                .text_color(rgba(0x4B5563FF))
+                .child(preview),
+        )
+}
+
+fn light_preview_box(title: &'static str, body: &'static str, sub: &'static str) -> Div {
+    div()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(rgba(0xE5E7EBFF))
+        .bg(rgb(0xF9FAFB))
+        .p(px(14.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0))
+        .child(light_section_subtitle(title))
+        .child(
+            div()
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(rgba(0xBFDBFEFF))
+                .bg(rgb(0xFFFFFF))
+                .p(px(12.0))
+                .child(
+                    div()
+                        .font_family(UI_FONT)
+                        .text_size(px(12.0))
+                        .text_color(rgba(0x111827FF))
+                        .child(body),
+                )
+                .child(
+                    div()
+                        .font_family("JetBrains Mono")
+                        .text_size(px(11.0))
+                        .text_color(rgba(0x6B7280FF))
+                        .child(sub),
+                ),
+        )
+}
+
+fn light_action_card(
+    title: &'static str,
+    description: &'static str,
+    button_label: &'static str,
+    destructive: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(if destructive {
+            rgba(0xFECACAFF)
+        } else {
+            rgba(0xE5E7EBFF)
+        })
+        .bg(rgb(0xFFFFFF))
+        .p(px(14.0))
+        .flex()
+        .flex_col()
+        .gap(px(10.0))
+        .child(light_section_subtitle(title))
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(11.0))
+                .text_color(if destructive {
+                    rgba(0xB91C1CFF)
+                } else {
+                    rgba(0x6B7280FF)
+                })
+                .child(description),
+        )
+        .child(if destructive {
+            div()
+                .px(px(14.0))
+                .py(px(8.0))
+                .rounded(px(8.0))
+                .bg(rgba(0xDC2626FF))
+                .cursor_pointer()
+                .font_family(UI_FONT)
+                .text_size(px(12.0))
+                .text_color(rgba(0xFFFFFFFF))
+                .hover(|style| style.bg(rgba(0xB91C1CFF)))
+                .on_mouse_down(MouseButton::Left, listener)
+                .child(button_label)
+        } else {
+            light_secondary_button(button_label, listener)
+        })
+}
+
+fn light_storage_card(items: usize, favorites: usize, queued: usize, bytes: u64) -> Div {
+    div()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(rgba(0xE5E7EBFF))
+        .bg(rgb(0xF9FAFB))
+        .p(px(14.0))
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(light_section_subtitle("ストレージ情報"))
+        .child(light_storage_row("定型文数", items.to_string()))
+        .child(light_storage_row("お気に入り数", favorites.to_string()))
+        .child(light_storage_row("キュー件数", queued.to_string()))
+        .child(light_storage_row("使用容量", format_bytes(bytes)))
+}
+
+fn light_storage_row(label: &'static str, value: String) -> Div {
+    div()
+        .w_full()
+        .flex()
+        .justify_between()
+        .font_family(UI_FONT)
+        .text_size(px(11.0))
+        .text_color(rgba(0x4B5563FF))
+        .child(label)
+        .child(value)
+}
+
+fn light_empty_state(message: &'static str) -> Div {
+    div()
+        .w_full()
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(rgba(0xE5E7EBFF))
+        .bg(rgb(0xFFFFFF))
+        .p(px(24.0))
+        .font_family(UI_FONT)
+        .text_size(px(12.0))
+        .text_color(rgba(0x9CA3AFFF))
+        .child(message)
+}
+
+fn theme_label(theme: &str) -> String {
+    match theme {
+        "dark" => "ダーク".to_string(),
+        "auto" => "自動".to_string(),
+        _ => "ライト".to_string(),
+    }
+}
+
+fn window_position_label(position: &str) -> String {
+    match position {
+        "cursor" => "カーソル位置".to_string(),
+        "topLeft" => "左上".to_string(),
+        "topRight" => "右上".to_string(),
+        "bottomLeft" => "左下".to_string(),
+        "bottomRight" => "右下".to_string(),
+        _ => "中央".to_string(),
+    }
+}
+
+fn notification_position_label(position: &str) -> String {
+    match position {
+        "topLeft" => "左上".to_string(),
+        "bottomLeft" => "左下".to_string(),
+        "bottomRight" => "右下".to_string(),
+        _ => "右上".to_string(),
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes >= 1024 * 1024 {
+        format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+    } else if bytes >= 1024 {
+        format!("{:.2} KB", bytes as f64 / 1024.0)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
+fn rgba_with_alpha(rgb: u32, alpha_percent: u8) -> u32 {
+    let alpha = ((alpha_percent as u32) * 255 / 100) & 0xFF;
+    (rgb << 8) | alpha
+}
+
+fn hotkey_matches(event: &KeyDownEvent, hotkey: &str) -> bool {
+    if hotkey.trim().is_empty() {
+        return false;
+    }
+
+    let mut require_ctrl = false;
+    let mut require_shift = false;
+    let mut require_alt = false;
+    let mut key = String::new();
+
+    for part in hotkey.split('+') {
+        match part.trim().to_ascii_lowercase().as_str() {
+            "ctrl" | "control" | "cmd" | "command" => require_ctrl = true,
+            "shift" => require_shift = true,
+            "alt" | "option" => require_alt = true,
+            other => key = other.to_string(),
+        }
+    }
+
+    if key.is_empty() {
+        return false;
+    }
+
+    let modifiers = &event.keystroke.modifiers;
+    let alt_pressed = false;
+    require_ctrl == modifiers.control
+        && require_shift == modifiers.shift
+        && require_alt == alt_pressed
+        && event.keystroke.key.eq_ignore_ascii_case(&key)
 }
 
 fn settings_section_heading(label: &'static str) -> Div {
