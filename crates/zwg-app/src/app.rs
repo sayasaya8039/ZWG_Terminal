@@ -1,9 +1,11 @@
 //! Application state and root view — multi-tab + split pane support
 
+use std::sync::{Arc, Mutex};
+
 use gpui::*;
 use uuid::Uuid;
 
-use crate::config::AppConfig;
+use crate::config::{AppConfig, WindowState};
 use crate::shell::{self, ShellType};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::{ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, SplitDown, SplitRight};
@@ -129,13 +131,20 @@ impl AppState {
 pub struct RootView {
     state: Entity<AppState>,
     show_shell_menu: bool,
+    /// Shared ref for saving window bounds on quit
+    last_bounds: Arc<Mutex<Option<WindowState>>>,
 }
 
 impl RootView {
-    pub fn new(state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<AppState>,
+        last_bounds: Arc<Mutex<Option<WindowState>>>,
+        _cx: &mut Context<Self>,
+    ) -> Self {
         Self {
             state,
             show_shell_menu: false,
+            last_bounds,
         }
     }
 
@@ -218,7 +227,17 @@ impl RootView {
 }
 
 impl Render for RootView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Track window bounds for save-on-quit
+        let bounds = window.bounds();
+        *self.last_bounds.lock().unwrap() = Some(WindowState {
+            x: f32::from(bounds.origin.x),
+            y: f32::from(bounds.origin.y),
+            width: f32::from(bounds.size.width),
+            height: f32::from(bounds.size.height),
+            maximized: window.is_maximized(),
+        });
+
         let state = self.state.read(cx);
         let active_tab = state.active_tab;
         let active_split = state.tabs.get(active_tab).map(|t| t.split.clone());

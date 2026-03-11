@@ -207,6 +207,79 @@ impl AppConfig {
     }
 }
 
+/// Window position and size state (persisted separately from config)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WindowState {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub maximized: bool,
+}
+
+impl Default for WindowState {
+    fn default() -> Self {
+        Self {
+            x: 100.0,
+            y: 100.0,
+            width: 1400.0,
+            height: 900.0,
+            maximized: false,
+        }
+    }
+}
+
+impl WindowState {
+    /// State file path: ~/.config/zwg/window_state.json
+    fn state_path() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("zwg")
+            .join("window_state.json")
+    }
+
+    /// Load window state from disk, falling back to defaults
+    pub fn load() -> Self {
+        let path = Self::state_path();
+        if path.exists() {
+            match std::fs::read_to_string(&path) {
+                Ok(content) => match serde_json::from_str::<WindowState>(&content) {
+                    Ok(state) => {
+                        log::info!("Loaded window state from {:?}", path);
+                        return state.validated();
+                    }
+                    Err(e) => log::warn!("Invalid window state file: {}", e),
+                },
+                Err(e) => log::warn!("Failed to read window state: {}", e),
+            }
+        }
+        Self::default()
+    }
+
+    /// Save window state to disk
+    pub fn save(&self) -> std::io::Result<()> {
+        let path = Self::state_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(self)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(&path, json)?;
+        log::debug!("Saved window state to {:?}", path);
+        Ok(())
+    }
+
+    /// Clamp to reasonable bounds
+    fn validated(mut self) -> Self {
+        self.width = self.width.clamp(400.0, 7680.0);
+        self.height = self.height.clamp(300.0, 4320.0);
+        // Allow negative coords for multi-monitor setups, but clamp extremes
+        self.x = self.x.clamp(-4000.0, 7680.0);
+        self.y = self.y.clamp(-4000.0, 4320.0);
+        self
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
