@@ -87,9 +87,9 @@ pub enum CursorShape {
     Bar,
 }
 
-// Catppuccin Mocha defaults
-pub const DEFAULT_FG: u32 = 0xcdd6f4;
-pub const DEFAULT_BG: u32 = 0x1e1e2e;
+// macOS-style terminal defaults from the Figma reference
+pub const DEFAULT_FG: u32 = 0xE5E5EA;
+pub const DEFAULT_BG: u32 = 0x1C1C1E;
 
 /// Screen buffer holding viewport + scrollback
 #[cfg(not(feature = "ghostty_vt"))]

@@ -8,14 +8,14 @@ use super::pty::{ConPtyConfig, spawn_pty};
 use super::surface::TerminalSurface;
 use super::{DEFAULT_BG, DEFAULT_FG};
 
-const FONT_FAMILY: &str = "Cascadia Code";
-const FONT_SIZE: f32 = 14.0;
-const LINE_HEIGHT_FACTOR: f32 = 1.3;
+const FONT_FAMILY: &str = "JetBrains Mono";
+const FONT_SIZE: f32 = 13.0;
+const LINE_HEIGHT_FACTOR: f32 = 1.5;
 
-// Catppuccin Mocha palette for status text
-const SUBTEXT0: u32 = 0xa6adc8;
-const SURFACE0: u32 = 0x313244;
-const RED: u32 = 0xf38ba8;
+// Figma-aligned chrome colors for status text
+const SUBTEXT0: u32 = 0x8E8E93;
+const SURFACE0: u32 = 0x48484A;
+const RED: u32 = 0xFF5F57;
 
 /// Terminal connection state — two-phase init pattern
 enum TerminalState {
@@ -51,69 +51,73 @@ impl TerminalPane {
         // Phase A: Return immediately with Pending state (<1ms)
         // Phase B: Spawn PTY in background thread
         let shell_owned = shell.to_string();
-        cx.spawn(async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
-            // Run ConPTY creation on background executor (off UI thread)
-            let shell_for_spawn = shell_owned.clone();
-            let pty_result = cx
-                .background_executor()
-                .spawn(async move {
-                    let config = ConPtyConfig {
-                        shell: shell_for_spawn,
-                        cols: 80,
-                        rows: 24,
-                        working_directory: None,
-                        env: Vec::new(),
-                    };
-                    spawn_pty(config)
-                })
-                .await;
+        cx.spawn(
+            async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
+                // Run ConPTY creation on background executor (off UI thread)
+                let shell_for_spawn = shell_owned.clone();
+                let pty_result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let config = ConPtyConfig {
+                            shell: shell_for_spawn,
+                            cols: 80,
+                            rows: 24,
+                            working_directory: None,
+                            env: Vec::new(),
+                        };
+                        spawn_pty(config)
+                    })
+                    .await;
 
-            // Phase C: Attach PTY to surface on executor context
-            let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
-                match pty_result {
-                    Ok(pty) => {
-                        if let Err(e) = pane.surface.attach_pty(Arc::new(pty)) {
+                // Phase C: Attach PTY to surface on executor context
+                let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
+                    match pty_result {
+                        Ok(pty) => {
+                            if let Err(e) = pane.surface.attach_pty(Arc::new(pty)) {
+                                pane.state = TerminalState::Failed(e.to_string());
+                                log::error!("Failed to attach PTY: {}", e);
+                            } else {
+                                pane.state = TerminalState::Running;
+                                log::info!("PTY connected for shell: {}", shell_owned);
+                            }
+                        }
+                        Err(e) => {
                             pane.state = TerminalState::Failed(e.to_string());
-                            log::error!("Failed to attach PTY: {}", e);
-                        } else {
-                            pane.state = TerminalState::Running;
-                            log::info!("PTY connected for shell: {}", shell_owned);
+                            log::error!("Failed to spawn shell: {}", e);
                         }
                     }
-                    Err(e) => {
-                        pane.state = TerminalState::Failed(e.to_string());
-                        log::error!("Failed to spawn shell: {}", e);
-                    }
-                }
-                cx.notify();
-            });
-        })
+                    cx.notify();
+                });
+            },
+        )
         .detach();
 
         // Poll for PTY output every 16ms (~60fps)
-        cx.spawn(async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
-            loop {
-                cx.background_executor()
-                    .timer(std::time::Duration::from_millis(16))
-                    .await;
+        cx.spawn(
+            async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
+                loop {
+                    cx.background_executor()
+                        .timer(std::time::Duration::from_millis(16))
+                        .await;
 
-                let should_notify = this
-                    .update(cx, |pane: &mut TerminalPane, _cx| {
-                        let mut dirty = false;
-                        while let Ok(_event) = pane.surface.event_rx.try_recv() {
-                            dirty = true;
-                        }
-                        dirty
-                    })
-                    .unwrap_or(false);
+                    let should_notify = this
+                        .update(cx, |pane: &mut TerminalPane, _cx| {
+                            let mut dirty = false;
+                            while let Ok(_event) = pane.surface.event_rx.try_recv() {
+                                dirty = true;
+                            }
+                            dirty
+                        })
+                        .unwrap_or(false);
 
-                if should_notify {
-                    let _ = this.update(cx, |_pane: &mut TerminalPane, cx| {
-                        cx.notify();
-                    });
+                    if should_notify {
+                        let _ = this.update(cx, |_pane: &mut TerminalPane, cx| {
+                            cx.notify();
+                        });
+                    }
                 }
-            }
-        })
+            },
+        )
         .detach();
 
         Self {
@@ -215,7 +219,7 @@ impl TerminalPane {
         let vp = window.viewport_size();
         let vp_w: f32 = vp.width.into();
         let vp_h: f32 = vp.height.into();
-        let avail_h = (vp_h - 40.0).max(100.0);
+        let avail_h = (vp_h - 60.0).max(100.0);
         self.handle_resize(vp_w, avail_h);
 
         // Snapshot backend state under brief lock
@@ -270,12 +274,10 @@ impl TerminalPane {
                 };
 
                 let chars: Vec<char> = display_text.chars().collect();
-                let before_cursor: String =
-                    chars[..cursor_col.min(chars.len())].iter().collect();
+                let before_cursor: String = chars[..cursor_col.min(chars.len())].iter().collect();
 
                 #[cfg(feature = "ghostty_vt")]
-                let text_child =
-                    render_styled_text(&display_text, style_runs, self.cell_width);
+                let text_child = render_styled_text(&display_text, style_runs, self.cell_width);
                 #[cfg(not(feature = "ghostty_vt"))]
                 let text_child = div().pl(px(4.0)).child(display_text);
 
@@ -302,7 +304,7 @@ impl TerminalPane {
                         div()
                             .w(px(self.cell_width))
                             .h(px(self.cell_height))
-                            .bg(rgba(0xcdd6f480))
+                            .bg(rgba(0xF5F5F780))
                             .rounded(px(1.0)),
                     );
 
@@ -323,8 +325,7 @@ impl TerminalPane {
                 };
 
                 #[cfg(feature = "ghostty_vt")]
-                let text_child =
-                    render_styled_text(&display, style_runs, self.cell_width);
+                let text_child = render_styled_text(&display, style_runs, self.cell_width);
                 #[cfg(not(feature = "ghostty_vt"))]
                 let text_child = div().pl(px(4.0)).child(display);
 
@@ -359,11 +360,7 @@ impl Render for TerminalPane {
 
 /// Render a row of text with Ghostty style runs applied
 #[cfg(feature = "ghostty_vt")]
-fn render_styled_text(
-    text: &str,
-    style_runs: &[ghostty_vt::StyleRun],
-    _cell_width: f32,
-) -> Div {
+fn render_styled_text(text: &str, style_runs: &[ghostty_vt::StyleRun], _cell_width: f32) -> Div {
     let container = div().pl(px(4.0)).flex().flex_row();
 
     if style_runs.is_empty() || text.is_empty() {
@@ -394,8 +391,7 @@ fn render_styled_text(
 
         let segment: String = chars[start..end].iter().collect();
         let fg = rgb(((run.fg.r as u32) << 16) | ((run.fg.g as u32) << 8) | (run.fg.b as u32));
-        let bg_val =
-            ((run.bg.r as u32) << 16) | ((run.bg.g as u32) << 8) | (run.bg.b as u32);
+        let bg_val = ((run.bg.r as u32) << 16) | ((run.bg.g as u32) << 8) | (run.bg.b as u32);
 
         let mut span = div().child(segment).text_color(fg);
 

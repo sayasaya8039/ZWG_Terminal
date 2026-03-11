@@ -1,34 +1,54 @@
-//! Application state and root view — multi-tab + split pane support
+//! Application state and root view — Figma-aligned macOS terminal chrome
 
 use std::time::Instant;
 
 use gpui::*;
-use uuid::Uuid;
 
-use crate::config::{AppConfig, WindowState};
+use crate::config::WindowState;
 use crate::shell::{self, ShellType};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::{ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, SplitDown, SplitRight};
 
-// Catppuccin Mocha palette
-const BASE: u32 = 0x1e1e2e;
-const MANTLE: u32 = 0x181825;
-const SURFACE0: u32 = 0x313244;
-const SURFACE1: u32 = 0x45475a;
-const TEXT: u32 = 0xcdd6f4;
-const SUBTEXT0: u32 = 0xa6adc8;
-const RED: u32 = 0xf38ba8;
-const GREEN: u32 = 0xa6e3a1;
+const WINDOW_BG: u32 = 0x1C1C1E;
+const TITLEBAR_BG: u32 = 0x2C2C2E;
+const PANEL_BG: u32 = 0x323234;
+const PANEL_SIDEBAR_BG: u32 = 0x242426;
+const SURFACE1: u32 = 0x48484A;
+const SURFACE2: u32 = 0x636366;
+const TEXT: u32 = 0xF5F5F7;
+const TEXT_SOFT: u32 = 0xE5E5EA;
+const SUBTEXT0: u32 = 0xC7C7CC;
+const SUBTEXT1: u32 = 0x8E8E93;
+const MUTED: u32 = 0x636366;
+const RED: u32 = 0xFF5F57;
+const GREEN: u32 = 0x28C840;
+const YELLOW: u32 = 0xFEBC2E;
+const ACCENT: u32 = 0x0A84FF;
+const ACCENT_ALT: u32 = 0x34C759;
+const BACKDROP: u32 = 0x00000088;
+const UI_FONT: &str = "Inter";
 
-/// Per-tab state
+/// Minimum interval between window state saves.
+const WINDOW_STATE_SAVE_INTERVAL_SECS: u64 = 2;
+
+/// Theme preview cards in the settings panel.
+const THEME_PREVIEWS: [(&str, u32); 6] = [
+    ("Dark", WINDOW_BG),
+    ("Light", 0xF5F5F7),
+    ("Solarized", 0x002B36),
+    ("Monokai", 0x272822),
+    ("Dracula", 0x282A36),
+    ("Nord", 0x2E3440),
+];
+
+/// Per-tab state.
 pub struct Tab {
-    pub id: Uuid,
     pub title: String,
-    pub shell: String,
+    pub shell_type: ShellType,
     pub split: Entity<SplitContainer>,
 }
 
-/// Shell entry for the dropdown menu
+/// Shell entry for the shell selector.
 #[derive(Clone)]
 pub struct ShellEntry {
     pub shell_type: ShellType,
@@ -36,77 +56,106 @@ pub struct ShellEntry {
     pub display_name: String,
 }
 
-/// Global application state
+/// Global application state.
 pub struct AppState {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
-    pub config: AppConfig,
     pub available_shells: Vec<ShellEntry>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SettingsCategory {
+    General,
+    Appearance,
+    Profiles,
+    Keyboard,
+    Notifications,
+    Privacy,
+    Advanced,
+}
+
+impl SettingsCategory {
+    fn all() -> &'static [(SettingsCategory, &'static str, &'static str)] {
+        &[
+            (Self::General, "General", "◻"),
+            (Self::Appearance, "Appearance", "◌"),
+            (Self::Profiles, "Profiles", ">_"),
+            (Self::Keyboard, "Keyboard", "⌨"),
+            (Self::Notifications, "Notifications", "♪"),
+            (Self::Privacy, "Privacy", "⌂"),
+            (Self::Advanced, "Advanced", "⚙"),
+        ]
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::General => "General",
+            Self::Appearance => "Appearance",
+            Self::Profiles => "Profiles",
+            Self::Keyboard => "Keyboard",
+            Self::Notifications => "Notifications",
+            Self::Privacy => "Privacy",
+            Self::Advanced => "Advanced",
+        }
+    }
+}
+
+/// Root view containing tab bar + split container + overlays.
+pub struct RootView {
+    state: Entity<AppState>,
+    show_shell_menu: bool,
+    show_settings: bool,
+    settings_category: SettingsCategory,
+    last_bounds: Option<WindowState>,
+    last_save_time: Instant,
+    bounds_dirty: bool,
 }
 
 impl AppState {
     pub fn new(cx: &mut App) -> Self {
-        let config = AppConfig::load();
-        let id = Uuid::new_v4();
-        let shell = config.shell.clone();
-        let split = cx.new(|cx| SplitContainer::new(&shell, cx));
-
-        // Cache available shells at startup
-        let available_shells = shell::detect_available_shells()
+        let available_shells: Vec<ShellEntry> = shell::detect_available_shells()
             .into_iter()
-            .map(|(st, cmd)| {
-                let display_name = match st {
-                    ShellType::PowerShell => "Windows PowerShell".to_string(),
-                    ShellType::Pwsh => "PowerShell 7".to_string(),
-                    ShellType::Cmd => "Command Prompt".to_string(),
-                    ShellType::Wsl => "WSL".to_string(),
-                    ShellType::GitBash => "Git Bash".to_string(),
-                };
-                ShellEntry {
-                    shell_type: st,
-                    command: cmd,
-                    display_name,
-                }
+            .map(|(shell_type, command)| ShellEntry {
+                display_name: shell_display_name(&shell_type).to_string(),
+                shell_type,
+                command,
             })
             .collect();
 
+        let default_shell = available_shells
+            .first()
+            .map(|entry| entry.command.clone())
+            .unwrap_or_else(shell::detect_default_shell);
+        let (shell_type, title) = shell_meta_for_command(&default_shell, &available_shells);
+        let split = cx.new(|cx| SplitContainer::new(&default_shell, cx));
+
         Self {
             tabs: vec![Tab {
-                id,
-                title: "Terminal 1".to_string(),
-                shell,
+                title,
+                shell_type,
                 split,
             }],
             active_tab: 0,
-            config,
             available_shells,
         }
     }
 
     pub fn add_tab(&mut self, cx: &mut App) {
-        let id = Uuid::new_v4();
-        let shell = self.config.shell.clone();
-        let idx = self.tabs.len() + 1;
-        let split = cx.new(|cx| SplitContainer::new(&shell, cx));
-
-        self.tabs.push(Tab {
-            id,
-            title: format!("Terminal {}", idx),
-            shell,
-            split,
-        });
-        self.active_tab = self.tabs.len() - 1;
+        let shell = self
+            .available_shells
+            .first()
+            .map(|entry| entry.command.clone())
+            .unwrap_or_else(shell::detect_default_shell);
+        self.add_tab_with_shell(&shell, cx);
     }
 
     pub fn add_tab_with_shell(&mut self, shell: &str, cx: &mut App) {
-        let id = Uuid::new_v4();
-        let idx = self.tabs.len() + 1;
+        let (shell_type, title) = shell_meta_for_command(shell, &self.available_shells);
         let split = cx.new(|cx| SplitContainer::new(shell, cx));
 
         self.tabs.push(Tab {
-            id,
-            title: format!("Terminal {}", idx),
-            shell: shell.to_string(),
+            title,
+            shell_type,
             split,
         });
         self.active_tab = self.tabs.len() - 1;
@@ -114,7 +163,7 @@ impl AppState {
 
     pub fn close_tab(&mut self, idx: usize) {
         if self.tabs.len() <= 1 {
-            return; // keep at least one tab
+            return;
         }
         self.tabs.remove(idx);
         if self.active_tab >= self.tabs.len() {
@@ -127,26 +176,13 @@ impl AppState {
     }
 }
 
-/// Root view containing tab bar + split container
-pub struct RootView {
-    state: Entity<AppState>,
-    show_shell_menu: bool,
-    /// Cached window bounds — saved to disk periodically and on Drop
-    last_bounds: Option<WindowState>,
-    /// Last time window state was saved (for debouncing)
-    last_save_time: Instant,
-    /// Whether bounds have changed since last save
-    bounds_dirty: bool,
-}
-
-/// Minimum interval between window state saves (seconds)
-const WINDOW_STATE_SAVE_INTERVAL_SECS: u64 = 2;
-
 impl RootView {
     pub fn new(state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
         Self {
             state,
             show_shell_menu: false,
+            show_settings: false,
+            settings_category: SettingsCategory::General,
             last_bounds: None,
             last_save_time: Instant::now(),
             bounds_dirty: false,
@@ -154,6 +190,8 @@ impl RootView {
     }
 
     fn on_new_tab(&mut self, _action: &NewTab, _window: &mut Window, cx: &mut Context<Self>) {
+        self.show_shell_menu = false;
+        self.show_settings = false;
         self.state.update(cx, |state, cx| {
             state.add_tab(cx);
             cx.notify();
@@ -162,8 +200,7 @@ impl RootView {
 
     fn on_close_tab(&mut self, _action: &CloseTab, _window: &mut Window, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
-            let idx = state.active_tab;
-            state.close_tab(idx);
+            state.close_tab(state.active_tab);
             cx.notify();
         });
     }
@@ -180,24 +217,14 @@ impl RootView {
         }
     }
 
-    fn on_split_down(
-        &mut self,
-        _action: &SplitDown,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_split_down(&mut self, _action: &SplitDown, _window: &mut Window, cx: &mut Context<Self>) {
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.split(SplitDirection::Vertical, cx));
         }
     }
 
-    fn on_close_pane(
-        &mut self,
-        _action: &ClosePane,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_close_pane(&mut self, _action: &ClosePane, _window: &mut Window, cx: &mut Context<Self>) {
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             split.update(cx, |sc, cx| {
@@ -206,34 +233,801 @@ impl RootView {
         }
     }
 
-    fn on_focus_next(
-        &mut self,
-        _action: &FocusNext,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_focus_next(&mut self, _action: &FocusNext, _window: &mut Window, cx: &mut Context<Self>) {
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.focus_direction(FocusDir::Next, cx));
         }
     }
 
-    fn on_focus_prev(
-        &mut self,
-        _action: &FocusPrev,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_focus_prev(&mut self, _action: &FocusPrev, _window: &mut Window, cx: &mut Context<Self>) {
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.focus_direction(FocusDir::Prev, cx));
         }
     }
+
+    fn render_window_traffic_lights(&mut self, cx: &mut Context<Self>) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .id("traffic-close")
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .rounded_full()
+                    .bg(rgb(RED))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|_this, _: &MouseDownEvent, _window, cx| cx.quit()),
+                    ),
+            )
+            .child(
+                div()
+                    .id("traffic-minimize")
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .rounded_full()
+                    .bg(rgb(YELLOW)),
+            )
+            .child(
+                div()
+                    .id("traffic-maximize")
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .rounded_full()
+                    .bg(rgb(GREEN)),
+            )
+    }
+
+    fn render_modal_traffic_lights(&mut self, modal: &'static str, cx: &mut Context<Self>) -> Div {
+        let close_modal = move |this: &mut RootView,
+                                _: &MouseDownEvent,
+                                _window: &mut Window,
+                                cx: &mut Context<RootView>| {
+            match modal {
+                "shell" => this.show_shell_menu = false,
+                "settings" => this.show_settings = false,
+                _ => {}
+            }
+            cx.notify();
+        };
+
+        div()
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .id(ElementId::Name(format!("{modal}-close").into()))
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .rounded_full()
+                    .bg(rgb(RED))
+                    .cursor_pointer()
+                    .on_mouse_down(MouseButton::Left, cx.listener(close_modal)),
+            )
+            .child(
+                div()
+                    .id(ElementId::Name(format!("{modal}-min").into()))
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .rounded_full()
+                    .bg(rgb(YELLOW)),
+            )
+            .child(
+                div()
+                    .id(ElementId::Name(format!("{modal}-max").into()))
+                    .w(px(12.0))
+                    .h(px(12.0))
+                    .rounded_full()
+                    .bg(rgb(GREEN)),
+            )
+    }
+
+    fn render_shell_selector(
+        &mut self,
+        viewport_w: f32,
+        viewport_h: f32,
+        shells: &[ShellEntry],
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.show_shell_menu {
+            return None;
+        }
+
+        let panel_w = 520.0;
+        let panel_h = 420.0;
+        let top = ((viewport_h - panel_h) * 0.5).max(24.0);
+        let left = ((viewport_w - panel_w) * 0.5).max(24.0);
+
+        let mut shell_items: Vec<AnyElement> = Vec::new();
+        for (idx, shell_entry) in shells.iter().cloned().enumerate() {
+            let command = shell_entry.command.clone();
+            let display_name = shell_entry.display_name.clone();
+            let description = shell_description(&shell_entry.shell_type);
+            let icon = shell_icon(&shell_entry.shell_type);
+
+            shell_items.push(
+                div()
+                    .id(ElementId::Name(format!("shell-item-{idx}").into()))
+                    .w_full()
+                    .flex()
+                    .items_center()
+                    .gap(px(12.0))
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .rounded(px(10.0))
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgba(0xffffff12)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                            this.show_shell_menu = false;
+                            this.state.update(cx, |state, cx| {
+                                state.add_tab_with_shell(&command, cx);
+                                cx.notify();
+                            });
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(36.0))
+                            .h(px(36.0))
+                            .rounded(px(10.0))
+                            .bg(rgba(0xffffff18))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .text_size(px(17.0))
+                            .child(icon),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(
+                                div()
+                                    .font_family(UI_FONT)
+                                    .text_size(px(13.0))
+                                    .text_color(rgb(TEXT))
+                                    .child(display_name),
+                            )
+                            .child(
+                                div()
+                                    .font_family(UI_FONT)
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(SUBTEXT1))
+                                    .child(description),
+                            ),
+                    )
+                    .child(div().text_size(px(13.0)).text_color(rgb(MUTED)).child(">"))
+                    .into_any_element(),
+            );
+        }
+
+        Some(
+            div()
+                .id("shell-selector")
+                .absolute()
+                .top(px(top))
+                .left(px(left))
+                .w(px(panel_w))
+                .h(px(panel_h))
+                .rounded(px(12.0))
+                .overflow_hidden()
+                .shadow_lg()
+                .bg(rgb(PANEL_BG))
+                .border_1()
+                .border_color(rgba(0xffffff16))
+                .child(
+                    div()
+                        .h(px(44.0))
+                        .w_full()
+                        .px(px(16.0))
+                        .border_b_1()
+                        .border_color(rgba(0xffffff10))
+                        .flex()
+                        .items_center()
+                        .child(self.render_modal_traffic_lights("shell", cx))
+                        .child(div().flex_1())
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(13.0))
+                                .text_color(rgb(TEXT))
+                                .child("New Terminal"),
+                        )
+                        .child(div().flex_1()),
+                )
+                .child(
+                    div()
+                        .p(px(16.0))
+                        .flex()
+                        .flex_col()
+                        .gap(px(14.0))
+                        .child(
+                            div()
+                                .h(px(36.0))
+                                .rounded(px(10.0))
+                                .bg(rgba(0xffffff0f))
+                                .border_1()
+                                .border_color(rgba(0xffffff10))
+                                .px(px(12.0))
+                                .flex()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(SUBTEXT1))
+                                        .child("/"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(13.0))
+                                        .text_color(rgb(MUTED))
+                                        .child("Search shells..."),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(11.0))
+                                .text_color(rgb(SUBTEXT1))
+                                .child("AVAILABLE SHELLS"),
+                        )
+                        .child(div().flex().flex_col().gap(px(2.0)).children(shell_items))
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(11.0))
+                                .text_color(rgb(SUBTEXT1))
+                                .pt(px(4.0))
+                                .child("ACTIONS"),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .px(px(12.0))
+                                .py(px(10.0))
+                                .rounded(px(10.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgba(0xffffff12)))
+                                .child(
+                                    div()
+                                        .w(px(36.0))
+                                        .h(px(36.0))
+                                        .rounded(px(10.0))
+                                        .bg(rgba(0x0A84FF33))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(16.0))
+                                        .text_color(rgb(ACCENT))
+                                        .child(">_"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(13.0))
+                                        .text_color(rgb(ACCENT))
+                                        .child("Install New Shell..."),
+                                )
+                                .child(div().text_size(px(13.0)).text_color(rgb(MUTED)).child(">")),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_settings_panel(
+        &mut self,
+        viewport_w: f32,
+        viewport_h: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.show_settings {
+            return None;
+        }
+
+        let panel_w = 740.0;
+        let panel_h = 540.0;
+        let top = ((viewport_h - panel_h) * 0.5).max(24.0);
+        let left = ((viewport_w - panel_w) * 0.5).max(24.0);
+
+        let mut category_items: Vec<AnyElement> = Vec::new();
+        for (category, label, icon) in SettingsCategory::all() {
+            let active = *category == self.settings_category;
+            let category_value = *category;
+            let mut button = div()
+                .id(ElementId::Name(format!("settings-{label}").into()))
+                .w_full()
+                .px(px(12.0))
+                .py(px(8.0))
+                .rounded(px(8.0))
+                .cursor_pointer()
+                .flex()
+                .items_center()
+                .gap(px(10.0))
+                .font_family(UI_FONT)
+                .text_size(px(13.0))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                        this.settings_category = category_value;
+                        cx.notify();
+                    }),
+                );
+
+            if active {
+                button = button.bg(rgb(ACCENT)).text_color(rgb(0xffffff));
+            } else {
+                button = button
+                    .text_color(rgb(TEXT_SOFT))
+                    .hover(|style| style.bg(rgba(0xffffff10)));
+            }
+
+            category_items.push(
+                button
+                    .child(div().w(px(16.0)).child(*icon))
+                    .child(*label)
+                    .into_any_element(),
+            );
+        }
+
+        Some(
+            div()
+                .id("settings-panel")
+                .absolute()
+                .top(px(top))
+                .left(px(left))
+                .w(px(panel_w))
+                .h(px(panel_h))
+                .rounded(px(12.0))
+                .overflow_hidden()
+                .shadow_lg()
+                .bg(rgb(PANEL_BG))
+                .border_1()
+                .border_color(rgba(0xffffff16))
+                .flex()
+                .child(
+                    div()
+                        .w(px(200.0))
+                        .h_full()
+                        .bg(rgb(PANEL_SIDEBAR_BG))
+                        .border_r_1()
+                        .border_color(rgba(0xffffff10))
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .h(px(46.0))
+                                .px(px(16.0))
+                                .border_b_1()
+                                .border_color(rgba(0xffffff10))
+                                .flex()
+                                .items_center()
+                                .child(self.render_modal_traffic_lights("settings", cx)),
+                        )
+                        .child(
+                            div()
+                                .p(px(8.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .children(category_items),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .h_full()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .h(px(46.0))
+                                .px(px(24.0))
+                                .border_b_1()
+                                .border_color(rgba(0xffffff10))
+                                .flex()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(16.0))
+                                        .text_color(rgb(TEXT))
+                                        .child(self.settings_category.title()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .p(px(24.0))
+                                .children(Some(self.render_settings_content())),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_settings_content(&self) -> AnyElement {
+        match self.settings_category {
+            SettingsCategory::General => self.render_general_settings().into_any_element(),
+            SettingsCategory::Appearance => self.render_appearance_settings().into_any_element(),
+            SettingsCategory::Profiles => self.render_profiles_settings().into_any_element(),
+            SettingsCategory::Keyboard => self.render_keyboard_settings().into_any_element(),
+            SettingsCategory::Notifications => {
+                self.render_notifications_settings().into_any_element()
+            }
+            SettingsCategory::Privacy => self.render_privacy_settings().into_any_element(),
+            SettingsCategory::Advanced => self.render_advanced_settings().into_any_element(),
+        }
+    }
+
+    fn render_general_settings(&self) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(24.0))
+            .child(settings_section_heading("Startup"))
+            .child(settings_row(
+                "Default Profile",
+                select_box("PowerShell", 150.0),
+            ))
+            .child(settings_row("Launch on Login", toggle(true)))
+            .child(settings_row("Show Tab Bar", toggle(true)))
+            .child(settings_row("Confirm on Close", toggle(true)))
+            .child(section_divider())
+            .child(settings_section_heading("Window"))
+            .child(settings_row(
+                "New Window Size",
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(8.0))
+                    .child(input_box("120", 64.0, false))
+                    .child(
+                        div()
+                            .font_family(UI_FONT)
+                            .text_size(px(13.0))
+                            .text_color(rgb(SUBTEXT1))
+                            .child("x"),
+                    )
+                    .child(input_box("30", 64.0, false)),
+            ))
+            .child(settings_row(
+                "Scrollback Lines",
+                input_box("10000", 96.0, false),
+            ))
+    }
+
+    fn render_appearance_settings(&self) -> Div {
+        let mut theme_rows_top: Vec<AnyElement> = Vec::new();
+        let mut theme_rows_bottom: Vec<AnyElement> = Vec::new();
+
+        for (idx, (name, preview)) in THEME_PREVIEWS.iter().enumerate() {
+            let card = theme_card(name, *preview, idx == 0).into_any_element();
+            if idx < 3 {
+                theme_rows_top.push(card);
+            } else {
+                theme_rows_bottom.push(card);
+            }
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(24.0))
+            .child(settings_section_heading("Theme"))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap(px(12.0))
+                    .child(div().flex().gap(px(12.0)).children(theme_rows_top))
+                    .child(div().flex().gap(px(12.0)).children(theme_rows_bottom)),
+            )
+            .child(section_divider())
+            .child(settings_section_heading("Font"))
+            .child(settings_row(
+                "Font Family",
+                select_box("JetBrains Mono", 180.0),
+            ))
+            .child(settings_row("Font Size", slider_with_value(0.45, "13px")))
+            .child(section_divider())
+            .child(settings_section_heading("Cursor"))
+            .child(settings_row(
+                "Cursor Style",
+                segmented_control(&[("Bar", true), ("Block", false), ("Underline", false)]),
+            ))
+            .child(settings_row("Cursor Blink", toggle(true)))
+            .child(section_divider())
+            .child(settings_section_heading("Transparency"))
+            .child(settings_row(
+                "Window Opacity",
+                slider_with_value(0.95, "95%"),
+            ))
+            .child(settings_row(
+                "Background Blur",
+                slider_with_value(0.33, "10px"),
+            ))
+    }
+
+    fn render_profiles_settings(&self) -> Div {
+        let profiles = [
+            (
+                "⚡",
+                "PowerShell",
+                "C:\\Program Files\\PowerShell\\7\\pwsh.exe",
+                true,
+            ),
+            (
+                "▶",
+                "Command Prompt",
+                "C:\\Windows\\System32\\cmd.exe",
+                false,
+            ),
+            ("🐧", "Ubuntu (WSL)", "\\\\wsl$\\Ubuntu", false),
+            (
+                "🔀",
+                "Git Bash",
+                "C:\\Program Files\\Git\\bin\\bash.exe",
+                false,
+            ),
+        ];
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (icon, name, path, active) in profiles {
+            let mut row = div()
+                .w_full()
+                .px(px(14.0))
+                .py(px(12.0))
+                .rounded(px(10.0))
+                .border_1()
+                .border_color(rgba(0xffffff10))
+                .flex()
+                .items_center()
+                .gap(px(12.0));
+
+            if active {
+                row = row.border_color(rgb(ACCENT)).bg(rgba(0x0A84FF14));
+            }
+
+            rows.push(
+                row.child(
+                    div()
+                        .w(px(28.0))
+                        .h(px(28.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .text_size(px(18.0))
+                        .child(icon),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .flex()
+                        .flex_col()
+                        .gap(px(3.0))
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(13.0))
+                                .text_color(rgb(TEXT))
+                                .child(name),
+                        )
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(11.0))
+                                .text_color(rgb(MUTED))
+                                .child(path),
+                        ),
+                )
+                .child(if active {
+                    div()
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded_full()
+                        .bg(rgba(0x0A84FF16))
+                        .font_family(UI_FONT)
+                        .text_size(px(10.0))
+                        .text_color(rgb(ACCENT))
+                        .child("Default")
+                        .into_any_element()
+                } else {
+                    div().into_any_element()
+                })
+                .child(div().text_size(px(13.0)).text_color(rgb(MUTED)).child(">"))
+                .into_any_element(),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(10.0))
+            .child(settings_section_heading("Shell Profiles"))
+            .children(rows)
+            .child(
+                div()
+                    .w_full()
+                    .py(px(10.0))
+                    .rounded(px(10.0))
+                    .border_1()
+                    .border_color(rgba(0xffffff20))
+                    .font_family(UI_FONT)
+                    .text_size(px(13.0))
+                    .text_color(rgb(ACCENT))
+                    .text_center()
+                    .child("+ Add New Profile"),
+            )
+    }
+
+    fn render_keyboard_settings(&self) -> Div {
+        let shortcuts = [
+            ("New Tab", "Ctrl Shift T"),
+            ("Close Tab", "Ctrl Shift W"),
+            ("Split Pane Horizontal", "Ctrl Shift D"),
+            ("Split Pane Vertical", "Ctrl Shift E"),
+            ("Close Pane", "Ctrl Shift X"),
+            ("Next Tab", "Ctrl Tab"),
+            ("Previous Tab", "Ctrl Shift Tab"),
+            ("Settings", "Ctrl Comma"),
+        ];
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (idx, (action, keys)) in shortcuts.iter().enumerate() {
+            let bg = if idx % 2 == 0 {
+                rgba(0xffffff06)
+            } else {
+                rgba(0x00000000)
+            };
+            rows.push(
+                div()
+                    .w_full()
+                    .px(px(12.0))
+                    .py(px(10.0))
+                    .rounded(px(8.0))
+                    .bg(bg)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .font_family(UI_FONT)
+                            .text_size(px(13.0))
+                            .text_color(rgb(TEXT_SOFT))
+                            .child(*action),
+                    )
+                    .child(
+                        div()
+                            .px(px(8.0))
+                            .py(px(3.0))
+                            .rounded(px(6.0))
+                            .bg(rgba(0xffffff10))
+                            .border_1()
+                            .border_color(rgba(0xffffff10))
+                            .font_family("JetBrains Mono")
+                            .text_size(px(12.0))
+                            .text_color(rgb(SUBTEXT0))
+                            .child(*keys),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(settings_section_heading("Keyboard Shortcuts"))
+            .children(rows)
+    }
+
+    fn render_notifications_settings(&self) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(settings_section_heading("Notifications"))
+            .child(settings_row("Bell Sound", toggle(false)))
+            .child(settings_row("Visual Bell", toggle(true)))
+            .child(settings_row("Process Completion Alerts", toggle(true)))
+    }
+
+    fn render_privacy_settings(&self) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(settings_section_heading("Privacy & Security"))
+            .child(settings_row("Copy on Select", toggle(true)))
+            .child(settings_row("Clear History on Close", toggle(false)))
+            .child(settings_row("Send Telemetry", toggle(false)))
+    }
+
+    fn render_advanced_settings(&self) -> Div {
+        div()
+            .flex()
+            .flex_col()
+            .gap(px(16.0))
+            .child(settings_section_heading("Advanced Settings"))
+            .child(settings_row("GPU Acceleration", toggle(true)))
+            .child(settings_row("Text Rendering", select_box("LCD", 120.0)))
+            .child(settings_row(
+                "Word Separators",
+                input_box("./\\()\"'-:,.;<>", 180.0, true),
+            ))
+            .child(settings_row("Enable Experimental Features", toggle(false)))
+            .child(section_divider())
+            .child(
+                div()
+                    .px(px(14.0))
+                    .py(px(10.0))
+                    .rounded(px(10.0))
+                    .bg(rgba(0xFF453A1A))
+                    .font_family(UI_FONT)
+                    .text_size(px(13.0))
+                    .text_color(rgb(0xFF453A))
+                    .child("Reset All Settings to Default"),
+            )
+    }
+
+    fn render_status_bar(
+        shell_name: &str,
+        pane_count: usize,
+        tab_count: usize,
+    ) -> impl IntoElement {
+        let mut bar = div()
+            .id("status-bar")
+            .h(px(22.0))
+            .w_full()
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(8.0))
+            .bg(rgba(0x2C2C2ECC))
+            .border_t_1()
+            .border_color(rgba(0xffffff08))
+            .font_family(UI_FONT)
+            .text_size(px(10.0))
+            .text_color(rgb(SURFACE2))
+            .child(shell_name.to_string())
+            .child(status_separator())
+            .child("UTF-8")
+            .child(status_separator())
+            .child("120x30");
+
+        if pane_count > 1 {
+            bar = bar
+                .child(status_separator())
+                .child(format!("{}P", pane_count));
+        }
+
+        bar.child(div().flex_1()).child(format!(
+            "{} tab{}",
+            tab_count,
+            if tab_count == 1 { "" } else { "s" }
+        ))
+    }
 }
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Track window bounds and save periodically (debounced)
         let bounds = window.bounds();
         let new_state = WindowState {
             x: f32::from(bounds.origin.x),
@@ -243,7 +1037,6 @@ impl Render for RootView {
             maximized: window.is_maximized(),
         };
 
-        // Check if bounds changed
         if let Some(ref prev) = self.last_bounds {
             if (prev.x - new_state.x).abs() > 1.0
                 || (prev.y - new_state.y).abs() > 1.0
@@ -255,16 +1048,13 @@ impl Render for RootView {
         } else {
             self.bounds_dirty = true;
         }
-        self.last_bounds = Some(new_state);
+        self.last_bounds = Some(new_state.clone());
 
-        // Debounced save: write to disk at most every N seconds when dirty
         if self.bounds_dirty
             && self.last_save_time.elapsed().as_secs() >= WINDOW_STATE_SAVE_INTERVAL_SECS
         {
-            if let Some(ref state) = self.last_bounds {
-                if let Err(e) = state.save() {
-                    log::warn!("Failed to save window state: {}", e);
-                }
+            if let Err(err) = new_state.save() {
+                log::warn!("Failed to save window state: {}", err);
             }
             self.bounds_dirty = false;
             self.last_save_time = Instant::now();
@@ -272,237 +1062,185 @@ impl Render for RootView {
 
         let state = self.state.read(cx);
         let active_tab = state.active_tab;
-        let active_split = state.tabs.get(active_tab).map(|t| t.split.clone());
-
-        // Collect tab info for rendering
-        let tab_infos: Vec<(usize, String, bool)> = state
+        let tab_count = state.tabs.len();
+        let active_split = state.tabs.get(active_tab).map(|tab| tab.split.clone());
+        let pane_count = active_split
+            .as_ref()
+            .map(|split| split.read(cx).all_terminals().len())
+            .unwrap_or(1);
+        let active_shell_name = state
+            .tabs
+            .get(active_tab)
+            .map(|tab| tab.title.clone())
+            .unwrap_or_else(|| "PowerShell".to_string());
+        let tab_infos: Vec<(usize, String, ShellType, bool)> = state
             .tabs
             .iter()
             .enumerate()
-            .map(|(i, t)| (i, t.title.clone(), i == active_tab))
+            .map(|(idx, tab)| {
+                (
+                    idx,
+                    tab.title.clone(),
+                    tab.shell_type.clone(),
+                    idx == active_tab,
+                )
+            })
             .collect();
-        let tab_count = state.tabs.len();
-        let shell_name = state
-            .tabs
-            .get(active_tab)
-            .map(|t| t.shell.clone())
-            .unwrap_or_default();
+        let available_shells = state.available_shells.clone();
+        let _ = state;
 
-        // Collect pane count from active split
-        let pane_count = active_split
-            .as_ref()
-            .map(|s| s.read(cx).all_terminals().len())
-            .unwrap_or(1);
-
-        let _ = state; // release borrow
-
-        // Build tab elements inline — cx.listener() needs &mut Context<Self>
         let mut tab_elements: Vec<AnyElement> = Vec::new();
-
-        for (idx, title, is_active) in &tab_infos {
-            let idx = *idx;
-            let is_active = *is_active;
+        for (idx, title, shell_type, is_active) in tab_infos {
+            let icon = shell_icon(&shell_type);
 
             let mut tab = div()
-                .id(ElementId::Name(format!("tab-{}", idx).into()))
-                .px(px(14.0))
-                .py(px(5.0))
-                .mx(px(2.0))
-                .rounded(px(6.0))
+                .id(ElementId::Name(format!("tab-{idx}").into()))
+                .px(px(12.0))
+                .py(px(6.0))
+                .rounded(px(8.0))
                 .cursor_pointer()
-                .text_size(px(12.0))
                 .flex()
                 .items_center()
-                .gap(px(8.0))
+                .gap(px(6.0))
+                .font_family(UI_FONT)
+                .text_size(px(12.0))
                 .on_mouse_down(
-                    gpui::MouseButton::Left,
+                    MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                        this.state.update(cx, |s, _cx| {
-                            s.active_tab = idx;
+                        this.state.update(cx, |state, _cx| {
+                            state.active_tab = idx;
                         });
                         cx.notify();
                     }),
                 );
 
             if is_active {
-                tab = tab.bg(rgb(BASE)).text_color(rgb(TEXT));
+                tab = tab.bg(rgba(0xffffff12)).text_color(rgb(TEXT));
             } else {
                 tab = tab
-                    .bg(rgb(MANTLE))
-                    .text_color(rgb(SUBTEXT0))
-                    .hover(|s| s.bg(rgb(SURFACE0)));
+                    .text_color(rgb(SUBTEXT1))
+                    .hover(|style| style.bg(rgba(0xffffff08)).text_color(rgb(SUBTEXT0)));
             }
 
-            tab = tab.child(title.clone());
+            tab = tab
+                .child(div().w(px(10.0)).text_size(px(10.0)).child(icon))
+                .child(title);
 
-            // Close button (only show if more than 1 tab)
             if tab_count > 1 {
                 tab = tab.child(
                     div()
-                        .id(ElementId::Name(format!("tab-close-{}", idx).into()))
-                        .text_size(px(10.0))
-                        .text_color(rgb(SURFACE1))
-                        .hover(|s| s.text_color(rgb(RED)))
+                        .id(ElementId::Name(format!("tab-close-{idx}").into()))
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .rounded(px(4.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
                         .cursor_pointer()
-                        .rounded(px(3.0))
-                        .px(px(3.0))
+                        .text_size(px(10.0))
+                        .text_color(rgb(if is_active { SUBTEXT1 } else { MUTED }))
+                        .hover(|style| style.bg(rgba(0xffffff12)).text_color(rgb(TEXT)))
                         .on_mouse_down(
-                            gpui::MouseButton::Left,
+                            MouseButton::Left,
                             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                this.state.update(cx, |s, _cx| {
-                                    s.close_tab(idx);
+                                this.state.update(cx, |state, _cx| {
+                                    state.close_tab(idx);
                                 });
                                 cx.notify();
                             }),
                         )
-                        .child("×"),
+                        .child("x"),
                 );
             }
 
             tab_elements.push(tab.into_any_element());
         }
 
-        // New tab button (+)
-        let new_tab_btn = div()
-            .id("new-tab-btn")
-            .px(px(8.0))
-            .py(px(5.0))
-            .rounded_l(px(6.0))
-            .cursor_pointer()
-            .text_size(px(14.0))
-            .text_color(rgb(SURFACE1))
-            .hover(|s| s.text_color(rgb(GREEN)).bg(rgb(SURFACE0)))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
+        let titlebar_actions = div()
+            .flex()
+            .items_center()
+            .gap(px(4.0))
+            .child(chrome_button("title-add", "+").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.show_settings = false;
+                    this.show_shell_menu = true;
+                    cx.notify();
+                }),
+            ))
+            .child(chrome_button("title-shells", "v").on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.show_settings = false;
+                    this.show_shell_menu = true;
+                    cx.notify();
+                }),
+            ))
+            .child(chrome_button("title-settings", "o").on_mouse_down(
+                MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                     this.show_shell_menu = false;
-                    this.state.update(cx, |s, cx| {
-                        s.add_tab(cx);
-                    });
+                    this.show_settings = true;
                     cx.notify();
                 }),
-            )
-            .child("+");
+            ));
 
-        // Shell dropdown button (▽)
-        let dropdown_btn = div()
-            .id("shell-dropdown-btn")
-            .px(px(4.0))
-            .py(px(5.0))
-            .rounded_r(px(6.0))
-            .cursor_pointer()
-            .text_size(px(10.0))
-            .text_color(rgb(SURFACE1))
-            .hover(|s| s.text_color(rgb(GREEN)).bg(rgb(SURFACE0)))
-            .on_mouse_down(
-                gpui::MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                    this.show_shell_menu = !this.show_shell_menu;
-                    cx.notify();
-                }),
-            )
-            .child("▾");
-
-        // Combined + and ▽ button group
-        let btn_group = div()
-            .ml(px(2.0))
+        let title_bar = div()
+            .id("title-bar")
+            .h(px(38.0))
+            .w_full()
+            .px(px(12.0))
+            .border_b_1()
+            .border_color(rgba(0xffffff08))
+            .bg(rgb(TITLEBAR_BG))
             .flex()
             .items_center()
-            .child(new_tab_btn)
+            .child(self.render_window_traffic_lights(cx))
             .child(
                 div()
-                    .h(px(16.0))
-                    .w(px(1.0))
-                    .bg(rgb(SURFACE0)),
+                    .flex_1()
+                    .mx(px(16.0))
+                    .flex()
+                    .items_center()
+                    .gap(px(2.0))
+                    .children(tab_elements),
             )
-            .child(dropdown_btn);
+            .child(titlebar_actions);
 
-        // Shell dropdown menu (overlay)
-        let show_menu = self.show_shell_menu;
-        let shell_entries: Vec<(usize, String, String)> = self
-            .state
-            .read(cx)
-            .available_shells
-            .iter()
-            .enumerate()
-            .map(|(i, e)| (i, e.display_name.clone(), e.command.clone()))
-            .collect();
-
-        let tab_bar = div()
-            .id("tab-bar")
-            .h(px(36.0))
-            .w_full()
-            .flex()
-            .items_center()
-            .bg(rgb(MANTLE))
-            .border_b_1()
-            .border_color(rgb(SURFACE0))
-            .children(tab_elements)
-            .child(btn_group);
-
-        // Build shell dropdown menu if open
-        let shell_menu = if show_menu {
-            let mut menu_items: Vec<AnyElement> = Vec::new();
-            for (idx, display_name, command) in shell_entries {
-                let cmd = command.clone();
-                menu_items.push(
-                    div()
-                        .id(ElementId::Name(format!("shell-item-{}", idx).into()))
-                        .px(px(12.0))
-                        .py(px(6.0))
-                        .w_full()
-                        .cursor_pointer()
-                        .text_size(px(12.0))
-                        .text_color(rgb(TEXT))
-                        .hover(|s| s.bg(rgb(SURFACE0)))
-                        .on_mouse_down(
-                            gpui::MouseButton::Left,
-                            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                this.show_shell_menu = false;
-                                let cmd = cmd.clone();
-                                this.state.update(cx, |s, cx| {
-                                    s.add_tab_with_shell(&cmd, cx);
-                                });
-                                cx.notify();
-                            }),
-                        )
-                        .child(display_name)
-                        .into_any_element(),
-                );
-            }
-
+        let shell_backdrop = if self.show_shell_menu {
             Some(
                 div()
-                    .id("shell-dropdown-menu")
+                    .id("shell-backdrop")
                     .absolute()
-                    .top(px(36.0))
-                    .right(px(0.0))
-                    .w(px(200.0))
-                    .bg(rgb(MANTLE))
-                    .border_1()
-                    .border_color(rgb(SURFACE0))
-                    .rounded(px(6.0))
-                    .shadow_lg()
-                    .py(px(4.0))
-                    .children(menu_items),
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba(BACKDROP))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.show_shell_menu = false;
+                            cx.notify();
+                        }),
+                    ),
             )
         } else {
             None
         };
 
-        // Click-outside overlay to close the menu
-        let backdrop = if show_menu {
+        let settings_backdrop = if self.show_settings {
             Some(
                 div()
-                    .id("shell-menu-backdrop")
+                    .id("settings-backdrop")
                     .absolute()
                     .top_0()
                     .left_0()
                     .size_full()
+                    .bg(rgba(BACKDROP))
                     .on_mouse_down(
-                        gpui::MouseButton::Left,
+                        MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                            this.show_shell_menu = false;
+                            this.show_settings = false;
                             cx.notify();
                         }),
                     ),
@@ -516,9 +1254,9 @@ impl Render for RootView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(BASE))
             .relative()
-            // Action handlers on the root element
+            .bg(rgb(WINDOW_BG))
+            .font_family(UI_FONT)
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_split_right))
@@ -526,85 +1264,355 @@ impl Render for RootView {
             .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_focus_next))
             .on_action(cx.listener(Self::on_focus_prev))
-            // Tab bar
-            .child(tab_bar)
-            // Active pane area
+            .child(title_bar)
             .child(
                 div()
+                    .id("terminal-area")
                     .flex_1()
                     .overflow_hidden()
+                    .bg(rgb(WINDOW_BG))
                     .children(active_split),
             )
-            // Status bar
-            .child(Self::render_status_bar(&shell_name, pane_count))
-            // Shell dropdown overlay (backdrop + menu)
-            .children(backdrop)
-            .children(shell_menu)
-    }
-}
-
-impl RootView {
-    fn render_status_bar(shell: &str, pane_count: usize) -> impl IntoElement {
-        let shell_display = shell
-            .rsplit(['\\', '/'])
-            .next()
-            .unwrap_or(shell)
-            .replace(".exe", "");
-
-        let version = env!("CARGO_PKG_VERSION");
-
-        let pane_info = if pane_count > 1 {
-            format!("{}P", pane_count)
-        } else {
-            String::new()
-        };
-
-        div()
-            .h(px(24.0))
-            .w_full()
-            .flex()
-            .items_center()
-            .justify_between()
-            .px(px(12.0))
-            .bg(rgb(MANTLE))
-            .border_t_1()
-            .border_color(rgb(SURFACE0))
-            .text_size(px(11.0))
-            .text_color(rgb(SUBTEXT0))
-            .child({
-                // Left: shell name + pane count
-                let left = div()
-                    .flex()
-                    .items_center()
-                    .gap(px(12.0))
-                    .child(shell_display);
-                if pane_info.is_empty() {
-                    left
-                } else {
-                    left.child(
-                        div()
-                            .text_color(rgb(SURFACE1))
-                            .child(pane_info),
-                    )
-                }
-            })
-            .child(
-                // Right: version
-                div()
-                    .text_color(rgb(SURFACE1))
-                    .child(format!("ZWG v{}", version)),
-            )
+            .child(Self::render_status_bar(
+                &active_shell_name,
+                pane_count,
+                tab_count,
+            ))
+            .children(shell_backdrop)
+            .children(self.render_shell_selector(
+                new_state.width,
+                new_state.height,
+                &available_shells,
+                cx,
+            ))
+            .children(settings_backdrop)
+            .children(self.render_settings_panel(new_state.width, new_state.height, cx))
     }
 }
 
 impl Drop for RootView {
     fn drop(&mut self) {
         if let Some(ref state) = self.last_bounds {
-            if let Err(e) = state.save() {
-                log::warn!("Failed to save window state: {}", e);
-            } else {
-                log::info!("Window state saved on exit");
+            if let Err(err) = state.save() {
+                log::warn!("Failed to save window state: {}", err);
             }
         }
     }
+}
+
+fn shell_meta_for_command(command: &str, available_shells: &[ShellEntry]) -> (ShellType, String) {
+    if let Some(entry) = available_shells
+        .iter()
+        .find(|entry| entry.command == command)
+    {
+        return (entry.shell_type.clone(), entry.display_name.clone());
+    }
+
+    let lower = command.to_lowercase();
+    if lower.contains("pwsh") {
+        (
+            ShellType::Pwsh,
+            shell_display_name(&ShellType::Pwsh).to_string(),
+        )
+    } else if lower.contains("powershell") {
+        (
+            ShellType::PowerShell,
+            shell_display_name(&ShellType::PowerShell).to_string(),
+        )
+    } else if lower.contains("wsl") {
+        (
+            ShellType::Wsl,
+            shell_display_name(&ShellType::Wsl).to_string(),
+        )
+    } else if lower.contains("bash") {
+        (
+            ShellType::GitBash,
+            shell_display_name(&ShellType::GitBash).to_string(),
+        )
+    } else {
+        (
+            ShellType::Cmd,
+            shell_display_name(&ShellType::Cmd).to_string(),
+        )
+    }
+}
+
+fn shell_display_name(shell_type: &ShellType) -> &'static str {
+    match shell_type {
+        ShellType::PowerShell => "Windows PowerShell",
+        ShellType::Pwsh => "PowerShell",
+        ShellType::Cmd => "Command Prompt",
+        ShellType::Wsl => "Ubuntu (WSL)",
+        ShellType::GitBash => "Git Bash",
+    }
+}
+
+fn shell_description(shell_type: &ShellType) -> &'static str {
+    match shell_type {
+        ShellType::PowerShell => "Windows PowerShell 5.1",
+        ShellType::Pwsh => "Windows PowerShell 7.x",
+        ShellType::Cmd => "Windows Command Processor",
+        ShellType::Wsl => "Windows Subsystem for Linux",
+        ShellType::GitBash => "Git for Windows Bash",
+    }
+}
+
+fn shell_icon(shell_type: &ShellType) -> &'static str {
+    match shell_type {
+        ShellType::PowerShell | ShellType::Pwsh => "⚡",
+        ShellType::Cmd => "▶",
+        ShellType::Wsl => "🐧",
+        ShellType::GitBash => "🔀",
+    }
+}
+
+fn chrome_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+    div()
+        .id(id)
+        .w(px(24.0))
+        .h(px(24.0))
+        .rounded(px(6.0))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(UI_FONT)
+        .text_size(px(12.0))
+        .text_color(rgb(SUBTEXT1))
+        .hover(|style| style.bg(rgba(0xffffff10)).text_color(rgb(TEXT)))
+        .child(label)
+}
+
+fn settings_section_heading(label: &'static str) -> Div {
+    div()
+        .font_family(UI_FONT)
+        .text_size(px(14.0))
+        .text_color(rgb(TEXT))
+        .child(label)
+}
+
+fn section_divider() -> Div {
+    div().w_full().h(px(1.0)).bg(rgba(0xffffff10))
+}
+
+fn status_separator() -> Div {
+    div().text_color(rgb(SURFACE1)).child("|")
+}
+
+fn settings_row(label: &'static str, control: impl IntoElement) -> Div {
+    div()
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap(px(12.0))
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(13.0))
+                .text_color(rgb(TEXT_SOFT))
+                .child(label),
+        )
+        .child(control)
+}
+
+fn select_box(value: &'static str, width: f32) -> Div {
+    div()
+        .w(px(width))
+        .h(px(32.0))
+        .rounded(px(8.0))
+        .bg(rgba(0xffffff10))
+        .border_1()
+        .border_color(rgba(0xffffff10))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(13.0))
+                .text_color(rgb(TEXT))
+                .child(value),
+        )
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(10.0))
+                .text_color(rgb(SUBTEXT1))
+                .child("v"),
+        )
+}
+
+fn input_box(value: &'static str, width: f32, mono: bool) -> Div {
+    let mut input = div()
+        .w(px(width))
+        .h(px(32.0))
+        .rounded(px(8.0))
+        .bg(rgba(0xffffff10))
+        .border_1()
+        .border_color(rgba(0xffffff10))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(13.0))
+        .text_color(rgb(TEXT))
+        .child(value);
+
+    if mono {
+        input = input.font_family("JetBrains Mono");
+    } else {
+        input = input.font_family(UI_FONT);
+    }
+
+    input
+}
+
+fn toggle(on: bool) -> Div {
+    let mut root = div()
+        .w(px(38.0))
+        .h(px(22.0))
+        .rounded_full()
+        .bg(rgb(if on { ACCENT_ALT } else { MUTED }))
+        .px(px(2.0))
+        .flex()
+        .items_center();
+
+    if on {
+        root = root.justify_end();
+    }
+
+    root.child(
+        div()
+            .w(px(18.0))
+            .h(px(18.0))
+            .rounded_full()
+            .bg(rgb(0xffffff)),
+    )
+}
+
+fn slider_with_value(fill_ratio: f32, value: &'static str) -> Div {
+    let fill_width = 112.0 * fill_ratio.clamp(0.0, 1.0);
+
+    div()
+        .flex()
+        .items_center()
+        .gap(px(12.0))
+        .child(
+            div()
+                .w(px(112.0))
+                .h(px(4.0))
+                .rounded_full()
+                .bg(rgba(0xffffff12))
+                .child(
+                    div()
+                        .w(px(fill_width))
+                        .h(px(4.0))
+                        .rounded_full()
+                        .bg(rgb(ACCENT)),
+                ),
+        )
+        .child(
+            div()
+                .w(px(40.0))
+                .font_family(UI_FONT)
+                .text_size(px(13.0))
+                .text_color(rgb(SUBTEXT1))
+                .text_right()
+                .child(value),
+        )
+}
+
+fn segmented_control(items: &[(&'static str, bool)]) -> Div {
+    let mut children = Vec::new();
+    for (label, active) in items {
+        let mut item = div()
+            .px(px(12.0))
+            .py(px(6.0))
+            .rounded(px(7.0))
+            .font_family(UI_FONT)
+            .text_size(px(12.0));
+
+        if *active {
+            item = item.bg(rgba(0xffffff14)).text_color(rgb(TEXT));
+        } else {
+            item = item.text_color(rgb(SUBTEXT1));
+        }
+
+        children.push(item.child(*label).into_any_element());
+    }
+
+    div()
+        .rounded(px(8.0))
+        .bg(rgba(0xffffff08))
+        .p(px(2.0))
+        .flex()
+        .items_center()
+        .gap(px(2.0))
+        .children(children)
+}
+
+fn theme_card(name: &'static str, preview: u32, selected: bool) -> Div {
+    let mut card = div()
+        .w(px(144.0))
+        .rounded(px(10.0))
+        .border_1()
+        .border_color(rgba(0xffffff10))
+        .bg(rgba(0xffffff04))
+        .p(px(10.0))
+        .flex()
+        .flex_col()
+        .gap(px(8.0));
+
+    if selected {
+        card = card.border_color(rgb(ACCENT)).bg(rgba(0x0A84FF10));
+    }
+
+    card.child(
+        div()
+            .w_full()
+            .h(px(46.0))
+            .rounded(px(8.0))
+            .bg(rgb(preview))
+            .p(px(6.0))
+            .flex()
+            .items_end()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(3.0))
+                    .child(color_dot(RED))
+                    .child(color_dot(YELLOW))
+                    .child(color_dot(GREEN)),
+            ),
+    )
+    .child(
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .font_family(UI_FONT)
+                    .text_size(px(12.0))
+                    .text_color(rgb(TEXT_SOFT))
+                    .child(name),
+            )
+            .child(if selected {
+                div()
+                    .font_family(UI_FONT)
+                    .text_size(px(12.0))
+                    .text_color(rgb(ACCENT))
+                    .child("o")
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            }),
+    )
+}
+
+fn color_dot(color: u32) -> Div {
+    div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(color))
 }

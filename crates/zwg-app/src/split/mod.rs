@@ -137,13 +137,16 @@ impl SplitContainer {
 
         // Use existing terminal clone as dummy (no new PTY spawned)
         let dummy_terminal = self.first_terminal();
-        let (new_root, sibling_id) = Self::remove_node(std::mem::replace(
-            &mut self.root,
-            SplitNode::Leaf {
-                id: Uuid::nil(),
-                terminal: dummy_terminal,
-            },
-        ), target_id);
+        let (new_root, sibling_id) = Self::remove_node(
+            std::mem::replace(
+                &mut self.root,
+                SplitNode::Leaf {
+                    id: Uuid::nil(),
+                    terminal: dummy_terminal,
+                },
+            ),
+            target_id,
+        );
 
         if let Some(root) = new_root {
             self.root = root;
@@ -161,7 +164,10 @@ impl SplitContainer {
     fn remove_node(node: SplitNode, target_id: Uuid) -> (Option<SplitNode>, Option<Uuid>) {
         match node {
             SplitNode::Branch {
-                direction, ratio, first, second,
+                direction,
+                ratio,
+                first,
+                second,
             } => {
                 // Check if first child is the target
                 if let SplitNode::Leaf { id, .. } = first.as_ref() {
@@ -224,10 +230,7 @@ impl SplitContainer {
         result
     }
 
-    fn collect_terminals(
-        node: &SplitNode,
-        out: &mut Vec<(Uuid, Entity<TerminalPane>)>,
-    ) {
+    fn collect_terminals(node: &SplitNode, out: &mut Vec<(Uuid, Entity<TerminalPane>)>) {
         match node {
             SplitNode::Leaf { id, terminal } => out.push((*id, terminal.clone())),
             SplitNode::Branch { first, second, .. } => {
@@ -288,13 +291,9 @@ impl SplitContainer {
                 let is_focused = *id == focused_id;
                 let mut el = div().size_full().child(terminal.clone());
                 if is_focused {
-                    el = el
-                        .border_2()
-                        .border_color(rgb(0x89b4fa)); // Catppuccin blue
+                    el = el.border_2().border_color(rgb(0x0A84FF));
                 } else {
-                    el = el
-                        .border_1()
-                        .border_color(rgb(0x313244)); // Catppuccin surface0
+                    el = el.border_1().border_color(rgb(0x3C3C3E));
                 }
                 el
             }
@@ -314,24 +313,14 @@ impl SplitContainer {
                         .flex()
                         .flex_row()
                         .child(first_el.flex_grow().flex_basis(relative(r)))
-                        .child(
-                            div()
-                                .w(px(1.0))
-                                .h_full()
-                                .bg(rgb(0x313244)), // divider
-                        )
+                        .child(div().w(px(1.0)).h_full().bg(rgb(0x3C3C3E)))
                         .child(second_el.flex_grow().flex_basis(relative(1.0 - r))),
                     SplitDirection::Vertical => div()
                         .size_full()
                         .flex()
                         .flex_col()
                         .child(first_el.flex_grow().flex_basis(relative(r)))
-                        .child(
-                            div()
-                                .h(px(1.0))
-                                .w_full()
-                                .bg(rgb(0x313244)), // divider
-                        )
+                        .child(div().h(px(1.0)).w_full().bg(rgb(0x3C3C3E)))
                         .child(second_el.flex_grow().flex_basis(relative(1.0 - r))),
                 }
             }
