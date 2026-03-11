@@ -458,6 +458,18 @@ impl RootView {
                 self.snippet_palette.select_next();
                 cx.notify();
             }
+            "tab" => {
+                self.snippet_palette
+                    .cycle_group(!event.keystroke.modifiers.shift);
+                cx.notify();
+            }
+            "delete" => {
+                if self.snippet_palette.delete_selected() {
+                    cx.notify();
+                } else {
+                    return;
+                }
+            }
             "backspace" => {
                 let mut query = self.snippet_palette.query().to_string();
                 if query.pop().is_some() {
@@ -468,6 +480,14 @@ impl RootView {
                 cx.notify();
             }
             _ => {
+                if event.keystroke.modifiers.control && event.keystroke.key == "n" {
+                    if self.snippet_palette.create_snippet_from_query() {
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                    return;
+                }
+
                 if let Some(text) = &event.keystroke.key_char {
                     if !text.is_empty() && !event.keystroke.modifiers.control {
                         let mut query = self.snippet_palette.query().to_string();
@@ -1025,23 +1045,32 @@ impl RootView {
             return None;
         }
 
-        let panel_w = 620.0;
-        let panel_h = 420.0;
+        let panel_w = (viewport_w - 32.0).clamp(560.0, 880.0);
+        let panel_h = (viewport_h - 48.0).clamp(360.0, 520.0);
         let top = ((viewport_h - panel_h) * 0.5).max(24.0);
         let left = ((viewport_w - panel_w) * 0.5).max(24.0);
+        let query_is_empty = self.snippet_palette.query().is_empty();
+        let display_text = if query_is_empty {
+            "Search snippets...".to_string()
+        } else {
+            self.snippet_palette.query().to_string()
+        };
+        let active_group = self.snippet_palette.active_group().map(str::to_owned);
+        let active_group_label = self.snippet_palette.active_group_label();
         let selected_index = self.snippet_palette.selected_filtered_index();
-        let filtered_items: Vec<(usize, String, String)> = self
+        let groups = self.snippet_palette.groups().to_vec();
+        let filtered_items: Vec<(usize, String, usize)> = self
             .snippet_palette
-            .filtered_items()
+            .filtered_entries()
             .into_iter()
-            .enumerate()
-            .map(|(index, snippet)| (index, snippet.title.clone(), snippet.content.clone()))
+            .map(|(store_index, snippet)| {
+                (
+                    store_index,
+                    snippet.title.clone(),
+                    SnippetPalette::item_metric(snippet),
+                )
+            })
             .collect();
-        let preview = self
-            .snippet_palette
-            .selected_content()
-            .unwrap_or("定型文を選択するとここに内容を表示します。")
-            .to_string();
 
         Some(
             div()
@@ -1056,10 +1085,10 @@ impl RootView {
                 .left(px(left))
                 .w(px(panel_w))
                 .h(px(panel_h))
-                .rounded(px(14.0))
+                .rounded(px(12.0))
                 .border_1()
-                .border_color(rgba(0xffffff16))
-                .bg(rgb(PANEL_BG))
+                .border_color(rgba(0x45475aFF))
+                .bg(rgba(0x1e1e2eFF))
                 .shadow_lg()
                 .overflow_hidden()
                 .flex()
@@ -1067,49 +1096,31 @@ impl RootView {
                 .child(
                     div()
                         .w_full()
-                        .px(px(20.0))
-                        .pt(px(18.0))
-                        .pb(px(14.0))
+                        .px(px(18.0))
+                        .py(px(14.0))
                         .border_b_1()
-                        .border_color(rgba(0xffffff10))
+                        .border_color(rgba(0x313244FF))
                         .flex()
-                        .flex_col()
+                        .items_center()
                         .gap(px(12.0))
                         .child(
                             div()
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .font_family(UI_FONT)
-                                        .text_size(px(18.0))
-                                        .text_color(rgb(TEXT))
-                                        .child("定型文"),
-                                )
-                                .child(
-                                    div()
-                                        .font_family(UI_FONT)
-                                        .text_size(px(12.0))
-                                        .text_color(rgb(SUBTEXT1))
-                                        .child(format!("{} 件", filtered_items.len())),
-                                ),
+                                .font_family("JetBrains Mono")
+                                .text_size(px(19.0))
+                                .text_color(rgba(0x89b4faFF))
+                                .child(">>"),
                         )
-                        .child(input_box_dynamic(
-                            if self.snippet_palette.query().is_empty() {
-                                "検索語を入力".to_string()
-                            } else {
-                                self.snippet_palette.query().to_string()
-                            },
-                            240.0,
-                            false,
-                        ))
                         .child(
                             div()
-                                .font_family(UI_FONT)
-                                .text_size(px(12.0))
-                                .text_color(rgb(SUBTEXT1))
-                                .child("Enter で送信 / ↑↓ で移動 / Esc で閉じる"),
+                                .flex_1()
+                                .font_family("JetBrains Mono")
+                                .text_size(px(18.0))
+                                .text_color(if query_is_empty {
+                                    rgba(0x585b70FF)
+                                } else {
+                                    rgba(0xcdd6f4FF)
+                                })
+                                .child(display_text),
                         ),
                 )
                 .child(
@@ -1120,50 +1131,159 @@ impl RootView {
                         .overflow_hidden()
                         .child(
                             div()
-                                .w(px(250.0))
+                                .w(px(176.0))
                                 .h_full()
-                                .p(px(12.0))
+                                .border_r_1()
+                                .border_color(rgba(0x313244FF))
+                                .bg(rgba(0x181825FF))
                                 .flex()
                                 .flex_col()
-                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .p(px(6.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .px(px(12.0))
+                                                .py(px(10.0))
+                                                .rounded(px(8.0))
+                                                .cursor_pointer()
+                                                .font_family("JetBrains Mono")
+                                                .text_size(px(14.0))
+                                                .bg(if active_group.is_none() {
+                                                    rgba(0x313244FF)
+                                                } else {
+                                                    rgba(0x00000000)
+                                                })
+                                                .text_color(if active_group.is_none() {
+                                                    rgba(0x89b4faFF)
+                                                } else {
+                                                    rgba(0xcdd6f4FF)
+                                                })
+                                                .hover(|style| style.bg(rgba(0x313244CC)))
+                                                .child("All")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                        this.snippet_palette.set_active_group(None);
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
+                                        .children(groups.into_iter().map(|group| {
+                                            let is_active = active_group
+                                                .as_deref()
+                                                .map(|active| active.eq_ignore_ascii_case(&group))
+                                                .unwrap_or(false);
+                                            let group_name = group.clone();
+                                            div()
+                                                .id(ElementId::Name(
+                                                    format!("snippet-group-{group_name}").into(),
+                                                ))
+                                                .px(px(12.0))
+                                                .py(px(10.0))
+                                                .rounded(px(8.0))
+                                                .cursor_pointer()
+                                                .font_family("JetBrains Mono")
+                                                .text_size(px(13.0))
+                                                .bg(if is_active {
+                                                    rgba(0x313244FF)
+                                                } else {
+                                                    rgba(0x00000000)
+                                                })
+                                                .text_color(if is_active {
+                                                    rgba(0x89b4faFF)
+                                                } else {
+                                                    rgba(0xcdd6f4FF)
+                                                })
+                                                .hover(|style| style.bg(rgba(0x313244CC)))
+                                                .child(group.clone())
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        move |this,
+                                                              _: &MouseDownEvent,
+                                                              _window,
+                                                              cx| {
+                                                            this.snippet_palette
+                                                                .set_active_group(Some(group_name.clone()));
+                                                            cx.notify();
+                                                        },
+                                                    ),
+                                                )
+                                        })),
+                                )
+                                .child(
+                                    div()
+                                        .p(px(6.0))
+                                        .border_t_1()
+                                        .border_color(rgba(0x313244FF))
+                                        .child(
+                                            div()
+                                                .px(px(12.0))
+                                                .py(px(10.0))
+                                                .rounded(px(8.0))
+                                                .cursor_pointer()
+                                                .font_family("JetBrains Mono")
+                                                .text_size(px(13.0))
+                                                .text_color(rgba(0xa6e3a1FF))
+                                                .hover(|style| style.bg(rgba(0x313244CC)))
+                                                .child("+ New Group")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                        if this.snippet_palette.create_group() {
+                                                            cx.notify();
+                                                        }
+                                                    }),
+                                                ),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .h_full()
+                                .py(px(8.0))
                                 .children(if filtered_items.is_empty() {
                                     vec![
                                         div()
-                                            .px(px(12.0))
-                                            .py(px(14.0))
-                                            .rounded(px(10.0))
-                                            .bg(rgba(0xffffff08))
-                                            .font_family(UI_FONT)
+                                            .px(px(18.0))
+                                            .py(px(20.0))
+                                            .font_family("JetBrains Mono")
                                             .text_size(px(13.0))
-                                            .text_color(rgb(SUBTEXT1))
-                                            .child("一致する定型文がありません。")
+                                            .text_color(rgba(0x585b70FF))
+                                            .child("No snippets. Press Ctrl+N to add one.")
                                             .into_any_element(),
                                     ]
                                 } else {
                                     filtered_items
                                         .iter()
-                                        .map(|(index, title, content)| {
-                                            let is_selected = selected_index == Some(*index);
-                                            let snippet_content = content.clone();
-                                            let snippet_summary = content
-                                                .lines()
-                                                .next()
-                                                .unwrap_or("")
-                                                .to_string();
+                                        .enumerate()
+                                        .map(|(list_index, (store_index, title, metric))| {
+                                            let is_selected = selected_index == Some(list_index);
+                                            let index = *store_index;
                                             div()
                                                 .id(ElementId::Name(
-                                                    format!("snippet-item-{index}").into(),
+                                                    format!("snippet-item-{store_index}").into(),
                                                 ))
-                                                .px(px(12.0))
-                                                .py(px(10.0))
-                                                .rounded(px(10.0))
+                                                .mx(px(8.0))
+                                                .px(px(18.0))
+                                                .py(px(12.0))
+                                                .rounded(px(8.0))
                                                 .cursor_pointer()
+                                                .flex()
+                                                .items_center()
+                                                .justify_between()
                                                 .bg(if is_selected {
-                                                    rgba(0x0A84FF33)
+                                                    rgba(0x313244FF)
                                                 } else {
-                                                    rgba(0xffffff08)
+                                                    rgba(0x00000000)
                                                 })
-                                                .hover(|style| style.bg(rgba(0xffffff12)))
+                                                .hover(|style| style.bg(rgba(0x313244CC)))
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(
@@ -1171,67 +1291,100 @@ impl RootView {
                                                               _: &MouseDownEvent,
                                                               window,
                                                               cx| {
-                                                            if let Some(split) =
-                                                                this.state.read(cx).active_split().cloned()
-                                                            {
-                                                                if let Some(terminal) =
-                                                                    split.read(cx).focused_terminal()
-                                                                {
-                                                                    let _ = terminal
-                                                                        .read(cx)
-                                                                        .send_input(
-                                                                            snippet_content
-                                                                                .as_bytes(),
-                                                                        );
-                                                                }
-                                                            }
-                                                            this.snippet_palette.hide();
-                                                            this.focus_active_terminal(window, cx);
-                                                            cx.notify();
+                                                            this.snippet_palette.select_store_index(index);
+                                                            this.send_selected_snippet_to_active_terminal(window, cx);
                                                         },
                                                     ),
                                                 )
                                                 .child(
                                                     div()
-                                                        .font_family(UI_FONT)
-                                                        .text_size(px(13.0))
-                                                        .text_color(rgb(TEXT))
+                                                        .font_family("JetBrains Mono")
+                                                        .text_size(px(15.0))
+                                                        .text_color(if is_selected {
+                                                            rgba(0x89b4faFF)
+                                                        } else {
+                                                            rgba(0xcdd6f4FF)
+                                                        })
                                                         .child(title.clone()),
                                                 )
                                                 .child(
                                                     div()
-                                                        .mt(px(4.0))
-                                                        .font_family(UI_FONT)
+                                                        .px(px(10.0))
+                                                        .py(px(4.0))
+                                                        .rounded(px(6.0))
+                                                        .font_family("JetBrains Mono")
                                                         .text_size(px(11.0))
-                                                        .text_color(rgb(SUBTEXT1))
-                                                        .child(snippet_summary),
+                                                        .text_color(rgba(0x6c7086FF))
+                                                        .bg(rgba(0x31324466))
+                                                        .child(metric.to_string()),
                                                 )
                                                 .into_any_element()
                                         })
                                         .collect()
                                 }),
+                        ),
+                )
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(14.0))
+                        .py(px(8.0))
+                        .border_t_1()
+                        .border_color(rgba(0x313244FF))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .px(px(10.0))
+                                        .py(px(4.0))
+                                        .rounded(px(6.0))
+                                        .cursor_pointer()
+                                        .font_family("JetBrains Mono")
+                                        .text_size(px(13.0))
+                                        .bg(rgba(0x89b4fa22))
+                                        .text_color(rgba(0x89b4faFF))
+                                        .hover(|style| style.bg(rgba(0x89b4fa33)))
+                                        .child("+ New Snippet")
+                                        .on_mouse_down(
+                                            MouseButton::Left,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                if this.snippet_palette.create_snippet_from_query() {
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .px(px(10.0))
+                                        .py(px(4.0))
+                                        .rounded(px(6.0))
+                                        .font_family("JetBrains Mono")
+                                        .text_size(px(13.0))
+                                        .bg(rgba(0x31324466))
+                                        .text_color(rgba(0x6c7086FF))
+                                        .child("FIFO: OFF"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family("JetBrains Mono")
+                                        .text_size(px(13.0))
+                                        .text_color(rgba(0x6c7086FF))
+                                        .child(format!("[{active_group_label}]")),
+                                ),
                         )
                         .child(
                             div()
-                                .flex_1()
-                                .h_full()
-                                .p(px(16.0))
-                                .border_l_1()
-                                .border_color(rgba(0xffffff10))
-                                .bg(rgba(0x00000012))
-                                .child(
-                                    div()
-                                        .size_full()
-                                        .rounded(px(12.0))
-                                        .bg(rgba(0xffffff06))
-                                        .border_1()
-                                        .border_color(rgba(0xffffff08))
-                                        .p(px(14.0))
-                                        .font_family("JetBrains Mono")
-                                        .text_size(px(12.0))
-                                        .text_color(rgb(TEXT_SOFT))
-                                        .child(preformatted_block(&preview)),
-                                ),
+                                .font_family("JetBrains Mono")
+                                .text_size(px(12.0))
+                                .text_color(rgba(0x6c7086FF))
+                                .child("Enter:paste Tab:group Ctrl+N:new Del:del"),
                         ),
                 )
                 .into_any_element(),
@@ -2136,29 +2289,6 @@ fn settings_section_heading(label: &'static str) -> Div {
         .text_size(px(14.0))
         .text_color(rgb(TEXT))
         .child(label)
-}
-
-fn preformatted_block(text: &str) -> Div {
-    let lines: Vec<&str> = if text.is_empty() {
-        vec![""]
-    } else {
-        text.split('\n').collect()
-    };
-
-    div()
-        .flex()
-        .flex_col()
-        .gap(px(4.0))
-        .children(lines.into_iter().map(|line| {
-            div()
-                .w_full()
-                .child(if line.is_empty() {
-                    " ".to_string()
-                } else {
-                    line.to_string()
-                })
-                .into_any_element()
-        }))
 }
 
 fn section_divider() -> Div {

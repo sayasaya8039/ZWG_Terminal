@@ -6,6 +6,7 @@ pub struct SnippetPalette {
     store: SnippetStore,
     visible: bool,
     query: String,
+    active_group: Option<String>,
     selected_store_index: Option<usize>,
 }
 
@@ -19,6 +20,7 @@ impl SnippetPalette {
             store,
             visible: false,
             query: String::new(),
+            active_group: None,
             selected_store_index: None,
         };
         palette.sync_selection();
@@ -74,10 +76,130 @@ impl SnippetPalette {
         self.sync_selection();
     }
 
+    pub fn groups(&self) -> &[String] {
+        self.store.groups()
+    }
+
+    pub fn active_group(&self) -> Option<&str> {
+        self.active_group.as_deref()
+    }
+
+    pub fn active_group_label(&self) -> String {
+        self.active_group
+            .clone()
+            .unwrap_or_else(|| "all".to_string())
+            .to_lowercase()
+    }
+
+    pub fn set_active_group(&mut self, group: Option<String>) {
+        self.active_group = group;
+        self.sync_selection();
+    }
+
+    pub fn cycle_group(&mut self, forward: bool) {
+        let mut groups: Vec<Option<String>> = vec![None];
+        groups.extend(self.store.groups().iter().cloned().map(Some));
+
+        let current_index = groups
+            .iter()
+            .position(|candidate| candidate.as_deref() == self.active_group())
+            .unwrap_or(0);
+        let next_index = if forward {
+            (current_index + 1) % groups.len()
+        } else if current_index == 0 {
+            groups.len().saturating_sub(1)
+        } else {
+            current_index - 1
+        };
+
+        self.active_group = groups[next_index].clone();
+        self.sync_selection();
+    }
+
+    pub fn create_group(&mut self) -> bool {
+        let mut suffix = 1usize;
+        loop {
+            let candidate = if suffix == 1 {
+                "New Group".to_string()
+            } else {
+                format!("New Group {suffix}")
+            };
+
+            match self.store.add_group(candidate.clone()) {
+                Ok(Some(group)) => {
+                    self.active_group = Some(group);
+                    self.sync_selection();
+                    return true;
+                }
+                Ok(None) => {
+                    suffix += 1;
+                }
+                Err(error) => {
+                    log::warn!("Failed to create snippet group: {}", error);
+                    return false;
+                }
+            }
+        }
+    }
+
+    pub fn create_snippet_from_query(&mut self) -> bool {
+        let query = self.query.trim();
+        let (title, content) = if query.is_empty() {
+            (
+                "New Snippet".to_string(),
+                "echo \"Edit me in %APPDATA%\\\\zwg\\\\snippets.json\"".to_string(),
+            )
+        } else {
+            (query.to_string(), query.to_string())
+        };
+
+        match self
+            .store
+            .add_snippet(title, content, self.active_group.as_deref())
+        {
+            Ok(Some(index)) => {
+                self.selected_store_index = Some(index);
+                self.sync_selection();
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                log::warn!("Failed to create snippet: {}", error);
+                false
+            }
+        }
+    }
+
+    pub fn delete_selected(&mut self) -> bool {
+        let Some(index) = self.selected_store_index else {
+            return false;
+        };
+
+        match self.store.delete_snippet(index) {
+            Ok(true) => {
+                self.sync_selection();
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                log::warn!("Failed to delete snippet: {}", error);
+                false
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn filtered_items(&self) -> Vec<&Snippet> {
         self.filtered_indices()
             .into_iter()
             .map(|index| &self.store.items()[index])
+            .collect()
+    }
+
+    pub fn filtered_entries(&self) -> Vec<(usize, &Snippet)> {
+        self.filtered_indices()
+            .into_iter()
+            .map(|index| (index, &self.store.items()[index]))
             .collect()
     }
 
@@ -105,6 +227,15 @@ impl SnippetPalette {
         self.move_selection(-1);
     }
 
+    pub fn select_store_index(&mut self, index: usize) {
+        self.selected_store_index = Some(index);
+        self.sync_selection();
+    }
+
+    pub fn item_metric(snippet: &Snippet) -> usize {
+        snippet.metric()
+    }
+
     fn move_selection(&mut self, step: isize) {
         let filtered = self.filtered_indices();
         if filtered.is_empty() {
@@ -122,6 +253,17 @@ impl SnippetPalette {
     }
 
     fn sync_selection(&mut self) {
+        if let Some(active_group) = &self.active_group {
+            let exists = self
+                .store
+                .groups()
+                .iter()
+                .any(|group| group.eq_ignore_ascii_case(active_group));
+            if !exists {
+                self.active_group = None;
+            }
+        }
+
         let filtered = self.filtered_indices();
         self.selected_store_index = match (self.selected_store_index, filtered.first()) {
             (_, None) => None,
@@ -132,12 +274,18 @@ impl SnippetPalette {
 
     fn filtered_indices(&self) -> Vec<usize> {
         let query = self.query.trim().to_lowercase();
+        let active_group = self.active_group.as_deref();
 
         self.store
             .items()
             .iter()
             .enumerate()
-            .filter_map(|(index, snippet)| snippet.matches_query(&query).then_some(index))
+            .filter_map(|(index, snippet)| {
+                let matches_group = active_group
+                    .map(|group| snippet.group.eq_ignore_ascii_case(group))
+                    .unwrap_or(true);
+                (matches_group && snippet.matches_query(&query)).then_some(index)
+            })
             .collect()
     }
 }
@@ -177,5 +325,20 @@ mod tests {
 
         palette.select_next();
         assert_eq!(palette.selected_filtered_index(), Some(0));
+    }
+
+    #[test]
+    fn active_group_filters_visible_items() {
+        let store = SnippetStore::from_items(vec![
+            Snippet::with_group("One", "1", "Alpha"),
+            Snippet::with_group("Two", "2", "Beta"),
+        ]);
+        let mut palette = SnippetPalette::new(store);
+
+        palette.set_active_group(Some("Beta".to_string()));
+
+        let items = palette.filtered_items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "Two");
     }
 }
