@@ -969,7 +969,12 @@ impl RootView {
         });
     }
 
-    fn open_snippet_editor(&mut self, mode: SnippetEditorMode, group_hint: Option<usize>) {
+    fn open_snippet_editor(
+        &mut self,
+        mode: SnippetEditorMode,
+        group_hint: Option<usize>,
+        window: &mut Window,
+    ) {
         let state = match mode {
             SnippetEditorMode::Add => SnippetEditorState {
                 mode,
@@ -1001,6 +1006,7 @@ impl RootView {
         };
 
         self.snippet_editor = Some(state);
+        self.focus_handle.focus(window);
     }
 
     fn open_snippet_csv_dialog(&mut self) {
@@ -1271,7 +1277,7 @@ impl RootView {
             }
             "enter" => {
                 if let Some(store_index) = state.selected_item_store_index {
-                    self.open_snippet_editor(SnippetEditorMode::Edit(store_index), None);
+                    self.open_snippet_editor(SnippetEditorMode::Edit(store_index), None, window);
                     cx.notify();
                 }
             }
@@ -1280,6 +1286,7 @@ impl RootView {
                     self.open_snippet_editor(
                         SnippetEditorMode::Add,
                         Some(state.selected_group_index),
+                        window,
                     );
                     cx.notify();
                 } else {
@@ -2550,11 +2557,12 @@ impl RootView {
                                                                         cx.listener(
                                                                             move |this,
                                                                                   _: &MouseDownEvent,
-                                                                                  _window,
+                                                                                  window,
                                                                                   cx| {
                                                                                 this.open_snippet_editor(
                                                                                     SnippetEditorMode::Edit(index),
                                                                                     None,
+                                                                                    window,
                                                                                 );
                                                                                 cx.stop_propagation();
                                                                                 cx.notify();
@@ -2675,12 +2683,16 @@ impl RootView {
                                 )
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                         let group_hint = this
                                             .snippet_palette
                                             .active_group()
                                             .and_then(|group| this.snippet_palette.group_index_by_name(group));
-                                        this.open_snippet_editor(SnippetEditorMode::Add, group_hint);
+                                        this.open_snippet_editor(
+                                            SnippetEditorMode::Add,
+                                            group_hint,
+                                            window,
+                                        );
                                         cx.notify();
                                     }),
                                 ),
@@ -3340,8 +3352,8 @@ impl RootView {
                     .child(light_section_title("定型文管理"))
                     .child(light_outline_button(
                         "新規作成",
-                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                            this.open_snippet_editor(SnippetEditorMode::Add, None);
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.open_snippet_editor(SnippetEditorMode::Add, None, window);
                             cx.notify();
                         }),
                     )),
@@ -3359,8 +3371,12 @@ impl RootView {
                             item.group.clone(),
                             preview,
                             item.is_favorite,
-                            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                this.open_snippet_editor(SnippetEditorMode::Edit(index), None);
+                            cx.listener(move |this, _: &MouseDownEvent, window, cx| {
+                                this.open_snippet_editor(
+                                    SnippetEditorMode::Edit(index),
+                                    None,
+                                    window,
+                                );
                                 cx.notify();
                             }),
                             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
@@ -4371,7 +4387,7 @@ impl RootView {
                                         .child(interactive_action_button(
                                             "新規登録",
                                             true,
-                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                                 let group_hint = this
                                                     .snippet_list_editor
                                                     .as_ref()
@@ -4379,6 +4395,7 @@ impl RootView {
                                                 this.open_snippet_editor(
                                                     SnippetEditorMode::Add,
                                                     group_hint,
+                                                    window,
                                                 );
                                                 cx.notify();
                                             }),
@@ -4386,7 +4403,7 @@ impl RootView {
                                         .child(interactive_action_button(
                                             "編集",
                                             false,
-                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                                 let selected =
                                                     this.snippet_list_editor.as_ref().and_then(
                                                         |state| state.selected_item_store_index,
@@ -4395,6 +4412,7 @@ impl RootView {
                                                     this.open_snippet_editor(
                                                         SnippetEditorMode::Edit(selected),
                                                         None,
+                                                        window,
                                                     );
                                                     cx.notify();
                                                 }
@@ -4603,12 +4621,13 @@ impl RootView {
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(
-                                                        |this, _: &MouseDownEvent, _window, cx| {
+                                                        |this, _: &MouseDownEvent, window, cx| {
                                                             if let Some(editor) =
                                                                 this.snippet_editor.as_mut()
                                                             {
                                                                 editor.active_field =
                                                                     SnippetEditorField::Title;
+                                                                this.focus_handle.focus(window);
                                                                 cx.notify();
                                                             }
                                                         },
@@ -4649,12 +4668,13 @@ impl RootView {
                                                 .on_mouse_down(
                                                     MouseButton::Left,
                                                     cx.listener(
-                                                        |this, _: &MouseDownEvent, _window, cx| {
+                                                        |this, _: &MouseDownEvent, window, cx| {
                                                             if let Some(editor) =
                                                                 this.snippet_editor.as_mut()
                                                             {
                                                                 editor.active_field =
                                                                     SnippetEditorField::Content;
+                                                                this.focus_handle.focus(window);
                                                                 cx.notify();
                                                             }
                                                         },
