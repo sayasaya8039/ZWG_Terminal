@@ -15,6 +15,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 mod app;
 mod config;
 mod shell;
+mod snippets;
 mod split;
 mod terminal;
 
@@ -50,7 +51,15 @@ impl AssetSource for Assets {
 actions!(
     zwg,
     [
-        Quit, NewTab, CloseTab, SplitRight, SplitDown, ClosePane, FocusNext, FocusPrev,
+        Quit,
+        NewTab,
+        CloseTab,
+        SplitRight,
+        SplitDown,
+        ClosePane,
+        FocusNext,
+        FocusPrev,
+        ToggleSnippetPalette,
     ]
 );
 
@@ -82,6 +91,7 @@ fn main() {
             KeyBinding::new("ctrl-shift-x", ClosePane, None),
             KeyBinding::new("ctrl-tab", FocusNext, None),
             KeyBinding::new("ctrl-shift-tab", FocusPrev, None),
+            KeyBinding::new("ctrl-shift-v", ToggleSnippetPalette, None),
             KeyBinding::new("ctrl-shift-q", Quit, None),
         ]);
 

@@ -32,6 +32,13 @@ pub struct SplitContainer {
     focused_id: Uuid,
     shell: String,
     terminal_settings: TerminalSettings,
+    resize_drag: Option<ResizeDragState>,
+}
+
+struct ResizeDragState {
+    branch_path: Vec<bool>,
+    direction: SplitDirection,
+    last_position: Point<Pixels>,
 }
 
 impl SplitContainer {
@@ -43,6 +50,7 @@ impl SplitContainer {
             focused_id: id,
             shell: shell.to_string(),
             terminal_settings,
+            resize_drag: None,
         }
     }
 
@@ -233,6 +241,10 @@ impl SplitContainer {
         result
     }
 
+    pub fn focused_terminal(&self) -> Option<Entity<TerminalPane>> {
+        Self::find_terminal(&self.root, self.focused_id)
+    }
+
     fn collect_terminals(node: &SplitNode, out: &mut Vec<(Uuid, Entity<TerminalPane>)>) {
         match node {
             SplitNode::Leaf { id, terminal } => out.push((*id, terminal.clone())),
@@ -240,6 +252,15 @@ impl SplitContainer {
                 Self::collect_terminals(first, out);
                 Self::collect_terminals(second, out);
             }
+        }
+    }
+
+    fn find_terminal(node: &SplitNode, target_id: Uuid) -> Option<Entity<TerminalPane>> {
+        match node {
+            SplitNode::Leaf { id, terminal } if *id == target_id => Some(terminal.clone()),
+            SplitNode::Leaf { .. } => None,
+            SplitNode::Branch { first, second, .. } => Self::find_terminal(first, target_id)
+                .or_else(|| Self::find_terminal(second, target_id)),
         }
     }
 
@@ -276,6 +297,105 @@ impl SplitContainer {
     pub fn update_terminal_settings(&mut self, terminal_settings: TerminalSettings) {
         self.terminal_settings = terminal_settings;
     }
+
+    fn begin_resize_drag(
+        &mut self,
+        branch_path: Vec<bool>,
+        direction: SplitDirection,
+        start: Point<Pixels>,
+    ) {
+        self.resize_drag = Some(ResizeDragState {
+            branch_path,
+            direction,
+            last_position: start,
+        });
+    }
+
+    fn end_resize_drag(&mut self) {
+        self.resize_drag = None;
+    }
+
+    fn update_resize_drag(
+        &mut self,
+        position: Point<Pixels>,
+        viewport_size: Size<Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        const MIN_RATIO: f32 = 0.15;
+        const MAX_RATIO: f32 = 0.85;
+
+        let Some(drag) = self.resize_drag.as_mut() else {
+            return;
+        };
+
+        let one = px(1.0);
+        let delta_px = match drag.direction {
+            SplitDirection::Horizontal => (position.x - drag.last_position.x) / one,
+            SplitDirection::Vertical => (position.y - drag.last_position.y) / one,
+        };
+        if delta_px.abs() < 0.01 {
+            return;
+        }
+        drag.last_position = position;
+
+        let axis_span = match drag.direction {
+            SplitDirection::Horizontal => (viewport_size.width / one).max(1.0),
+            SplitDirection::Vertical => (viewport_size.height / one).max(1.0),
+        };
+        let delta_ratio = delta_px / axis_span;
+
+        if Self::adjust_branch_ratio_by_path(
+            &mut self.root,
+            &drag.branch_path,
+            delta_ratio,
+            MIN_RATIO,
+            MAX_RATIO,
+        ) {
+            cx.notify();
+        }
+    }
+
+    fn adjust_branch_ratio_by_path(
+        node: &mut SplitNode,
+        path: &[bool],
+        delta_ratio: f32,
+        min_ratio: f32,
+        max_ratio: f32,
+    ) -> bool {
+        if path.is_empty() {
+            if let SplitNode::Branch { ratio, .. } = node {
+                let next = (*ratio + delta_ratio).clamp(min_ratio, max_ratio);
+                if (next - *ratio).abs() > f32::EPSILON {
+                    *ratio = next;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        match node {
+            SplitNode::Branch { first, second, .. } => {
+                if path[0] {
+                    Self::adjust_branch_ratio_by_path(
+                        second,
+                        &path[1..],
+                        delta_ratio,
+                        min_ratio,
+                        max_ratio,
+                    )
+                } else {
+                    Self::adjust_branch_ratio_by_path(
+                        first,
+                        &path[1..],
+                        delta_ratio,
+                        min_ratio,
+                        max_ratio,
+                    )
+                }
+            }
+            SplitNode::Leaf { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -285,14 +405,36 @@ pub enum FocusDir {
 }
 
 impl Render for SplitContainer {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused_id = self.focused_id;
-        Self::render_node(&self.root, focused_id)
+        Self::render_node(&self.root, focused_id, cx.entity().clone(), &[])
+            .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
+                if ev.dragging() {
+                    this.update_resize_drag(ev.position, window.viewport_size(), cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseUpEvent, _window, _cx| {
+                    this.end_resize_drag();
+                }),
+            )
+            .on_mouse_up_out(
+                MouseButton::Left,
+                cx.listener(|this, _ev: &MouseUpEvent, _window, _cx| {
+                    this.end_resize_drag();
+                }),
+            )
     }
 }
 
 impl SplitContainer {
-    fn render_node(node: &SplitNode, focused_id: Uuid) -> Div {
+    fn render_node(
+        node: &SplitNode,
+        focused_id: Uuid,
+        pane_entity: Entity<SplitContainer>,
+        branch_path: &[bool],
+    ) -> Div {
         match node {
             SplitNode::Leaf { id, terminal } => {
                 let is_focused = *id == focused_id;
@@ -310,8 +452,14 @@ impl SplitContainer {
                 first,
                 second,
             } => {
-                let first_el = Self::render_node(first, focused_id);
-                let second_el = Self::render_node(second, focused_id);
+                let mut first_path = branch_path.to_vec();
+                first_path.push(false);
+                let first_el =
+                    Self::render_node(first, focused_id, pane_entity.clone(), &first_path);
+                let mut second_path = branch_path.to_vec();
+                second_path.push(true);
+                let second_el =
+                    Self::render_node(second, focused_id, pane_entity.clone(), &second_path);
                 let r = *ratio;
 
                 match direction {
@@ -319,16 +467,65 @@ impl SplitContainer {
                         .size_full()
                         .flex()
                         .flex_row()
-                        .child(first_el.flex_grow().flex_basis(relative(r)))
-                        .child(div().w(px(1.0)).h_full().bg(rgb(0x3C3C3E)))
-                        .child(second_el.flex_grow().flex_basis(relative(1.0 - r))),
+                        .child(
+                            first_el
+                                .flex_grow()
+                                .flex_basis(relative(r))
+                                .min_w(px(140.0)),
+                        )
+                        .child({
+                            let pane_resize = pane_entity.clone();
+                            let path_for_start = branch_path.to_vec();
+                            div()
+                                .w(px(4.0))
+                                .h_full()
+                                .cursor_col_resize()
+                                .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
+                                    pane_resize.update(cx, |pane, _cx| {
+                                        pane.begin_resize_drag(
+                                            path_for_start.clone(),
+                                            SplitDirection::Horizontal,
+                                            ev.position,
+                                        );
+                                    });
+                                })
+                                .child(div().mx(px(1.5)).w(px(1.0)).h_full().bg(rgb(0x3C3C3E)))
+                        })
+                        .child(
+                            second_el
+                                .flex_grow()
+                                .flex_basis(relative(1.0 - r))
+                                .min_w(px(140.0)),
+                        ),
                     SplitDirection::Vertical => div()
                         .size_full()
                         .flex()
                         .flex_col()
-                        .child(first_el.flex_grow().flex_basis(relative(r)))
-                        .child(div().h(px(1.0)).w_full().bg(rgb(0x3C3C3E)))
-                        .child(second_el.flex_grow().flex_basis(relative(1.0 - r))),
+                        .child(first_el.flex_grow().flex_basis(relative(r)).min_h(px(96.0)))
+                        .child({
+                            let pane_resize = pane_entity.clone();
+                            let path_for_start = branch_path.to_vec();
+                            div()
+                                .h(px(4.0))
+                                .w_full()
+                                .cursor_row_resize()
+                                .on_mouse_down(MouseButton::Left, move |ev, _window, cx| {
+                                    pane_resize.update(cx, |pane, _cx| {
+                                        pane.begin_resize_drag(
+                                            path_for_start.clone(),
+                                            SplitDirection::Vertical,
+                                            ev.position,
+                                        );
+                                    });
+                                })
+                                .child(div().my(px(1.5)).h(px(1.0)).w_full().bg(rgb(0x3C3C3E)))
+                        })
+                        .child(
+                            second_el
+                                .flex_grow()
+                                .flex_basis(relative(1.0 - r))
+                                .min_h(px(96.0)),
+                        ),
                 }
             }
         }

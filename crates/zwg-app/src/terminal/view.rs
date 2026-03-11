@@ -562,7 +562,11 @@ fn render_styled_text(text: &str, style_runs: &[ghostty_vt::StyleRun], _cell_wid
 }
 
 impl TerminalPane {
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+    pub fn send_input(&self, data: &[u8]) -> std::io::Result<usize> {
+        self.surface.write_input(data)
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
         // Ignore input while PTY is not connected
         if !matches!(self.state, TerminalState::Running) {
             return;
@@ -574,7 +578,6 @@ impl TerminalPane {
         if let Some(ref kc) = ks.key_char {
             if !kc.is_empty() {
                 let _ = self.surface.write_input(kc.as_bytes());
-                cx.notify();
                 return;
             }
         }

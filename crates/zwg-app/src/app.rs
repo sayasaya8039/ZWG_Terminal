@@ -6,10 +6,13 @@ use gpui::*;
 
 use crate::config::{AppConfig, WindowState, set_launch_on_login};
 use crate::shell::{self, ShellType};
+use crate::snippets::SnippetPalette;
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::terminal::TerminalSettings;
 use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
-use crate::{ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, SplitDown, SplitRight};
+use crate::{
+    ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, SplitDown, SplitRight, ToggleSnippetPalette,
+};
 
 const WINDOW_BG: u32 = 0x1C1C1E;
 const TITLEBAR_BG: u32 = 0x2C2C2E;
@@ -106,9 +109,11 @@ impl SettingsCategory {
 /// Root view containing tab bar + split container + overlays.
 pub struct RootView {
     state: Entity<AppState>,
+    focus_handle: FocusHandle,
     show_shell_menu: bool,
     show_settings: bool,
     show_close_confirm: bool,
+    snippet_palette: SnippetPalette,
     settings_category: SettingsCategory,
     last_bounds: Option<WindowState>,
     last_save_time: Instant,
@@ -198,9 +203,11 @@ impl RootView {
     pub fn new(state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
         Self {
             state,
+            focus_handle: _cx.focus_handle(),
             show_shell_menu: false,
             show_settings: false,
             show_close_confirm: false,
+            snippet_palette: SnippetPalette::load(),
             settings_category: SettingsCategory::General,
             last_bounds: None,
             last_save_time: Instant::now(),
@@ -266,6 +273,24 @@ impl RootView {
         }
     }
 
+    fn on_toggle_snippet_palette(
+        &mut self,
+        _action: &ToggleSnippetPalette,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_shell_menu = false;
+        self.show_settings = false;
+        self.show_close_confirm = false;
+        self.snippet_palette.toggle();
+        if self.snippet_palette.is_visible() {
+            self.focus_handle.focus(window);
+        } else {
+            self.focus_active_terminal(window, cx);
+        }
+        cx.notify();
+    }
+
     fn on_quit_requested(
         &mut self,
         _action: &crate::Quit,
@@ -280,6 +305,7 @@ impl RootView {
         if should_confirm {
             self.show_shell_menu = false;
             self.show_settings = false;
+            self.snippet_palette.hide();
             self.show_close_confirm = true;
             cx.notify();
         } else {
@@ -378,6 +404,86 @@ impl RootView {
         self.persist_config_update(cx, move |config| {
             config.scrollback_lines = next_value;
         });
+    }
+
+    fn focus_active_terminal(&self, window: &mut Window, cx: &Context<Self>) {
+        let split = self.state.read(cx).active_split().cloned();
+        if let Some(split) = split {
+            if let Some(terminal) = split.read(cx).focused_terminal() {
+                terminal.read(cx).focus_handle(cx).focus(window);
+            }
+        }
+    }
+
+    fn send_selected_snippet_to_active_terminal(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(content) = self.snippet_palette.selected_content().map(str::to_owned) else {
+            return;
+        };
+
+        let split = self.state.read(cx).active_split().cloned();
+        if let Some(split) = split {
+            if let Some(terminal) = split.read(cx).focused_terminal() {
+                let _ = terminal.read(cx).send_input(content.as_bytes());
+            }
+        }
+
+        self.snippet_palette.hide();
+        self.focus_active_terminal(window, cx);
+        cx.notify();
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.snippet_palette.is_visible() {
+            return;
+        }
+
+        match event.keystroke.key.as_ref() {
+            "escape" => {
+                self.snippet_palette.hide();
+                self.focus_active_terminal(window, cx);
+                cx.notify();
+            }
+            "enter" => {
+                self.send_selected_snippet_to_active_terminal(window, cx);
+            }
+            "up" => {
+                self.snippet_palette.select_previous();
+                cx.notify();
+            }
+            "down" => {
+                self.snippet_palette.select_next();
+                cx.notify();
+            }
+            "backspace" => {
+                let mut query = self.snippet_palette.query().to_string();
+                if query.pop().is_some() {
+                    self.snippet_palette.set_query(query);
+                } else {
+                    self.snippet_palette.clear_query();
+                }
+                cx.notify();
+            }
+            _ => {
+                if let Some(text) = &event.keystroke.key_char {
+                    if !text.is_empty() && !event.keystroke.modifiers.control {
+                        let mut query = self.snippet_palette.query().to_string();
+                        query.push_str(text);
+                        self.snippet_palette.set_query(query);
+                        cx.notify();
+                    } else {
+                        return;
+                    }
+                } else {
+                    return;
+                }
+            }
+        }
+
+        cx.stop_propagation();
     }
 
     fn render_window_traffic_lights(
@@ -903,6 +1009,230 @@ impl RootView {
                                 window.remove_window();
                             }),
                         )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_snippet_palette(
+        &mut self,
+        viewport_w: f32,
+        viewport_h: f32,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.snippet_palette.is_visible() {
+            return None;
+        }
+
+        let panel_w = 620.0;
+        let panel_h = 420.0;
+        let top = ((viewport_h - panel_h) * 0.5).max(24.0);
+        let left = ((viewport_w - panel_w) * 0.5).max(24.0);
+        let selected_index = self.snippet_palette.selected_filtered_index();
+        let filtered_items: Vec<(usize, String, String)> = self
+            .snippet_palette
+            .filtered_items()
+            .into_iter()
+            .enumerate()
+            .map(|(index, snippet)| (index, snippet.title.clone(), snippet.content.clone()))
+            .collect();
+        let preview = self
+            .snippet_palette
+            .selected_content()
+            .unwrap_or("定型文を選択するとここに内容を表示します。")
+            .to_string();
+
+        Some(
+            div()
+                .id("snippet-panel")
+                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.snippet_palette.hide();
+                    this.focus_active_terminal(window, cx);
+                    cx.notify();
+                }))
+                .absolute()
+                .top(px(top))
+                .left(px(left))
+                .w(px(panel_w))
+                .h(px(panel_h))
+                .rounded(px(14.0))
+                .border_1()
+                .border_color(rgba(0xffffff16))
+                .bg(rgb(PANEL_BG))
+                .shadow_lg()
+                .overflow_hidden()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .w_full()
+                        .px(px(20.0))
+                        .pt(px(18.0))
+                        .pb(px(14.0))
+                        .border_b_1()
+                        .border_color(rgba(0xffffff10))
+                        .flex()
+                        .flex_col()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(18.0))
+                                        .text_color(rgb(TEXT))
+                                        .child("定型文"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(SUBTEXT1))
+                                        .child(format!("{} 件", filtered_items.len())),
+                                ),
+                        )
+                        .child(input_box_dynamic(
+                            if self.snippet_palette.query().is_empty() {
+                                "検索語を入力".to_string()
+                            } else {
+                                self.snippet_palette.query().to_string()
+                            },
+                            240.0,
+                            false,
+                        ))
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(12.0))
+                                .text_color(rgb(SUBTEXT1))
+                                .child("Enter で送信 / ↑↓ で移動 / Esc で閉じる"),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .w_full()
+                        .flex()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .w(px(250.0))
+                                .h_full()
+                                .p(px(12.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(8.0))
+                                .children(if filtered_items.is_empty() {
+                                    vec![
+                                        div()
+                                            .px(px(12.0))
+                                            .py(px(14.0))
+                                            .rounded(px(10.0))
+                                            .bg(rgba(0xffffff08))
+                                            .font_family(UI_FONT)
+                                            .text_size(px(13.0))
+                                            .text_color(rgb(SUBTEXT1))
+                                            .child("一致する定型文がありません。")
+                                            .into_any_element(),
+                                    ]
+                                } else {
+                                    filtered_items
+                                        .iter()
+                                        .map(|(index, title, content)| {
+                                            let is_selected = selected_index == Some(*index);
+                                            let snippet_content = content.clone();
+                                            let snippet_summary = content
+                                                .lines()
+                                                .next()
+                                                .unwrap_or("")
+                                                .to_string();
+                                            div()
+                                                .id(ElementId::Name(
+                                                    format!("snippet-item-{index}").into(),
+                                                ))
+                                                .px(px(12.0))
+                                                .py(px(10.0))
+                                                .rounded(px(10.0))
+                                                .cursor_pointer()
+                                                .bg(if is_selected {
+                                                    rgba(0x0A84FF33)
+                                                } else {
+                                                    rgba(0xffffff08)
+                                                })
+                                                .hover(|style| style.bg(rgba(0xffffff12)))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        move |this,
+                                                              _: &MouseDownEvent,
+                                                              window,
+                                                              cx| {
+                                                            if let Some(split) =
+                                                                this.state.read(cx).active_split().cloned()
+                                                            {
+                                                                if let Some(terminal) =
+                                                                    split.read(cx).focused_terminal()
+                                                                {
+                                                                    let _ = terminal
+                                                                        .read(cx)
+                                                                        .send_input(
+                                                                            snippet_content
+                                                                                .as_bytes(),
+                                                                        );
+                                                                }
+                                                            }
+                                                            this.snippet_palette.hide();
+                                                            this.focus_active_terminal(window, cx);
+                                                            cx.notify();
+                                                        },
+                                                    ),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(UI_FONT)
+                                                        .text_size(px(13.0))
+                                                        .text_color(rgb(TEXT))
+                                                        .child(title.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .mt(px(4.0))
+                                                        .font_family(UI_FONT)
+                                                        .text_size(px(11.0))
+                                                        .text_color(rgb(SUBTEXT1))
+                                                        .child(snippet_summary),
+                                                )
+                                                .into_any_element()
+                                        })
+                                        .collect()
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .h_full()
+                                .p(px(16.0))
+                                .border_l_1()
+                                .border_color(rgba(0xffffff10))
+                                .bg(rgba(0x00000012))
+                                .child(
+                                    div()
+                                        .size_full()
+                                        .rounded(px(12.0))
+                                        .bg(rgba(0xffffff06))
+                                        .border_1()
+                                        .border_color(rgba(0xffffff08))
+                                        .p(px(14.0))
+                                        .font_family("JetBrains Mono")
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(TEXT_SOFT))
+                                        .child(preformatted_block(&preview)),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -1496,6 +1826,7 @@ impl Render for RootView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                     this.show_settings = false;
+                    this.snippet_palette.hide();
                     this.show_shell_menu = true;
                     cx.notify();
                 }),
@@ -1505,7 +1836,25 @@ impl Render for RootView {
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                         this.show_settings = false;
+                        this.snippet_palette.hide();
                         this.show_shell_menu = true;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                chrome_button("title-snippets", "ui/snippets.svg").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.show_shell_menu = false;
+                        this.show_settings = false;
+                        this.show_close_confirm = false;
+                        this.snippet_palette.toggle();
+                        if this.snippet_palette.is_visible() {
+                            this.focus_handle.focus(window);
+                        } else {
+                            this.focus_active_terminal(window, cx);
+                        }
                         cx.notify();
                     }),
                 ),
@@ -1515,6 +1864,7 @@ impl Render for RootView {
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                         this.show_shell_menu = false;
+                        this.snippet_palette.hide();
                         this.show_settings = true;
                         cx.notify();
                     }),
@@ -1582,6 +1932,20 @@ impl Render for RootView {
             None
         };
 
+        let snippet_backdrop = if self.snippet_palette.is_visible() {
+            Some(
+                div()
+                    .id("snippet-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba(BACKDROP)),
+            )
+        } else {
+            None
+        };
+
         let close_confirm_backdrop = if self.show_close_confirm {
             Some(
                 div()
@@ -1604,6 +1968,8 @@ impl Render for RootView {
             .relative()
             .bg(rgb(WINDOW_BG))
             .font_family(UI_FONT)
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
             .on_action(cx.listener(Self::on_new_tab))
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_split_right))
@@ -1611,6 +1977,7 @@ impl Render for RootView {
             .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_focus_next))
             .on_action(cx.listener(Self::on_focus_prev))
+            .on_action(cx.listener(Self::on_toggle_snippet_palette))
             .on_action(cx.listener(Self::on_quit_requested))
             .child(title_bar)
             .child(
@@ -1636,6 +2003,8 @@ impl Render for RootView {
             ))
             .children(settings_backdrop)
             .children(self.render_settings_panel(new_state.width, new_state.height, window, cx))
+            .children(snippet_backdrop)
+            .children(self.render_snippet_palette(new_state.width, new_state.height, window, cx))
             .children(close_confirm_backdrop)
             .children(self.render_close_confirm_dialog(new_state.width, new_state.height, cx))
     }
@@ -1767,6 +2136,29 @@ fn settings_section_heading(label: &'static str) -> Div {
         .text_size(px(14.0))
         .text_color(rgb(TEXT))
         .child(label)
+}
+
+fn preformatted_block(text: &str) -> Div {
+    let lines: Vec<&str> = if text.is_empty() {
+        vec![""]
+    } else {
+        text.split('\n').collect()
+    };
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .children(lines.into_iter().map(|line| {
+            div()
+                .w_full()
+                .child(if line.is_empty() {
+                    " ".to_string()
+                } else {
+                    line.to_string()
+                })
+                .into_any_element()
+        }))
 }
 
 fn section_divider() -> Div {
