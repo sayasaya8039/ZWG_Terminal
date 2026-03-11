@@ -1476,7 +1476,7 @@ impl RootView {
                     self.compute_snippet_ime_target(),
                     Some(SnippetImeTarget::EditorTitle) | Some(SnippetImeTarget::EditorContent)
                 ) {
-                    return false;
+                    return true;
                 }
                 if let Some(text) = &event.keystroke.key_char {
                     if !text.is_empty() && !event.keystroke.modifiers.control {
