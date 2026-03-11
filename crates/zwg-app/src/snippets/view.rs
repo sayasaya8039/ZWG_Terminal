@@ -1,4 +1,14 @@
+use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
+
 use crate::snippets::{Snippet, SnippetStore};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnippetQueueMode {
+    Off,
+    Fifo,
+    Lifo,
+}
 
 /// Minimal palette state for browsing saved snippets.
 #[derive(Debug, Clone)]
@@ -8,6 +18,8 @@ pub struct SnippetPalette {
     query: String,
     active_group: Option<String>,
     selected_store_index: Option<usize>,
+    queue_mode: SnippetQueueMode,
+    queue: VecDeque<String>,
 }
 
 impl SnippetPalette {
@@ -22,6 +34,8 @@ impl SnippetPalette {
             query: String::new(),
             active_group: None,
             selected_store_index: None,
+            queue_mode: SnippetQueueMode::Off,
+            queue: VecDeque::new(),
         };
         palette.sync_selection();
         palette
@@ -78,6 +92,14 @@ impl SnippetPalette {
 
     pub fn groups(&self) -> &[String] {
         self.store.groups()
+    }
+
+    pub fn store_path(&self) -> &Path {
+        self.store.path()
+    }
+
+    pub fn csv_path(&self) -> PathBuf {
+        SnippetStore::csv_path()
     }
 
     pub fn active_group(&self) -> Option<&str> {
@@ -219,6 +241,64 @@ impl SnippetPalette {
         self.selected_item().map(|snippet| snippet.content.as_str())
     }
 
+    pub fn queue_mode(&self) -> SnippetQueueMode {
+        self.queue_mode
+    }
+
+    pub fn queue_status_label(&self) -> String {
+        match self.queue_mode {
+            SnippetQueueMode::Off => "FIFO: OFF".to_string(),
+            SnippetQueueMode::Fifo => format!("FIFO: ON ({})", self.queue.len()),
+            SnippetQueueMode::Lifo => format!("LIFO: ON ({})", self.queue.len()),
+        }
+    }
+
+    pub fn toggle_fifo_mode(&mut self) {
+        self.queue_mode = if self.queue_mode == SnippetQueueMode::Fifo {
+            self.queue.clear();
+            SnippetQueueMode::Off
+        } else {
+            SnippetQueueMode::Fifo
+        };
+    }
+
+    pub fn toggle_lifo_mode(&mut self) {
+        self.queue_mode = if self.queue_mode == SnippetQueueMode::Lifo {
+            self.queue.clear();
+            SnippetQueueMode::Off
+        } else {
+            SnippetQueueMode::Lifo
+        };
+    }
+
+    pub fn activate_selected(&mut self) -> Option<String> {
+        let content = self.selected_content()?.to_string();
+        self.dispatch_content(content)
+    }
+
+    pub fn activate_store_index(&mut self, index: usize) -> Option<String> {
+        self.select_store_index(index);
+        self.activate_selected()
+    }
+
+    pub fn dequeue(&mut self) -> Option<String> {
+        match self.queue_mode {
+            SnippetQueueMode::Off => None,
+            SnippetQueueMode::Fifo => self.queue.pop_front(),
+            SnippetQueueMode::Lifo => self.queue.pop_back(),
+        }
+    }
+
+    pub fn export_csv(&self) -> std::io::Result<PathBuf> {
+        self.store.export_csv()
+    }
+
+    pub fn import_csv(&mut self) -> std::io::Result<usize> {
+        let count = self.store.import_csv()?;
+        self.sync_selection();
+        Ok(count)
+    }
+
     pub fn select_next(&mut self) {
         self.move_selection(1);
     }
@@ -234,6 +314,16 @@ impl SnippetPalette {
 
     pub fn item_metric(snippet: &Snippet) -> usize {
         snippet.metric()
+    }
+
+    fn dispatch_content(&mut self, content: String) -> Option<String> {
+        match self.queue_mode {
+            SnippetQueueMode::Off => Some(content),
+            SnippetQueueMode::Fifo | SnippetQueueMode::Lifo => {
+                self.queue.push_back(content);
+                None
+            }
+        }
     }
 
     fn move_selection(&mut self, step: isize) {
@@ -340,5 +430,20 @@ mod tests {
         let items = palette.filtered_items();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "Two");
+    }
+
+    #[test]
+    fn fifo_mode_queues_and_dequeues_in_order() {
+        let store =
+            SnippetStore::from_items(vec![Snippet::new("One", "A"), Snippet::new("Two", "B")]);
+        let mut palette = SnippetPalette::new(store);
+
+        palette.toggle_fifo_mode();
+        assert_eq!(palette.activate_selected(), None);
+        palette.select_next();
+        assert_eq!(palette.activate_selected(), None);
+
+        assert_eq!(palette.dequeue(), Some("A".to_string()));
+        assert_eq!(palette.dequeue(), Some("B".to_string()));
     }
 }

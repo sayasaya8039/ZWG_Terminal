@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
-use std::io;
+use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
 const SNIPPET_STORE_VERSION: u32 = 2;
@@ -154,6 +154,13 @@ impl SnippetStore {
             .join("snippets.json")
     }
 
+    pub fn csv_path() -> PathBuf {
+        dirs::config_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("zwg")
+            .join("snippets.csv")
+    }
+
     #[allow(dead_code)]
     pub fn path(&self) -> &Path {
         &self.path
@@ -256,6 +263,84 @@ impl SnippetStore {
         Ok(())
     }
 
+    pub fn export_csv_to_path(&self, path: &Path) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let mut output = String::from("group,title,content\n");
+        for snippet in &self.items {
+            output.push_str(&escape_csv_field(&snippet.group));
+            output.push(',');
+            output.push_str(&escape_csv_field(&snippet.title));
+            output.push(',');
+            output.push_str(&escape_csv_field(&snippet.content));
+            output.push('\n');
+        }
+
+        fs::write(path, output)
+    }
+
+    pub fn export_csv(&self) -> io::Result<PathBuf> {
+        let path = Self::csv_path();
+        self.export_csv_to_path(&path)?;
+        Ok(path)
+    }
+
+    pub fn import_csv_from_path(&mut self, path: &Path) -> io::Result<usize> {
+        let content = fs::read_to_string(path)?;
+        let mut items = Vec::new();
+
+        for (row_index, row) in parse_csv_rows(&content)?.into_iter().enumerate() {
+            if row.iter().all(|field| field.trim().is_empty()) {
+                continue;
+            }
+
+            if row_index == 0
+                && row.len() >= 3
+                && row[0].eq_ignore_ascii_case("group")
+                && row[1].eq_ignore_ascii_case("title")
+                && row[2].eq_ignore_ascii_case("content")
+            {
+                continue;
+            }
+
+            let (group, title, content) = match row.as_slice() {
+                [group, title, content, ..] => (group.clone(), title.clone(), content.clone()),
+                [title, content] => (
+                    DEFAULT_GROUP_NAME.to_string(),
+                    title.clone(),
+                    content.clone(),
+                ),
+                _ => {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        format!("Invalid CSV row at line {}", row_index + 1),
+                    ));
+                }
+            };
+
+            items.push(Snippet::with_group(title, content, group));
+        }
+
+        if items.is_empty() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "CSV did not contain any snippets",
+            ));
+        }
+
+        let refreshed = Self::with_loaded_data(self.path.clone(), Vec::new(), items);
+        self.groups = refreshed.groups;
+        self.items = refreshed.items;
+        self.save()?;
+        Ok(self.items.len())
+    }
+
+    pub fn import_csv(&mut self) -> io::Result<usize> {
+        self.import_csv_from_path(&Self::csv_path())
+    }
+
     fn with_loaded_data(path: PathBuf, groups: Vec<String>, items: Vec<Snippet>) -> Self {
         let items = sanitize_items(items);
         let groups = sanitize_groups(groups, &items);
@@ -306,6 +391,71 @@ fn sanitize_groups(groups: Vec<String>, items: &[Snippet]) -> Vec<String> {
 
 fn sanitize_items(items: Vec<Snippet>) -> Vec<Snippet> {
     items.into_iter().filter_map(Snippet::sanitized).collect()
+}
+
+fn escape_csv_field(field: &str) -> String {
+    let escaped = field.replace('"', "\"\"");
+    if escaped.contains([',', '\n', '\r', '"']) {
+        format!("\"{escaped}\"")
+    } else {
+        escaped
+    }
+}
+
+fn parse_csv_rows(content: &str) -> io::Result<Vec<Vec<String>>> {
+    let mut rows = Vec::new();
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut chars = content.chars().peekable();
+    let mut in_quotes = false;
+
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                if in_quotes {
+                    if matches!(chars.peek(), Some('"')) {
+                        field.push('"');
+                        let _ = chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                } else if field.is_empty() {
+                    in_quotes = true;
+                } else {
+                    field.push(ch);
+                }
+            }
+            ',' if !in_quotes => {
+                row.push(std::mem::take(&mut field));
+            }
+            '\n' if !in_quotes => {
+                row.push(std::mem::take(&mut field));
+                rows.push(std::mem::take(&mut row));
+            }
+            '\r' if !in_quotes => {
+                if matches!(chars.peek(), Some('\n')) {
+                    let _ = chars.next();
+                }
+                row.push(std::mem::take(&mut field));
+                rows.push(std::mem::take(&mut row));
+            }
+            _ => field.push(ch),
+        }
+    }
+
+    if in_quotes {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "CSV ended inside a quoted field",
+        ));
+    }
+
+    if !field.is_empty() || !row.is_empty() {
+        row.push(field);
+        rows.push(row);
+    }
+
+    Ok(rows)
 }
 
 fn default_snippets() -> Vec<Snippet> {
@@ -367,6 +517,28 @@ mod tests {
         ]);
 
         assert_eq!(store.groups(), &["Alpha".to_string(), "Beta".to_string()]);
+    }
+
+    #[test]
+    fn csv_export_import_round_trip_preserves_multiline_content() {
+        let json_path = temp_path();
+        let csv_path = json_path.with_extension("csv");
+        let store = SnippetStore::with_loaded_data(
+            json_path.clone(),
+            vec![],
+            vec![Snippet::with_group("One", "line1\nline2", "Alpha")],
+        );
+
+        store.export_csv_to_path(&csv_path).unwrap();
+
+        let mut imported = SnippetStore::with_loaded_data(json_path, vec![], vec![]);
+        let count = imported.import_csv_from_path(&csv_path).unwrap();
+
+        assert_eq!(count, 1);
+        assert_eq!(imported.groups(), &["Alpha".to_string()]);
+        assert_eq!(imported.items()[0].content, "line1\nline2");
+
+        let _ = fs::remove_file(csv_path);
     }
 
     fn temp_path() -> PathBuf {

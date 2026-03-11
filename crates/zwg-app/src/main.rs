@@ -60,6 +60,7 @@ actions!(
         FocusNext,
         FocusPrev,
         ToggleSnippetPalette,
+        SnippetQueuePaste,
     ]
 );
 
@@ -92,6 +93,7 @@ fn main() {
             KeyBinding::new("ctrl-tab", FocusNext, None),
             KeyBinding::new("ctrl-shift-tab", FocusPrev, None),
             KeyBinding::new("ctrl-shift-v", ToggleSnippetPalette, None),
+            KeyBinding::new("ctrl-shift-f", SnippetQueuePaste, None),
             KeyBinding::new("ctrl-shift-q", Quit, None),
         ]);
 

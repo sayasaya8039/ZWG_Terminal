@@ -1,17 +1,20 @@
 //! Application state and root view — Figma-aligned macOS terminal chrome
 
+use std::path::Path;
+use std::process::Command;
 use std::time::Instant;
 
 use gpui::*;
 
 use crate::config::{AppConfig, WindowState, set_launch_on_login};
 use crate::shell::{self, ShellType};
-use crate::snippets::SnippetPalette;
+use crate::snippets::{SnippetPalette, SnippetQueueMode};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::terminal::TerminalSettings;
 use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
 use crate::{
-    ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, SplitDown, SplitRight, ToggleSnippetPalette,
+    ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, SnippetQueuePaste, SplitDown, SplitRight,
+    ToggleSnippetPalette,
 };
 
 const WINDOW_BG: u32 = 0x1C1C1E;
@@ -113,6 +116,7 @@ pub struct RootView {
     show_shell_menu: bool,
     show_settings: bool,
     show_close_confirm: bool,
+    show_snippet_context_menu: bool,
     snippet_palette: SnippetPalette,
     settings_category: SettingsCategory,
     last_bounds: Option<WindowState>,
@@ -207,6 +211,7 @@ impl RootView {
             show_shell_menu: false,
             show_settings: false,
             show_close_confirm: false,
+            show_snippet_context_menu: false,
             snippet_palette: SnippetPalette::load(),
             settings_category: SettingsCategory::General,
             last_bounds: None,
@@ -282,6 +287,7 @@ impl RootView {
         self.show_shell_menu = false;
         self.show_settings = false;
         self.show_close_confirm = false;
+        self.show_snippet_context_menu = false;
         self.snippet_palette.toggle();
         if self.snippet_palette.is_visible() {
             self.focus_handle.focus(window);
@@ -289,6 +295,15 @@ impl RootView {
             self.focus_active_terminal(window, cx);
         }
         cx.notify();
+    }
+
+    fn on_snippet_queue_paste(
+        &mut self,
+        _action: &SnippetQueuePaste,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.paste_next_queued_snippet(window, cx);
     }
 
     fn on_quit_requested(
@@ -305,6 +320,7 @@ impl RootView {
         if should_confirm {
             self.show_shell_menu = false;
             self.show_settings = false;
+            self.show_snippet_context_menu = false;
             self.snippet_palette.hide();
             self.show_close_confirm = true;
             cx.notify();
@@ -415,15 +431,12 @@ impl RootView {
         }
     }
 
-    fn send_selected_snippet_to_active_terminal(
+    fn dispatch_snippet_to_active_terminal(
         &mut self,
+        content: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(content) = self.snippet_palette.selected_content().map(str::to_owned) else {
-            return;
-        };
-
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             if let Some(terminal) = split.read(cx).focused_terminal() {
@@ -434,6 +447,67 @@ impl RootView {
         self.snippet_palette.hide();
         self.focus_active_terminal(window, cx);
         cx.notify();
+    }
+
+    fn activate_selected_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.snippet_palette.activate_selected() {
+            Some(content) => self.dispatch_snippet_to_active_terminal(content, window, cx),
+            None => cx.notify(),
+        }
+    }
+
+    fn activate_snippet_index(
+        &mut self,
+        store_index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match self.snippet_palette.activate_store_index(store_index) {
+            Some(content) => self.dispatch_snippet_to_active_terminal(content, window, cx),
+            None => cx.notify(),
+        }
+    }
+
+    fn paste_next_queued_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(content) = self.snippet_palette.dequeue() else {
+            return;
+        };
+
+        let split = self.state.read(cx).active_split().cloned();
+        if let Some(split) = split {
+            if let Some(terminal) = split.read(cx).focused_terminal() {
+                let _ = terminal.read(cx).send_input(content.as_bytes());
+            }
+        }
+
+        self.focus_active_terminal(window, cx);
+        cx.notify();
+    }
+
+    fn open_snippet_store_in_editor(&mut self) {
+        let path = self.snippet_palette.store_path().to_path_buf();
+        if let Err(err) = open_path_in_default_app(&path) {
+            log::warn!("Failed to open snippet store {:?}: {}", path, err);
+        }
+    }
+
+    fn sync_snippet_csv_roundtrip(&mut self) {
+        let csv_path = self.snippet_palette.csv_path();
+        let result = if csv_path.exists() {
+            self.snippet_palette.import_csv().map(|count| {
+                log::info!("Imported {} snippets from {:?}", count, csv_path);
+            })
+        } else {
+            self.snippet_palette.export_csv().and_then(|path| {
+                log::info!("Exported snippets to {:?}", path);
+                open_path_in_default_app(&path)?;
+                Ok(())
+            })
+        };
+
+        if let Err(err) = result {
+            log::warn!("Failed to sync snippet CSV {:?}: {}", csv_path, err);
+        }
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
@@ -448,7 +522,7 @@ impl RootView {
                 cx.notify();
             }
             "enter" => {
-                self.send_selected_snippet_to_active_terminal(window, cx);
+                self.activate_selected_snippet(window, cx);
             }
             "up" => {
                 self.snippet_palette.select_previous();
@@ -1057,6 +1131,7 @@ impl RootView {
         };
         let active_group = self.snippet_palette.active_group().map(str::to_owned);
         let active_group_label = self.snippet_palette.active_group_label();
+        let queue_status_label = self.snippet_palette.queue_status_label();
         let selected_index = self.snippet_palette.selected_filtered_index();
         let groups = self.snippet_palette.groups().to_vec();
         let filtered_items: Vec<(usize, String, usize)> = self
@@ -1294,8 +1369,7 @@ impl RootView {
                                                               _: &MouseDownEvent,
                                                               window,
                                                               cx| {
-                                                            this.snippet_palette.select_store_index(index);
-                                                            this.send_selected_snippet_to_active_terminal(window, cx);
+                                                            this.activate_snippet_index(index, window, cx);
                                                         },
                                                     ),
                                                 )
@@ -1372,7 +1446,7 @@ impl RootView {
                                         .text_size(px(13.0))
                                         .bg(rgba(0x31324466))
                                         .text_color(rgba(0x6c7086FF))
-                                        .child("FIFO: OFF"),
+                                        .child(queue_status_label),
                                 )
                                 .child(
                                     div()
@@ -1387,8 +1461,127 @@ impl RootView {
                                 .font_family("JetBrains Mono")
                                 .text_size(px(12.0))
                                 .text_color(rgba(0x6c7086FF))
-                                .child("Enter:paste Tab:group Ctrl+N:new Del:del"),
+                                .child("Enter:paste/queue Tab:group Ctrl+N:new Ctrl+Shift+F:send"),
                         ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_snippet_context_menu(
+        &mut self,
+        viewport_w: f32,
+        _viewport_h: f32,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.show_snippet_context_menu {
+            return None;
+        }
+
+        let menu_w = 312.0;
+        let top = 42.0;
+        let left = (viewport_w - menu_w - 10.0).max(12.0);
+        let fifo_active = self.snippet_palette.queue_mode() == SnippetQueueMode::Fifo;
+        let lifo_active = self.snippet_palette.queue_mode() == SnippetQueueMode::Lifo;
+
+        Some(
+            div()
+                .id("snippet-context-menu-overlay")
+                .absolute()
+                .top(px(0.0))
+                .left(px(0.0))
+                .w_full()
+                .h_full()
+                .child(
+                    div()
+                        .absolute()
+                        .top(px(0.0))
+                        .left(px(0.0))
+                        .w_full()
+                        .h_full()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.show_snippet_context_menu = false;
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.show_snippet_context_menu = false;
+                                cx.notify();
+                            }),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("snippet-context-menu")
+                        .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.show_snippet_context_menu = false;
+                            cx.notify();
+                        }))
+                        .absolute()
+                        .top(px(top))
+                        .left(px(left))
+                        .w(px(menu_w))
+                        .rounded(px(10.0))
+                        .border_1()
+                        .border_color(rgba(0x313244FF))
+                        .bg(rgba(0x11111BFF))
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .child(snippet_menu_item(
+                            "定型文グループの編集(G)",
+                            false,
+                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                this.show_snippet_context_menu = false;
+                                this.snippet_palette.show();
+                                let _ = this.snippet_palette.create_group();
+                                this.focus_handle.focus(window);
+                                cx.notify();
+                            }),
+                        ))
+                        .child(snippet_menu_item(
+                            "定型文の編集(T)",
+                            false,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.show_snippet_context_menu = false;
+                                this.open_snippet_store_in_editor();
+                                cx.notify();
+                            }),
+                        ))
+                        .child(snippet_menu_item(
+                            "定型文CSV出力/取込(V)",
+                            false,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.show_snippet_context_menu = false;
+                                this.sync_snippet_csv_roundtrip();
+                                cx.notify();
+                            }),
+                        ))
+                        .child(div().w_full().h(px(1.0)).my(px(4.0)).bg(rgba(0x313244FF)))
+                        .child(snippet_menu_item(
+                            "FIFOモード(O)",
+                            fifo_active,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.show_snippet_context_menu = false;
+                                this.snippet_palette.toggle_fifo_mode();
+                                cx.notify();
+                            }),
+                        ))
+                        .child(snippet_menu_item(
+                            "LIFOモード(L)",
+                            lifo_active,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.show_snippet_context_menu = false;
+                                this.snippet_palette.toggle_lifo_mode();
+                                cx.notify();
+                            }),
+                        )),
                 )
                 .into_any_element(),
         )
@@ -1982,6 +2175,7 @@ impl Render for RootView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                     this.show_settings = false;
+                    this.show_snippet_context_menu = false;
                     this.snippet_palette.hide();
                     this.show_shell_menu = true;
                     cx.notify();
@@ -1992,6 +2186,7 @@ impl Render for RootView {
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                         this.show_settings = false;
+                        this.show_snippet_context_menu = false;
                         this.snippet_palette.hide();
                         this.show_shell_menu = true;
                         cx.notify();
@@ -1999,27 +2194,41 @@ impl Render for RootView {
                 ),
             )
             .child(
-                chrome_button("title-snippets", "ui/snippets.svg").on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                        this.show_shell_menu = false;
-                        this.show_settings = false;
-                        this.show_close_confirm = false;
-                        this.snippet_palette.toggle();
-                        if this.snippet_palette.is_visible() {
-                            this.focus_handle.focus(window);
-                        } else {
-                            this.focus_active_terminal(window, cx);
-                        }
-                        cx.notify();
-                    }),
-                ),
+                chrome_button("title-snippets", "ui/snippets.svg")
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.show_shell_menu = false;
+                            this.show_settings = false;
+                            this.show_close_confirm = false;
+                            this.show_snippet_context_menu = false;
+                            this.snippet_palette.toggle();
+                            if this.snippet_palette.is_visible() {
+                                this.focus_handle.focus(window);
+                            } else {
+                                this.focus_active_terminal(window, cx);
+                            }
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.show_shell_menu = false;
+                            this.show_settings = false;
+                            this.show_close_confirm = false;
+                            this.snippet_palette.hide();
+                            this.show_snippet_context_menu = !this.show_snippet_context_menu;
+                            cx.notify();
+                        }),
+                    ),
             )
             .child(
                 chrome_button("title-settings", "ui/settings.svg").on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                         this.show_shell_menu = false;
+                        this.show_snippet_context_menu = false;
                         this.snippet_palette.hide();
                         this.show_settings = true;
                         cx.notify();
@@ -2134,6 +2343,7 @@ impl Render for RootView {
             .on_action(cx.listener(Self::on_focus_next))
             .on_action(cx.listener(Self::on_focus_prev))
             .on_action(cx.listener(Self::on_toggle_snippet_palette))
+            .on_action(cx.listener(Self::on_snippet_queue_paste))
             .on_action(cx.listener(Self::on_quit_requested))
             .child(title_bar)
             .child(
@@ -2159,6 +2369,12 @@ impl Render for RootView {
             ))
             .children(settings_backdrop)
             .children(self.render_settings_panel(new_state.width, new_state.height, window, cx))
+            .children(self.render_snippet_context_menu(
+                new_state.width,
+                new_state.height,
+                window,
+                cx,
+            ))
             .children(snippet_backdrop)
             .children(self.render_snippet_palette(new_state.width, new_state.height, window, cx))
             .children(close_confirm_backdrop)
@@ -2191,6 +2407,13 @@ fn resolve_default_shell_command(config_shell: &str, available_shells: &[ShellEn
         .map(|entry| entry.command.clone())
         .or_else(|| available_shells.first().map(|entry| entry.command.clone()))
         .unwrap_or_else(shell::detect_default_shell)
+}
+
+fn open_path_in_default_app(path: &Path) -> std::io::Result<()> {
+    Command::new("cmd")
+        .args(["/C", "start", "", path.to_string_lossy().as_ref()])
+        .spawn()?;
+    Ok(())
 }
 
 fn window_size_from_grid(cols: u16, rows: u16) -> Size<Pixels> {
@@ -2284,6 +2507,28 @@ fn chrome_button(id: &'static str, icon_path: &'static str) -> Stateful<Div> {
                 .size(px(14.0))
                 .text_color(rgb(SUBTEXT1)),
         )
+}
+
+fn snippet_menu_item(
+    label: &'static str,
+    active: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .w_full()
+        .px(px(16.0))
+        .py(px(12.0))
+        .cursor_pointer()
+        .font_family(UI_FONT)
+        .text_size(px(13.0))
+        .text_color(if active {
+            rgba(0x89b4faFF)
+        } else {
+            rgba(0xBAC2DEFF)
+        })
+        .hover(|style| style.bg(rgba(0x313244AA)))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(label)
 }
 
 fn settings_section_heading(label: &'static str) -> Div {
