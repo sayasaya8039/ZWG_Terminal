@@ -2402,7 +2402,7 @@ impl RootView {
                                 .font_family(UI_FONT)
                                 .text_size(px(12.0))
                                 .text_color(rgba(0x6B7280FF))
-                                .child("Clibor"),
+                                .child("定型文"),
                         )
                         .child(div().w(px(46.0))),
                 )
