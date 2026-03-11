@@ -1705,6 +1705,10 @@ impl RootView {
             return;
         }
 
+        if self.compute_snippet_ime_target() != Some(SnippetImeTarget::PaletteQuery) {
+            return;
+        }
+
         match event.keystroke.key.as_ref() {
             "escape" => {
                 self.snippet_palette.hide();
@@ -1750,10 +1754,6 @@ impl RootView {
                         cx.notify();
                     }
                     cx.stop_propagation();
-                    return;
-                }
-
-                if self.compute_snippet_ime_target() == Some(SnippetImeTarget::PaletteQuery) {
                     return;
                 }
 
