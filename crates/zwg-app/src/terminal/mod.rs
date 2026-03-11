@@ -6,11 +6,14 @@ pub mod view;
 #[cfg(not(feature = "ghostty_vt"))]
 pub mod vt_parser;
 
-#[derive(Debug, Clone, Copy)]
+use std::sync::{Arc, atomic::AtomicBool};
+
+#[derive(Debug, Clone)]
 pub struct TerminalSettings {
     pub cols: u16,
     pub rows: u16,
     pub scrollback_lines: usize,
+    pub input_suppressed: Arc<AtomicBool>,
 }
 
 #[cfg(not(feature = "ghostty_vt"))]

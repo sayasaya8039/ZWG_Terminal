@@ -2,6 +2,10 @@
 
 use std::io::Write;
 use std::ops::Range;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::Instant;
 
 use gpui::prelude::FluentBuilder;
@@ -72,6 +76,7 @@ pub struct AppState {
     pub active_tab: usize,
     pub available_shells: Vec<ShellEntry>,
     pub config: AppConfig,
+    terminal_input_suppressed: Arc<AtomicBool>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -294,8 +299,10 @@ impl AppState {
             }
         }
 
+        let terminal_input_suppressed = Arc::new(AtomicBool::new(false));
         let (shell_type, title) = shell_meta_for_command(&default_shell, &available_shells);
-        let terminal_settings = terminal_settings_from_config(&config);
+        let terminal_settings =
+            terminal_settings_from_config(&config, terminal_input_suppressed.clone());
         let split = cx.new(|cx| SplitContainer::new(&default_shell, terminal_settings, cx));
 
         Self {
@@ -307,6 +314,7 @@ impl AppState {
             active_tab: 0,
             available_shells,
             config,
+            terminal_input_suppressed,
         }
     }
 
@@ -317,7 +325,8 @@ impl AppState {
 
     pub fn add_tab_with_shell(&mut self, shell: &str, cx: &mut App) {
         let (shell_type, title) = shell_meta_for_command(shell, &self.available_shells);
-        let terminal_settings = terminal_settings_from_config(&self.config);
+        let terminal_settings =
+            terminal_settings_from_config(&self.config, self.terminal_input_suppressed.clone());
         let split = cx.new(|cx| SplitContainer::new(shell, terminal_settings, cx));
 
         self.tabs.push(Tab {
@@ -344,8 +353,10 @@ impl AppState {
 
     pub fn apply_config(&mut self, config: AppConfig, cx: &mut App) {
         self.config = config;
-        let terminal_settings = terminal_settings_from_config(&self.config);
+        let terminal_settings =
+            terminal_settings_from_config(&self.config, self.terminal_input_suppressed.clone());
         for tab in &self.tabs {
+            let terminal_settings = terminal_settings.clone();
             tab.split.update(cx, |split, _cx| {
                 split.update_terminal_settings(terminal_settings);
             });
@@ -961,6 +972,20 @@ impl RootView {
                 terminal.read(cx).focus_handle(cx).focus(window);
             }
         }
+    }
+
+    fn sync_terminal_input_suppression(&self, cx: &Context<Self>) {
+        let suppressed = self.show_snippet_settings
+            || self.show_snippet_context_menu
+            || self.snippet_palette.is_visible()
+            || self.snippet_group_editor.is_some()
+            || self.snippet_list_editor.is_some()
+            || self.snippet_editor.is_some()
+            || self.snippet_csv_dialog.is_some();
+        self.state
+            .read(cx)
+            .terminal_input_suppressed
+            .store(suppressed, Ordering::Relaxed);
     }
 
     fn dispatch_snippet_to_active_terminal(
@@ -5942,6 +5967,8 @@ impl Render for RootView {
             None
         };
 
+        self.sync_terminal_input_suppression(cx);
+
         div()
             .id("root")
             .size_full()
@@ -6034,11 +6061,15 @@ impl Drop for RootView {
     }
 }
 
-fn terminal_settings_from_config(config: &AppConfig) -> TerminalSettings {
+fn terminal_settings_from_config(
+    config: &AppConfig,
+    input_suppressed: Arc<AtomicBool>,
+) -> TerminalSettings {
     TerminalSettings {
         cols: config.default_window_cols,
         rows: config.default_window_rows,
         scrollback_lines: config.scrollback_lines,
+        input_suppressed,
     }
 }
 

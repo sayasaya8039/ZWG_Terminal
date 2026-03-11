@@ -44,7 +44,7 @@ struct ResizeDragState {
 impl SplitContainer {
     pub fn new(shell: &str, terminal_settings: TerminalSettings, cx: &mut Context<Self>) -> Self {
         let id = Uuid::new_v4();
-        let terminal = cx.new(|cx| TerminalPane::new(shell, terminal_settings, cx));
+        let terminal = cx.new(|cx| TerminalPane::new(shell, terminal_settings.clone(), cx));
         Self {
             root: SplitNode::Leaf { id, terminal },
             focused_id: id,
@@ -59,7 +59,7 @@ impl SplitContainer {
         let target_id = self.focused_id;
         let shell = self.shell.clone();
         let new_id = Uuid::new_v4();
-        let terminal_settings = self.terminal_settings;
+        let terminal_settings = self.terminal_settings.clone();
         let new_terminal = cx.new(|cx| TerminalPane::new(&shell, terminal_settings, cx));
 
         self.root = Self::split_node(

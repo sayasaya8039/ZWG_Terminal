@@ -1,6 +1,9 @@
 //! Terminal pane — GPUI view that renders the terminal and handles input
 
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 
 use gpui::*;
 
@@ -62,6 +65,7 @@ impl TerminalSnapshot {
 pub struct TerminalPane {
     surface: TerminalSurface,
     focus_handle: FocusHandle,
+    input_suppressed: Arc<AtomicBool>,
     state: TerminalState,
     snapshot: TerminalSnapshot,
     /// Cached cell dimensions
@@ -177,6 +181,7 @@ impl TerminalPane {
         Self {
             surface,
             focus_handle,
+            input_suppressed: settings.input_suppressed.clone(),
             state: TerminalState::Pending,
             snapshot: TerminalSnapshot::new(settings.rows),
             cell_width: CELL_WIDTH_ESTIMATE,
@@ -567,6 +572,10 @@ impl TerminalPane {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
+        if self.input_suppressed.load(Ordering::Relaxed) {
+            return;
+        }
+
         // Ignore input while PTY is not connected
         if !matches!(self.state, TerminalState::Running) {
             return;
