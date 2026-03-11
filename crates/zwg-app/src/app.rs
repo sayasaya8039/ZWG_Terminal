@@ -4507,6 +4507,16 @@ impl RootView {
         };
         let title_active = editor.active_field == SnippetEditorField::Title;
         let content_active = editor.active_field == SnippetEditorField::Content;
+        let title_display = if title_active {
+            format!("{}|", editor.title)
+        } else {
+            editor.title.clone()
+        };
+        let content_display = if content_active {
+            format!("{}|", editor.content)
+        } else {
+            editor.content.clone()
+        };
 
         Some(
             div()
@@ -4633,7 +4643,7 @@ impl RootView {
                                                         },
                                                     ),
                                                 )
-                                                .child(editor.title),
+                                                .child(title_display),
                                         ),
                                 )
                                 .child(
@@ -4680,7 +4690,7 @@ impl RootView {
                                                         },
                                                     ),
                                                 )
-                                                .child(editor.content),
+                                                .child(content_display),
                                         ),
                                 )
                                 .child(
