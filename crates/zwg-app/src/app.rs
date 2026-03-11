@@ -1,14 +1,12 @@
 //! Application state and root view — Figma-aligned macOS terminal chrome
 
-use std::path::Path;
-use std::process::Command;
 use std::time::Instant;
 
 use gpui::*;
 
 use crate::config::{AppConfig, WindowState, set_launch_on_login};
 use crate::shell::{self, ShellType};
-use crate::snippets::{SnippetPalette, SnippetQueueMode};
+use crate::snippets::{CsvEncoding, SnippetPalette, SnippetQueueMode};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::terminal::TerminalSettings;
 use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
@@ -109,6 +107,74 @@ impl SettingsCategory {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnippetGroupEditMode {
+    None,
+    Rename(usize),
+    New,
+}
+
+#[derive(Clone)]
+struct SnippetGroupEditorState {
+    selected_index: usize,
+    edit_mode: SnippetGroupEditMode,
+    draft_name: String,
+}
+
+impl Default for SnippetGroupEditorState {
+    fn default() -> Self {
+        Self {
+            selected_index: 0,
+            edit_mode: SnippetGroupEditMode::None,
+            draft_name: String::new(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct SnippetListEditorState {
+    selected_group_index: usize,
+    selected_item_store_index: Option<usize>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnippetEditorMode {
+    Add,
+    Edit(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnippetEditorField {
+    Title,
+    Content,
+}
+
+#[derive(Clone)]
+struct SnippetEditorState {
+    mode: SnippetEditorMode,
+    title: String,
+    content: String,
+    group_index: usize,
+    active_field: SnippetEditorField,
+}
+
+#[derive(Clone)]
+struct SnippetCsvDialogState {
+    export_encoding: CsvEncoding,
+    import_encoding: CsvEncoding,
+    clear_before_import: bool,
+}
+
+impl Default for SnippetCsvDialogState {
+    fn default() -> Self {
+        Self {
+            export_encoding: CsvEncoding::ShiftJis,
+            import_encoding: CsvEncoding::ShiftJis,
+            clear_before_import: false,
+        }
+    }
+}
+
 /// Root view containing tab bar + split container + overlays.
 pub struct RootView {
     state: Entity<AppState>,
@@ -118,6 +184,10 @@ pub struct RootView {
     show_close_confirm: bool,
     show_snippet_context_menu: bool,
     snippet_palette: SnippetPalette,
+    snippet_group_editor: Option<SnippetGroupEditorState>,
+    snippet_list_editor: Option<SnippetListEditorState>,
+    snippet_editor: Option<SnippetEditorState>,
+    snippet_csv_dialog: Option<SnippetCsvDialogState>,
     settings_category: SettingsCategory,
     last_bounds: Option<WindowState>,
     last_save_time: Instant,
@@ -213,6 +283,10 @@ impl RootView {
             show_close_confirm: false,
             show_snippet_context_menu: false,
             snippet_palette: SnippetPalette::load(),
+            snippet_group_editor: None,
+            snippet_list_editor: None,
+            snippet_editor: None,
+            snippet_csv_dialog: None,
             settings_category: SettingsCategory::General,
             last_bounds: None,
             last_save_time: Instant::now(),
@@ -484,33 +558,416 @@ impl RootView {
         cx.notify();
     }
 
-    fn open_snippet_store_in_editor(&mut self) {
-        let path = self.snippet_palette.store_path().to_path_buf();
-        if let Err(err) = open_path_in_default_app(&path) {
-            log::warn!("Failed to open snippet store {:?}: {}", path, err);
+    fn close_snippet_dialogs(&mut self) {
+        self.snippet_group_editor = None;
+        self.snippet_list_editor = None;
+        self.snippet_editor = None;
+        self.snippet_csv_dialog = None;
+    }
+
+    fn open_snippet_group_editor(&mut self) {
+        self.close_snippet_dialogs();
+        self.snippet_palette.hide();
+        let selected_index = self
+            .snippet_palette
+            .active_group()
+            .and_then(|group| self.snippet_palette.group_index_by_name(group))
+            .unwrap_or(0);
+        self.snippet_group_editor = Some(SnippetGroupEditorState {
+            selected_index,
+            ..SnippetGroupEditorState::default()
+        });
+    }
+
+    fn open_snippet_list_editor(&mut self) {
+        self.close_snippet_dialogs();
+        self.snippet_palette.hide();
+        let selected_group_index = self
+            .snippet_palette
+            .active_group()
+            .and_then(|group| self.snippet_palette.group_index_by_name(group))
+            .unwrap_or(0);
+        let selected_item_store_index = self
+            .snippet_palette
+            .group_name_at(selected_group_index)
+            .and_then(|group| {
+                self.snippet_palette
+                    .snippets_for_group(Some(group))
+                    .first()
+                    .map(|(store_index, _)| *store_index)
+            });
+        self.snippet_list_editor = Some(SnippetListEditorState {
+            selected_group_index,
+            selected_item_store_index,
+        });
+    }
+
+    fn open_snippet_editor(&mut self, mode: SnippetEditorMode, group_hint: Option<usize>) {
+        let state = match mode {
+            SnippetEditorMode::Add => SnippetEditorState {
+                mode,
+                title: String::new(),
+                content: String::new(),
+                group_index: group_hint.unwrap_or(0),
+                active_field: SnippetEditorField::Title,
+            },
+            SnippetEditorMode::Edit(store_index) => {
+                let snippet = self
+                    .snippet_palette
+                    .store()
+                    .items()
+                    .get(store_index)
+                    .cloned()
+                    .unwrap_or_else(|| crate::snippets::Snippet::new("", ""));
+                let group_index = self
+                    .snippet_palette
+                    .group_index_by_name(&snippet.group)
+                    .unwrap_or(0);
+                SnippetEditorState {
+                    mode,
+                    title: snippet.title,
+                    content: snippet.content,
+                    group_index,
+                    active_field: SnippetEditorField::Title,
+                }
+            }
+        };
+
+        self.snippet_editor = Some(state);
+    }
+
+    fn open_snippet_csv_dialog(&mut self) {
+        self.close_snippet_dialogs();
+        self.snippet_palette.hide();
+        self.snippet_csv_dialog = Some(SnippetCsvDialogState::default());
+    }
+
+    fn close_snippet_group_editor(&mut self) {
+        self.snippet_group_editor = None;
+    }
+
+    fn close_snippet_list_editor(&mut self) {
+        self.snippet_list_editor = None;
+    }
+
+    fn close_snippet_editor(&mut self) {
+        self.snippet_editor = None;
+    }
+
+    fn close_snippet_csv_dialog(&mut self) {
+        self.snippet_csv_dialog = None;
+    }
+
+    fn sync_list_editor_selection(&mut self) {
+        let Some(state) = self.snippet_list_editor.as_mut() else {
+            return;
+        };
+        let Some(group_name) = self
+            .snippet_palette
+            .group_name_at(state.selected_group_index)
+        else {
+            state.selected_group_index = 0;
+            state.selected_item_store_index =
+                self.snippet_palette.group_name_at(0).and_then(|group| {
+                    self.snippet_palette
+                        .snippets_for_group(Some(group))
+                        .first()
+                        .map(|(store_index, _)| *store_index)
+                });
+            return;
+        };
+
+        let group_items = self.snippet_palette.snippets_for_group(Some(group_name));
+        if group_items.is_empty() {
+            state.selected_item_store_index = None;
+            return;
+        }
+
+        if !state
+            .selected_item_store_index
+            .map(|selected| {
+                group_items
+                    .iter()
+                    .any(|(store_index, _)| *store_index == selected)
+            })
+            .unwrap_or(false)
+        {
+            state.selected_item_store_index = Some(group_items[0].0);
         }
     }
 
-    fn sync_snippet_csv_roundtrip(&mut self) {
-        let csv_path = self.snippet_palette.csv_path();
-        let result = if csv_path.exists() {
-            self.snippet_palette.import_csv().map(|count| {
-                log::info!("Imported {} snippets from {:?}", count, csv_path);
-            })
-        } else {
-            self.snippet_palette.export_csv().and_then(|path| {
-                log::info!("Exported snippets to {:?}", path);
-                open_path_in_default_app(&path)?;
-                Ok(())
-            })
+    fn apply_group_editor_edit(&mut self) {
+        let Some(editor) = self.snippet_group_editor.as_mut() else {
+            return;
+        };
+        let draft_name = editor.draft_name.trim().to_string();
+        if draft_name.is_empty() {
+            editor.edit_mode = SnippetGroupEditMode::None;
+            editor.draft_name.clear();
+            return;
+        }
+
+        let updated = match editor.edit_mode {
+            SnippetGroupEditMode::Rename(index) => {
+                self.snippet_palette.rename_group(index, draft_name)
+            }
+            SnippetGroupEditMode::New => self.snippet_palette.add_group_named(draft_name),
+            SnippetGroupEditMode::None => false,
         };
 
-        if let Err(err) = result {
-            log::warn!("Failed to sync snippet CSV {:?}: {}", csv_path, err);
+        if updated {
+            editor.selected_index = match editor.edit_mode {
+                SnippetGroupEditMode::Rename(index) => index,
+                SnippetGroupEditMode::New => self.snippet_palette.groups().len().saturating_sub(1),
+                SnippetGroupEditMode::None => editor.selected_index,
+            };
         }
+
+        editor.edit_mode = SnippetGroupEditMode::None;
+        editor.draft_name.clear();
+    }
+
+    fn save_snippet_editor(&mut self) {
+        let Some(editor) = self.snippet_editor.as_ref().cloned() else {
+            return;
+        };
+        let group_name = self
+            .snippet_palette
+            .group_name_at(editor.group_index)
+            .unwrap_or("General")
+            .to_string();
+        let selected_store_index = match editor.mode {
+            SnippetEditorMode::Add => {
+                self.snippet_palette
+                    .add_snippet(editor.title, editor.content, Some(&group_name))
+            }
+            SnippetEditorMode::Edit(store_index) => self
+                .snippet_palette
+                .update_snippet(store_index, editor.title, editor.content, Some(&group_name))
+                .then_some(store_index),
+        };
+
+        if let Some(selected_store_index) = selected_store_index {
+            self.snippet_editor = None;
+            if let Some(state) = self.snippet_list_editor.as_mut() {
+                state.selected_group_index = editor.group_index;
+                state.selected_item_store_index = Some(selected_store_index);
+            }
+            self.sync_list_editor_selection();
+        }
+    }
+
+    fn handle_snippet_group_editor_key(
+        &mut self,
+        event: &KeyDownEvent,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(editor) = self.snippet_group_editor.as_mut() else {
+            return false;
+        };
+
+        match event.keystroke.key.as_ref() {
+            "escape" => {
+                self.close_snippet_group_editor();
+                cx.notify();
+            }
+            "up" => {
+                editor.selected_index = editor.selected_index.saturating_sub(1);
+                cx.notify();
+            }
+            "down" => {
+                editor.selected_index = (editor.selected_index + 1)
+                    .min(self.snippet_palette.groups().len().saturating_sub(1));
+                cx.notify();
+            }
+            "enter" => {
+                if editor.edit_mode != SnippetGroupEditMode::None {
+                    self.apply_group_editor_edit();
+                    cx.notify();
+                }
+            }
+            "backspace" => {
+                if editor.edit_mode != SnippetGroupEditMode::None {
+                    editor.draft_name.pop();
+                    cx.notify();
+                }
+            }
+            _ => {
+                if let Some(text) = &event.keystroke.key_char {
+                    if !text.is_empty()
+                        && !event.keystroke.modifiers.control
+                        && editor.edit_mode != SnippetGroupEditMode::None
+                    {
+                        editor.draft_name.push_str(text);
+                        cx.notify();
+                    } else {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
+    fn handle_snippet_list_editor_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(state) = self.snippet_list_editor.as_ref().cloned() else {
+            return false;
+        };
+        let Some(group_name) = self
+            .snippet_palette
+            .group_name_at(state.selected_group_index)
+            .map(str::to_string)
+        else {
+            return false;
+        };
+        let group_items = self.snippet_palette.snippets_for_group(Some(&group_name));
+        let selected_position = state
+            .selected_item_store_index
+            .and_then(|selected| {
+                group_items
+                    .iter()
+                    .position(|(store_index, _)| *store_index == selected)
+            })
+            .unwrap_or(0);
+
+        match event.keystroke.key.as_ref() {
+            "escape" => {
+                self.close_snippet_list_editor();
+                cx.notify();
+            }
+            "up" => {
+                if let Some((store_index, _)) = group_items.get(selected_position.saturating_sub(1))
+                {
+                    if let Some(state) = self.snippet_list_editor.as_mut() {
+                        state.selected_item_store_index = Some(*store_index);
+                        cx.notify();
+                    }
+                }
+            }
+            "down" => {
+                if let Some((store_index, _)) = group_items
+                    .get((selected_position + 1).min(group_items.len().saturating_sub(1)))
+                {
+                    if let Some(state) = self.snippet_list_editor.as_mut() {
+                        state.selected_item_store_index = Some(*store_index);
+                        cx.notify();
+                    }
+                }
+            }
+            "delete" => {
+                if let Some(store_index) = state.selected_item_store_index {
+                    if self.snippet_palette.delete_snippet(store_index) {
+                        self.sync_list_editor_selection();
+                        cx.notify();
+                    }
+                }
+            }
+            "enter" => {
+                if let Some(store_index) = state.selected_item_store_index {
+                    self.open_snippet_editor(SnippetEditorMode::Edit(store_index), None);
+                    cx.notify();
+                }
+            }
+            _ => {
+                if event.keystroke.modifiers.control && event.keystroke.key == "n" {
+                    self.open_snippet_editor(
+                        SnippetEditorMode::Add,
+                        Some(state.selected_group_index),
+                    );
+                    cx.notify();
+                } else {
+                    return false;
+                }
+            }
+        }
+
+        let _ = window;
+        true
+    }
+
+    fn handle_snippet_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
+        let Some(editor) = self.snippet_editor.as_mut() else {
+            return false;
+        };
+
+        match event.keystroke.key.as_ref() {
+            "escape" => {
+                self.close_snippet_editor();
+                cx.notify();
+            }
+            "tab" => {
+                editor.active_field = match editor.active_field {
+                    SnippetEditorField::Title => SnippetEditorField::Content,
+                    SnippetEditorField::Content => SnippetEditorField::Title,
+                };
+                cx.notify();
+            }
+            "enter" if event.keystroke.modifiers.control => {
+                self.save_snippet_editor();
+                cx.notify();
+            }
+            "enter" => {
+                match editor.active_field {
+                    SnippetEditorField::Title => editor.active_field = SnippetEditorField::Content,
+                    SnippetEditorField::Content => editor.content.push('\n'),
+                }
+                cx.notify();
+            }
+            "backspace" => {
+                match editor.active_field {
+                    SnippetEditorField::Title => {
+                        editor.title.pop();
+                    }
+                    SnippetEditorField::Content => {
+                        editor.content.pop();
+                    }
+                }
+                cx.notify();
+            }
+            _ => {
+                if let Some(text) = &event.keystroke.key_char {
+                    if !text.is_empty() && !event.keystroke.modifiers.control {
+                        match editor.active_field {
+                            SnippetEditorField::Title => editor.title.push_str(text),
+                            SnippetEditorField::Content => editor.content.push_str(text),
+                        }
+                        cx.notify();
+                    } else {
+                        return false;
+                    }
+                } else {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        if self.handle_snippet_editor_key(event, cx)
+            || self.handle_snippet_group_editor_key(event, cx)
+            || self.handle_snippet_list_editor_key(event, window, cx)
+        {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.snippet_csv_dialog.is_some() {
+            if event.keystroke.key == "escape" {
+                self.close_snippet_csv_dialog();
+                cx.notify();
+                cx.stop_propagation();
+            }
+            return;
+        }
+
         if !self.snippet_palette.is_visible() {
             return;
         }
@@ -1537,11 +1994,9 @@ impl RootView {
                         .child(snippet_menu_item(
                             "定型文グループの編集(G)",
                             false,
-                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                                 this.show_snippet_context_menu = false;
-                                this.snippet_palette.show();
-                                let _ = this.snippet_palette.create_group();
-                                this.focus_handle.focus(window);
+                                this.open_snippet_group_editor();
                                 cx.notify();
                             }),
                         ))
@@ -1550,7 +2005,7 @@ impl RootView {
                             false,
                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                                 this.show_snippet_context_menu = false;
-                                this.open_snippet_store_in_editor();
+                                this.open_snippet_list_editor();
                                 cx.notify();
                             }),
                         ))
@@ -1559,7 +2014,7 @@ impl RootView {
                             false,
                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                                 this.show_snippet_context_menu = false;
-                                this.sync_snippet_csv_roundtrip();
+                                this.open_snippet_csv_dialog();
                                 cx.notify();
                             }),
                         ))
@@ -1569,7 +2024,7 @@ impl RootView {
                             fifo_active,
                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                                 this.show_snippet_context_menu = false;
-                                this.snippet_palette.toggle_fifo_mode();
+                                this.snippet_palette.set_fifo_mode();
                                 cx.notify();
                             }),
                         ))
@@ -1578,10 +2033,1223 @@ impl RootView {
                             lifo_active,
                             cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                                 this.show_snippet_context_menu = false;
-                                this.snippet_palette.toggle_lifo_mode();
+                                this.snippet_palette.set_lifo_mode();
                                 cx.notify();
                             }),
                         )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_snippet_group_editor(
+        &mut self,
+        viewport_w: f32,
+        viewport_h: f32,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let editor = self.snippet_group_editor.as_ref()?.clone();
+        let groups = self.snippet_palette.groups().to_vec();
+        let selected_index = editor.selected_index.min(groups.len().saturating_sub(1));
+        let panel_w = 880.0;
+        let panel_h = 520.0;
+        let top = ((viewport_h - panel_h) * 0.5).max(24.0);
+        let left = ((viewport_w - panel_w) * 0.5).max(24.0);
+        let editing = editor.edit_mode != SnippetGroupEditMode::None;
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (index, group_name) in groups.iter().cloned().enumerate() {
+            let row_index = index;
+            let is_selected = index == selected_index;
+            rows.push(
+                div()
+                    .id(ElementId::Name(
+                        format!("snippet-group-row-{row_index}").into(),
+                    ))
+                    .w_full()
+                    .px(px(12.0))
+                    .py(px(8.0))
+                    .border_b_1()
+                    .border_color(rgba(0xffffff08))
+                    .bg(if is_selected {
+                        rgba(0xffffff10)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .cursor_pointer()
+                    .hover(|style| style.bg(rgba(0xffffff12)))
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                            if let Some(editor) = this.snippet_group_editor.as_mut() {
+                                editor.selected_index = row_index;
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .font_family("JetBrains Mono")
+                            .text_size(px(12.0))
+                            .text_color(rgb(if is_selected { TEXT } else { TEXT_SOFT }))
+                            .child(group_name),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        Some(
+            div()
+                .id("snippet-group-editor-overlay")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(rgba(BACKDROP)),
+                )
+                .child(
+                    div()
+                        .id("snippet-group-editor-panel")
+                        .absolute()
+                        .top(px(top))
+                        .left(px(left))
+                        .w(px(panel_w))
+                        .rounded(px(12.0))
+                        .border_1()
+                        .border_color(rgba(0xffffff10))
+                        .bg(rgb(WINDOW_BG))
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.close_snippet_group_editor();
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w_full()
+                                .px(px(16.0))
+                                .py(px(12.0))
+                                .border_b_1()
+                                .border_color(rgba(0xffffff10))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(14.0))
+                                        .text_color(rgb(TEXT))
+                                        .child("定型文グループ"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family("JetBrains Mono")
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(SUBTEXT1))
+                                        .child("Enter:確定 Esc:閉じる"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .gap(px(12.0))
+                                .p(px(12.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h(px(400.0))
+                                        .rounded(px(10.0))
+                                        .border_1()
+                                        .border_color(rgba(0xffffff10))
+                                        .bg(rgba(0xffffff06))
+                                        .overflow_hidden()
+                                        .children(rows),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(220.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(8.0))
+                                        .child(interactive_action_button(
+                                            "名前変更",
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                let selected = this
+                                                    .snippet_group_editor
+                                                    .as_ref()
+                                                    .map(|editor| editor.selected_index)
+                                                    .unwrap_or(0);
+                                                let current_name = this
+                                                    .snippet_palette
+                                                    .group_name_at(selected)
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                if let Some(editor) =
+                                                    this.snippet_group_editor.as_mut()
+                                                {
+                                                    editor.selected_index = selected;
+                                                    editor.edit_mode =
+                                                        SnippetGroupEditMode::Rename(selected);
+                                                    editor.draft_name = current_name;
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        ))
+                                        .child(interactive_action_button(
+                                            "上へ",
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                let selected = this
+                                                    .snippet_group_editor
+                                                    .as_ref()
+                                                    .map(|editor| editor.selected_index)
+                                                    .unwrap_or(0);
+                                                if let Some(next_index) =
+                                                    this.snippet_palette.move_group_up(selected)
+                                                {
+                                                    if let Some(editor) =
+                                                        this.snippet_group_editor.as_mut()
+                                                    {
+                                                        editor.selected_index = next_index;
+                                                    }
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(interactive_action_button(
+                                            "下へ",
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                let selected = this
+                                                    .snippet_group_editor
+                                                    .as_ref()
+                                                    .map(|editor| editor.selected_index)
+                                                    .unwrap_or(0);
+                                                if let Some(next_index) =
+                                                    this.snippet_palette.move_group_down(selected)
+                                                {
+                                                    if let Some(editor) =
+                                                        this.snippet_group_editor.as_mut()
+                                                    {
+                                                        editor.selected_index = next_index;
+                                                    }
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(div().h(px(8.0)))
+                                        .child(interactive_action_button(
+                                            "新規追加",
+                                            true,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                if let Some(editor) =
+                                                    this.snippet_group_editor.as_mut()
+                                                {
+                                                    editor.edit_mode = SnippetGroupEditMode::New;
+                                                    editor.draft_name.clear();
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        ))
+                                        .child(interactive_action_button(
+                                            "削除",
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                let selected = this
+                                                    .snippet_group_editor
+                                                    .as_ref()
+                                                    .map(|editor| editor.selected_index)
+                                                    .unwrap_or(0);
+                                                if this.snippet_palette.delete_group(selected) {
+                                                    if let Some(editor) =
+                                                        this.snippet_group_editor.as_mut()
+                                                    {
+                                                        editor.selected_index =
+                                                            selected.saturating_sub(1);
+                                                        editor.edit_mode =
+                                                            SnippetGroupEditMode::None;
+                                                        editor.draft_name.clear();
+                                                    }
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(interactive_action_button(
+                                            if editing { "確定" } else { "閉じる" },
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                if this
+                                                    .snippet_group_editor
+                                                    .as_ref()
+                                                    .map(|editor| {
+                                                        editor.edit_mode
+                                                            != SnippetGroupEditMode::None
+                                                    })
+                                                    .unwrap_or(false)
+                                                {
+                                                    this.apply_group_editor_edit();
+                                                } else {
+                                                    this.close_snippet_group_editor();
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(div().h(px(8.0)))
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(SUBTEXT1))
+                                                .child(format!(
+                                                    "最大 {} グループ",
+                                                    crate::snippets::SnippetStore::MAX_GROUPS
+                                                )),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .p(px(12.0))
+                                .border_t_1()
+                                .border_color(rgba(0xffffff10))
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(TEXT_SOFT))
+                                        .child(if editing {
+                                            "グループ名"
+                                        } else {
+                                            "名前変更または新規追加を押すとここで編集できます"
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(px(38.0))
+                                        .rounded(px(8.0))
+                                        .border_1()
+                                        .border_color(rgb(if editing { ACCENT } else { SURFACE1 }))
+                                        .bg(rgba(0xffffff08))
+                                        .px(px(12.0))
+                                        .flex()
+                                        .items_center()
+                                        .font_family("JetBrains Mono")
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(TEXT))
+                                        .child(if editing {
+                                            editor.draft_name
+                                        } else {
+                                            String::new()
+                                        }),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_snippet_list_editor(
+        &mut self,
+        viewport_w: f32,
+        viewport_h: f32,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let state = self.snippet_list_editor.as_ref()?.clone();
+        let groups = self.snippet_palette.groups().to_vec();
+        let selected_group_index = state
+            .selected_group_index
+            .min(groups.len().saturating_sub(1));
+        let selected_group_name = groups.get(selected_group_index)?.clone();
+        let items = self
+            .snippet_palette
+            .snippets_for_group(Some(&selected_group_name));
+        let panel_w = 1020.0;
+        let panel_h = 620.0;
+        let top = ((viewport_h - panel_h) * 0.5).max(24.0);
+        let left = ((viewport_w - panel_w) * 0.5).max(24.0);
+
+        let mut rows: Vec<AnyElement> = Vec::new();
+        for (row_index, (store_index, snippet)) in items.iter().enumerate() {
+            let store_index = *store_index;
+            let is_selected = state.selected_item_store_index == Some(store_index);
+            let preview = snippet.content.replace('\n', " ");
+            rows.push(
+                div()
+                    .id(ElementId::Name(
+                        format!("snippet-list-row-{store_index}").into(),
+                    ))
+                    .w_full()
+                    .flex()
+                    .border_b_1()
+                    .border_color(rgba(0xffffff08))
+                    .bg(if is_selected {
+                        rgba(0xffffff10)
+                    } else {
+                        rgba(0x00000000)
+                    })
+                    .hover(|style| style.bg(rgba(0xffffff12)))
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                            if let Some(state) = this.snippet_list_editor.as_mut() {
+                                state.selected_item_store_index = Some(store_index);
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .child(
+                        div()
+                            .w(px(260.0))
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .font_family("JetBrains Mono")
+                            .text_size(px(12.0))
+                            .text_color(rgb(TEXT))
+                            .child(snippet.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .border_l_1()
+                            .border_color(rgba(0xffffff08))
+                            .font_family("JetBrains Mono")
+                            .text_size(px(12.0))
+                            .text_color(rgb(TEXT_SOFT))
+                            .child(preview),
+                    )
+                    .child(
+                        div()
+                            .w(px(84.0))
+                            .px(px(10.0))
+                            .py(px(8.0))
+                            .border_l_1()
+                            .border_color(rgba(0xffffff08))
+                            .font_family("JetBrains Mono")
+                            .text_size(px(11.0))
+                            .text_color(rgb(SUBTEXT1))
+                            .text_right()
+                            .child(format!("{}", row_index + 1)),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        Some(
+            div()
+                .id("snippet-list-editor-overlay")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(rgba(BACKDROP)),
+                )
+                .child(
+                    div()
+                        .id("snippet-list-editor-panel")
+                        .absolute()
+                        .top(px(top))
+                        .left(px(left))
+                        .w(px(panel_w))
+                        .rounded(px(12.0))
+                        .border_1()
+                        .border_color(rgba(0xffffff10))
+                        .bg(rgb(WINDOW_BG))
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.close_snippet_list_editor();
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w_full()
+                                .px(px(16.0))
+                                .py(px(12.0))
+                                .border_b_1()
+                                .border_color(rgba(0xffffff10))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(14.0))
+                                        .text_color(rgb(TEXT))
+                                        .child("定型文"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family("JetBrains Mono")
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(SUBTEXT1))
+                                        .child("Ctrl+N:新規 Enter:編集 Del:削除"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap(px(12.0))
+                                .px(px(16.0))
+                                .py(px(12.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(10.0))
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(12.0))
+                                                .text_color(rgb(TEXT_SOFT))
+                                                .child("定型文グループ"),
+                                        )
+                                        .child(interactive_select_box(
+                                            selected_group_name.clone(),
+                                            260.0,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                let total =
+                                                    this.snippet_palette.groups().len().max(1);
+                                                let next_group_index = this
+                                                    .snippet_list_editor
+                                                    .as_ref()
+                                                    .map(|state| {
+                                                        (state.selected_group_index + 1) % total
+                                                    })
+                                                    .unwrap_or(0);
+                                                let next_selection = this
+                                                    .snippet_palette
+                                                    .group_name_at(next_group_index)
+                                                    .and_then(|group| {
+                                                        this.snippet_palette
+                                                            .snippets_for_group(Some(group))
+                                                            .first()
+                                                            .map(|(store_index, _)| *store_index)
+                                                    });
+                                                if let Some(state) =
+                                                    this.snippet_list_editor.as_mut()
+                                                {
+                                                    state.selected_group_index = next_group_index;
+                                                    state.selected_item_store_index =
+                                                        next_selection;
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        )),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(SUBTEXT1))
+                                        .child(format!(
+                                            "{} / {}",
+                                            items.len(),
+                                            crate::snippets::SnippetStore::MAX_SNIPPETS_PER_GROUP
+                                        )),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .gap(px(12.0))
+                                .px(px(16.0))
+                                .pb(px(16.0))
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_h(px(460.0))
+                                        .rounded(px(10.0))
+                                        .border_1()
+                                        .border_color(rgba(0xffffff10))
+                                        .bg(rgba(0xffffff06))
+                                        .overflow_hidden()
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .flex()
+                                                .border_b_1()
+                                                .border_color(rgba(0xffffff10))
+                                                .bg(rgba(0xffffff08))
+                                                .child(
+                                                    div()
+                                                        .w(px(260.0))
+                                                        .px(px(10.0))
+                                                        .py(px(8.0))
+                                                        .font_family(UI_FONT)
+                                                        .text_size(px(11.0))
+                                                        .text_color(rgb(SUBTEXT1))
+                                                        .child("定型文"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .flex_1()
+                                                        .px(px(10.0))
+                                                        .py(px(8.0))
+                                                        .border_l_1()
+                                                        .border_color(rgba(0xffffff10))
+                                                        .font_family(UI_FONT)
+                                                        .text_size(px(11.0))
+                                                        .text_color(rgb(SUBTEXT1))
+                                                        .child("内容"),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(84.0))
+                                                        .px(px(10.0))
+                                                        .py(px(8.0))
+                                                        .border_l_1()
+                                                        .border_color(rgba(0xffffff10))
+                                                        .font_family(UI_FONT)
+                                                        .text_size(px(11.0))
+                                                        .text_color(rgb(SUBTEXT1))
+                                                        .child("No."),
+                                                ),
+                                        )
+                                        .children(rows),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(220.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(8.0))
+                                        .child(interactive_action_button(
+                                            "上へ",
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                let selected =
+                                                    this.snippet_list_editor.as_ref().and_then(
+                                                        |state| state.selected_item_store_index,
+                                                    );
+                                                if let Some(selected) = selected {
+                                                    let _ = this
+                                                        .snippet_palette
+                                                        .move_snippet_up(selected);
+                                                    this.sync_list_editor_selection();
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(interactive_action_button(
+                                            "下へ",
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                let selected =
+                                                    this.snippet_list_editor.as_ref().and_then(
+                                                        |state| state.selected_item_store_index,
+                                                    );
+                                                if let Some(selected) = selected {
+                                                    let _ = this
+                                                        .snippet_palette
+                                                        .move_snippet_down(selected);
+                                                    this.sync_list_editor_selection();
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(div().h(px(8.0)))
+                                        .child(interactive_action_button(
+                                            "新規登録",
+                                            true,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                let group_hint = this
+                                                    .snippet_list_editor
+                                                    .as_ref()
+                                                    .map(|state| state.selected_group_index);
+                                                this.open_snippet_editor(
+                                                    SnippetEditorMode::Add,
+                                                    group_hint,
+                                                );
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(interactive_action_button(
+                                            "編集",
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                let selected =
+                                                    this.snippet_list_editor.as_ref().and_then(
+                                                        |state| state.selected_item_store_index,
+                                                    );
+                                                if let Some(selected) = selected {
+                                                    this.open_snippet_editor(
+                                                        SnippetEditorMode::Edit(selected),
+                                                        None,
+                                                    );
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        ))
+                                        .child(interactive_action_button(
+                                            "削除",
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                let selected =
+                                                    this.snippet_list_editor.as_ref().and_then(
+                                                        |state| state.selected_item_store_index,
+                                                    );
+                                                if let Some(selected) = selected {
+                                                    if this.snippet_palette.delete_snippet(selected)
+                                                    {
+                                                        this.sync_list_editor_selection();
+                                                    }
+                                                }
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(interactive_action_button(
+                                            "移動",
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                let groups = this.snippet_palette.groups().to_vec();
+                                                let Some(state) = this.snippet_list_editor.as_ref()
+                                                else {
+                                                    return;
+                                                };
+                                                let Some(selected) =
+                                                    state.selected_item_store_index
+                                                else {
+                                                    return;
+                                                };
+                                                if groups.len() < 2 {
+                                                    return;
+                                                }
+                                                if let Some(next_group) = groups
+                                                    .get(
+                                                        (state.selected_group_index + 1)
+                                                            % groups.len(),
+                                                    )
+                                                    .cloned()
+                                                {
+                                                    if this.snippet_palette.move_snippet_to_group(
+                                                        selected,
+                                                        &next_group,
+                                                    ) {
+                                                        this.sync_list_editor_selection();
+                                                    }
+                                                    cx.notify();
+                                                }
+                                            }),
+                                        ))
+                                        .child(div().h(px(8.0)))
+                                        .child(interactive_action_button(
+                                            "閉じる",
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.close_snippet_list_editor();
+                                                cx.notify();
+                                            }),
+                                        )),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_snippet_editor(
+        &mut self,
+        viewport_w: f32,
+        viewport_h: f32,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let editor = self.snippet_editor.as_ref()?.clone();
+        let groups = self.snippet_palette.groups().to_vec();
+        let panel_w = 720.0;
+        let top = ((viewport_h - 420.0) * 0.5).max(48.0);
+        let left = ((viewport_w - panel_w) * 0.5).max(48.0);
+        let group_label = groups
+            .get(editor.group_index.min(groups.len().saturating_sub(1)))
+            .cloned()
+            .unwrap_or_else(|| "General".to_string());
+        let mode_label = match editor.mode {
+            SnippetEditorMode::Add => "定型文の新規登録",
+            SnippetEditorMode::Edit(_) => "定型文の編集",
+        };
+        let title_active = editor.active_field == SnippetEditorField::Title;
+        let content_active = editor.active_field == SnippetEditorField::Content;
+
+        Some(
+            div()
+                .id("snippet-editor-overlay")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .child(
+                    div()
+                        .absolute()
+                        .top_0()
+                        .left_0()
+                        .size_full()
+                        .bg(rgba(BACKDROP)),
+                )
+                .child(
+                    div()
+                        .id("snippet-editor-panel")
+                        .absolute()
+                        .top(px(top))
+                        .left(px(left))
+                        .w(px(panel_w))
+                        .rounded(px(12.0))
+                        .border_1()
+                        .border_color(rgba(0xffffff10))
+                        .bg(rgb(WINDOW_BG))
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            this.close_snippet_editor();
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                .w_full()
+                                .px(px(16.0))
+                                .py(px(12.0))
+                                .border_b_1()
+                                .border_color(rgba(0xffffff10))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(14.0))
+                                        .text_color(rgb(TEXT))
+                                        .child(mode_label),
+                                )
+                                .child(
+                                    div()
+                                        .font_family("JetBrains Mono")
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(SUBTEXT1))
+                                        .child("Tab:項目切替 Ctrl+Enter:保存"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .p(px(16.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(12.0))
+                                .child(settings_row(
+                                    "定型文グループ",
+                                    interactive_select_box(
+                                        group_label,
+                                        220.0,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            let total = this.snippet_palette.groups().len().max(1);
+                                            if let Some(editor) = this.snippet_editor.as_mut() {
+                                                editor.group_index =
+                                                    (editor.group_index + 1) % total;
+                                                cx.notify();
+                                            }
+                                        }),
+                                    ),
+                                ))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(12.0))
+                                                .text_color(rgb(TEXT_SOFT))
+                                                .child("タイトル"),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .h(px(40.0))
+                                                .rounded(px(8.0))
+                                                .border_1()
+                                                .border_color(rgb(if title_active {
+                                                    ACCENT
+                                                } else {
+                                                    SURFACE1
+                                                }))
+                                                .bg(rgba(0xffffff08))
+                                                .px(px(12.0))
+                                                .flex()
+                                                .items_center()
+                                                .font_family("JetBrains Mono")
+                                                .text_size(px(12.0))
+                                                .text_color(rgb(TEXT))
+                                                .cursor_pointer()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        |this, _: &MouseDownEvent, _window, cx| {
+                                                            if let Some(editor) =
+                                                                this.snippet_editor.as_mut()
+                                                            {
+                                                                editor.active_field =
+                                                                    SnippetEditorField::Title;
+                                                                cx.notify();
+                                                            }
+                                                        },
+                                                    ),
+                                                )
+                                                .child(editor.title),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(12.0))
+                                                .text_color(rgb(TEXT_SOFT))
+                                                .child("内容"),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .min_h(px(180.0))
+                                                .rounded(px(8.0))
+                                                .border_1()
+                                                .border_color(rgb(if content_active {
+                                                    ACCENT
+                                                } else {
+                                                    SURFACE1
+                                                }))
+                                                .bg(rgba(0xffffff08))
+                                                .p(px(12.0))
+                                                .font_family("JetBrains Mono")
+                                                .text_size(px(12.0))
+                                                .text_color(rgb(TEXT))
+                                                .cursor_pointer()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(
+                                                        |this, _: &MouseDownEvent, _window, cx| {
+                                                            if let Some(editor) =
+                                                                this.snippet_editor.as_mut()
+                                                            {
+                                                                editor.active_field =
+                                                                    SnippetEditorField::Content;
+                                                                cx.notify();
+                                                            }
+                                                        },
+                                                    ),
+                                                )
+                                                .child(editor.content),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .justify_end()
+                                        .gap(px(8.0))
+                                        .child(interactive_action_button(
+                                            "キャンセル",
+                                            false,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.close_snippet_editor();
+                                                cx.notify();
+                                            }),
+                                        ))
+                                        .child(interactive_action_button(
+                                            "保存",
+                                            true,
+                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                this.save_snippet_editor();
+                                                cx.notify();
+                                            }),
+                                        )),
+                                ),
+                        ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_snippet_csv_dialog(
+        &mut self,
+        viewport_w: f32,
+        viewport_h: f32,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let state = self.snippet_csv_dialog.as_ref()?.clone();
+        let panel_w = 760.0;
+        let top = ((viewport_h - 360.0) * 0.5).max(48.0);
+        let left = ((viewport_w - panel_w) * 0.5).max(48.0);
+
+        Some(
+            div()
+                .id("snippet-csv-dialog-overlay")
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .child(div().absolute().top_0().left_0().size_full().bg(rgba(BACKDROP)))
+                .child(
+                    div()
+                        .id("snippet-csv-dialog-panel")
+                        .absolute()
+                        .top(px(top))
+                        .left(px(left))
+                        .w(px(panel_w))
+                        .rounded(px(12.0))
+                        .border_1()
+                        .border_color(rgba(0xffffff10))
+                        .bg(rgb(WINDOW_BG))
+                        .shadow_lg()
+                        .overflow_hidden()
+                        .on_mouse_down_out(cx.listener(
+                            |this, _: &MouseDownEvent, _window, cx| {
+                                this.close_snippet_csv_dialog();
+                                cx.notify();
+                            },
+                        ))
+                        .child(
+                            div()
+                                .w_full()
+                                .px(px(16.0))
+                                .py(px(12.0))
+                                .border_b_1()
+                                .border_color(rgba(0xffffff10))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(14.0))
+                                        .text_color(rgb(TEXT))
+                                        .child("定型文CSV出力/取込"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family("JetBrains Mono")
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(SUBTEXT1))
+                                        .child("smux 互換: UTF-8 / Shift_JIS"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .p(px(16.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(12.0))
+                                .child(
+                                    div()
+                                        .rounded(px(10.0))
+                                        .border_1()
+                                        .border_color(rgba(0xffffff10))
+                                        .bg(rgba(0xffffff06))
+                                        .p(px(14.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(10.0))
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(13.0))
+                                                .text_color(rgb(TEXT))
+                                                .child("CSV出力"),
+                                        )
+                                        .child(settings_row(
+                                            "文字コード",
+                                            interactive_select_box(
+                                                csv_encoding_label(state.export_encoding).to_string(),
+                                                180.0,
+                                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                    if let Some(state) = this.snippet_csv_dialog.as_mut() {
+                                                        state.export_encoding =
+                                                            next_csv_encoding(state.export_encoding);
+                                                        cx.notify();
+                                                    }
+                                                }),
+                                            ),
+                                        ))
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .flex()
+                                                .justify_end()
+                                                .child(interactive_action_button(
+                                                    "出力",
+                                                    true,
+                                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                        let encoding = this
+                                                            .snippet_csv_dialog
+                                                            .as_ref()
+                                                            .map(|state| state.export_encoding)
+                                                            .unwrap_or(CsvEncoding::ShiftJis);
+                                                        let path = rfd::FileDialog::new()
+                                                            .add_filter("CSV", &["csv"])
+                                                            .set_file_name(&default_snippet_csv_file_name())
+                                                            .save_file();
+                                                        if let Some(path) = path {
+                                                            if let Err(err) = this
+                                                                .snippet_palette
+                                                                .export_csv_with_encoding(path.as_path(), encoding)
+                                                            {
+                                                                log::warn!("Failed to export snippets csv: {}", err);
+                                                            }
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                )),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .rounded(px(10.0))
+                                        .border_1()
+                                        .border_color(rgba(0xffffff10))
+                                        .bg(rgba(0xffffff06))
+                                        .p(px(14.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(10.0))
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(13.0))
+                                                .text_color(rgb(TEXT))
+                                                .child("CSV取込"),
+                                        )
+                                        .child(settings_row(
+                                            "文字コード",
+                                            interactive_select_box(
+                                                csv_encoding_label(state.import_encoding).to_string(),
+                                                180.0,
+                                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                    if let Some(state) = this.snippet_csv_dialog.as_mut() {
+                                                        state.import_encoding =
+                                                            next_csv_encoding(state.import_encoding);
+                                                        cx.notify();
+                                                    }
+                                                }),
+                                            ),
+                                        ))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(8.0))
+                                                .cursor_pointer()
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                        if let Some(state) = this.snippet_csv_dialog.as_mut() {
+                                                            state.clear_before_import = !state.clear_before_import;
+                                                            cx.notify();
+                                                        }
+                                                    }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .w(px(16.0))
+                                                        .h(px(16.0))
+                                                        .rounded(px(4.0))
+                                                        .border_1()
+                                                        .border_color(rgb(SURFACE1))
+                                                        .bg(if state.clear_before_import {
+                                                            rgb(ACCENT)
+                                                        } else {
+                                                            rgba(0xffffff06)
+                                                        }),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(UI_FONT)
+                                                        .text_size(px(12.0))
+                                                        .text_color(rgb(TEXT_SOFT))
+                                                        .child("既存の定型文を全てクリアしてから取り込む"),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(SUBTEXT1))
+                                                .child("同名グループは維持しつつ、CSV内容で更新します。"),
+                                        )
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .flex()
+                                                .justify_end()
+                                                .gap(px(8.0))
+                                                .child(interactive_action_button(
+                                                    "閉じる",
+                                                    false,
+                                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                        this.close_snippet_csv_dialog();
+                                                        cx.notify();
+                                                    }),
+                                                ))
+                                                .child(interactive_action_button(
+                                                    "取込",
+                                                    true,
+                                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                        let (encoding, clear_before_import) = this
+                                                            .snippet_csv_dialog
+                                                            .as_ref()
+                                                            .map(|state| {
+                                                                (state.import_encoding, state.clear_before_import)
+                                                            })
+                                                            .unwrap_or((CsvEncoding::ShiftJis, false));
+                                                        let path = rfd::FileDialog::new()
+                                                            .add_filter("CSV", &["csv"])
+                                                            .pick_file();
+                                                        if let Some(path) = path {
+                                                            if let Err(err) = this.snippet_palette.import_csv_with_encoding(
+                                                                path.as_path(),
+                                                                encoding,
+                                                                clear_before_import,
+                                                            ) {
+                                                                log::warn!("Failed to import snippets csv: {}", err);
+                                                            }
+                                                        }
+                                                        cx.notify();
+                                                    }),
+                                                )),
+                                        ),
+                                ),
+                        ),
                 )
                 .into_any_element(),
         )
@@ -2377,6 +4045,20 @@ impl Render for RootView {
             ))
             .children(snippet_backdrop)
             .children(self.render_snippet_palette(new_state.width, new_state.height, window, cx))
+            .children(self.render_snippet_group_editor(
+                new_state.width,
+                new_state.height,
+                window,
+                cx,
+            ))
+            .children(self.render_snippet_list_editor(
+                new_state.width,
+                new_state.height,
+                window,
+                cx,
+            ))
+            .children(self.render_snippet_editor(new_state.width, new_state.height, window, cx))
+            .children(self.render_snippet_csv_dialog(new_state.width, new_state.height, window, cx))
             .children(close_confirm_backdrop)
             .children(self.render_close_confirm_dialog(new_state.width, new_state.height, cx))
     }
@@ -2409,11 +4091,26 @@ fn resolve_default_shell_command(config_shell: &str, available_shells: &[ShellEn
         .unwrap_or_else(shell::detect_default_shell)
 }
 
-fn open_path_in_default_app(path: &Path) -> std::io::Result<()> {
-    Command::new("cmd")
-        .args(["/C", "start", "", path.to_string_lossy().as_ref()])
-        .spawn()?;
-    Ok(())
+fn default_snippet_csv_file_name() -> String {
+    crate::snippets::SnippetStore::csv_path()
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("snippets.csv")
+        .to_string()
+}
+
+fn csv_encoding_label(encoding: CsvEncoding) -> &'static str {
+    match encoding {
+        CsvEncoding::Utf8 => "UTF-8",
+        CsvEncoding::ShiftJis => "Shift_JIS",
+    }
+}
+
+fn next_csv_encoding(encoding: CsvEncoding) -> CsvEncoding {
+    match encoding {
+        CsvEncoding::Utf8 => CsvEncoding::ShiftJis,
+        CsvEncoding::ShiftJis => CsvEncoding::Utf8,
+    }
 }
 
 fn window_size_from_grid(cols: u16, rows: u16) -> Size<Pixels> {

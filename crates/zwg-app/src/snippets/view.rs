@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
-use crate::snippets::{Snippet, SnippetStore};
+use crate::snippets::{CsvEncoding, Snippet, SnippetStore};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnippetQueueMode {
@@ -94,6 +94,14 @@ impl SnippetPalette {
         self.store.groups()
     }
 
+    pub fn group_name_at(&self, index: usize) -> Option<&str> {
+        self.store.group_at(index)
+    }
+
+    pub fn group_index_by_name(&self, name: &str) -> Option<usize> {
+        self.store.group_index_by_name(name)
+    }
+
     pub fn store_path(&self) -> &Path {
         self.store.path()
     }
@@ -164,6 +172,91 @@ impl SnippetPalette {
         }
     }
 
+    pub fn add_group_named(&mut self, name: impl Into<String>) -> bool {
+        match self.store.add_group(name.into()) {
+            Ok(Some(group)) => {
+                self.active_group = Some(group);
+                self.sync_selection();
+                true
+            }
+            Ok(None) => false,
+            Err(error) => {
+                log::warn!("Failed to add snippet group: {}", error);
+                false
+            }
+        }
+    }
+
+    pub fn rename_group(&mut self, index: usize, name: impl Into<String>) -> bool {
+        let Some(previous_group) = self.store.group_at(index).map(str::to_string) else {
+            return false;
+        };
+        match self.store.rename_group(index, name.into()) {
+            Ok(true) => {
+                if self
+                    .active_group
+                    .as_deref()
+                    .map(|group| group.eq_ignore_ascii_case(&previous_group))
+                    .unwrap_or(false)
+                {
+                    self.active_group = self.store.group_at(index).map(str::to_string);
+                }
+                self.sync_selection();
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                log::warn!("Failed to rename snippet group: {}", error);
+                false
+            }
+        }
+    }
+
+    pub fn move_group_up(&mut self, index: usize) -> Option<usize> {
+        match self.store.move_group_up(index) {
+            Ok(next_index) => next_index,
+            Err(error) => {
+                log::warn!("Failed to move snippet group up: {}", error);
+                None
+            }
+        }
+    }
+
+    pub fn move_group_down(&mut self, index: usize) -> Option<usize> {
+        match self.store.move_group_down(index) {
+            Ok(next_index) => next_index,
+            Err(error) => {
+                log::warn!("Failed to move snippet group down: {}", error);
+                None
+            }
+        }
+    }
+
+    pub fn delete_group(&mut self, index: usize) -> bool {
+        let Some(removed_name) = self.store.group_at(index).map(str::to_string) else {
+            return false;
+        };
+        match self.store.delete_group(index) {
+            Ok(true) => {
+                if self
+                    .active_group
+                    .as_deref()
+                    .map(|group| group.eq_ignore_ascii_case(&removed_name))
+                    .unwrap_or(false)
+                {
+                    self.active_group = None;
+                }
+                self.sync_selection();
+                true
+            }
+            Ok(false) => false,
+            Err(error) => {
+                log::warn!("Failed to delete snippet group: {}", error);
+                false
+            }
+        }
+    }
+
     pub fn create_snippet_from_query(&mut self) -> bool {
         let query = self.query.trim();
         let (title, content) = if query.is_empty() {
@@ -208,6 +301,112 @@ impl SnippetPalette {
                 false
             }
         }
+    }
+
+    pub fn add_snippet(
+        &mut self,
+        title: impl Into<String>,
+        content: impl Into<String>,
+        group: Option<&str>,
+    ) -> Option<usize> {
+        match self.store.add_snippet(title, content, group) {
+            Ok(index) => {
+                if let Some(index) = index {
+                    self.selected_store_index = Some(index);
+                    self.sync_selection();
+                }
+                index
+            }
+            Err(error) => {
+                log::warn!("Failed to add snippet: {}", error);
+                None
+            }
+        }
+    }
+
+    pub fn update_snippet(
+        &mut self,
+        index: usize,
+        title: impl Into<String>,
+        content: impl Into<String>,
+        group: Option<&str>,
+    ) -> bool {
+        match self.store.update_snippet(index, title, content, group) {
+            Ok(updated) => {
+                self.selected_store_index = Some(index);
+                self.sync_selection();
+                updated
+            }
+            Err(error) => {
+                log::warn!("Failed to update snippet: {}", error);
+                false
+            }
+        }
+    }
+
+    pub fn move_snippet_up(&mut self, index: usize) -> Option<usize> {
+        match self.store.move_snippet_up(index) {
+            Ok(next_index) => {
+                if let Some(next_index) = next_index {
+                    self.selected_store_index = Some(next_index);
+                }
+                self.sync_selection();
+                next_index
+            }
+            Err(error) => {
+                log::warn!("Failed to move snippet up: {}", error);
+                None
+            }
+        }
+    }
+
+    pub fn move_snippet_down(&mut self, index: usize) -> Option<usize> {
+        match self.store.move_snippet_down(index) {
+            Ok(next_index) => {
+                if let Some(next_index) = next_index {
+                    self.selected_store_index = Some(next_index);
+                }
+                self.sync_selection();
+                next_index
+            }
+            Err(error) => {
+                log::warn!("Failed to move snippet down: {}", error);
+                None
+            }
+        }
+    }
+
+    pub fn move_snippet_to_group(&mut self, index: usize, target_group: &str) -> bool {
+        match self.store.move_snippet_to_group(index, target_group) {
+            Ok(updated) => {
+                self.selected_store_index = Some(index);
+                self.sync_selection();
+                updated
+            }
+            Err(error) => {
+                log::warn!("Failed to move snippet to group: {}", error);
+                false
+            }
+        }
+    }
+
+    pub fn delete_snippet(&mut self, index: usize) -> bool {
+        match self.store.delete_snippet(index) {
+            Ok(deleted) => {
+                if deleted {
+                    self.sync_selection();
+                }
+                deleted
+            }
+            Err(error) => {
+                log::warn!("Failed to delete snippet: {}", error);
+                false
+            }
+        }
+    }
+
+    pub fn snippets_for_group(&self, group: Option<&str>) -> Vec<(usize, &Snippet)> {
+        self.store.snippets_for_group(group)
     }
 
     #[allow(dead_code)]
@@ -295,6 +494,35 @@ impl SnippetPalette {
 
     pub fn import_csv(&mut self) -> std::io::Result<usize> {
         let count = self.store.import_csv()?;
+        self.sync_selection();
+        Ok(count)
+    }
+
+    pub fn set_fifo_mode(&mut self) {
+        self.queue_mode = SnippetQueueMode::Fifo;
+    }
+
+    pub fn set_lifo_mode(&mut self) {
+        self.queue_mode = SnippetQueueMode::Lifo;
+    }
+
+    pub fn export_csv_with_encoding(
+        &self,
+        path: &Path,
+        encoding: CsvEncoding,
+    ) -> std::io::Result<()> {
+        self.store.export_csv_with_encoding(path, encoding)
+    }
+
+    pub fn import_csv_with_encoding(
+        &mut self,
+        path: &Path,
+        encoding: CsvEncoding,
+        clear_before_import: bool,
+    ) -> std::io::Result<usize> {
+        let count = self
+            .store
+            .import_csv_with_encoding(path, encoding, clear_before_import)?;
         self.sync_selection();
         Ok(count)
     }

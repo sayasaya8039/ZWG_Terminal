@@ -1,3 +1,4 @@
+use encoding_rs::SHIFT_JIS;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::fs;
@@ -6,6 +7,12 @@ use std::path::{Path, PathBuf};
 
 const SNIPPET_STORE_VERSION: u32 = 2;
 const DEFAULT_GROUP_NAME: &str = "General";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CsvEncoding {
+    Utf8,
+    ShiftJis,
+}
 
 /// Persisted snippet entry.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -98,6 +105,9 @@ pub struct SnippetStore {
 }
 
 impl SnippetStore {
+    pub const MAX_GROUPS: usize = 108;
+    pub const MAX_SNIPPETS_PER_GROUP: usize = 36;
+
     pub fn load() -> Self {
         Self::load_from_path(Self::default_path())
     }
@@ -174,6 +184,16 @@ impl SnippetStore {
         &self.groups
     }
 
+    pub fn group_at(&self, index: usize) -> Option<&str> {
+        self.groups.get(index).map(String::as_str)
+    }
+
+    pub fn group_index_by_name(&self, name: &str) -> Option<usize> {
+        self.groups
+            .iter()
+            .position(|group| group.eq_ignore_ascii_case(name))
+    }
+
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.items.len()
@@ -185,6 +205,10 @@ impl SnippetStore {
     }
 
     pub fn add_group(&mut self, name: impl Into<String>) -> io::Result<Option<String>> {
+        if self.groups.len() >= Self::MAX_GROUPS {
+            return Ok(None);
+        }
+
         let candidate = sanitize_group_name(name.into());
         if self
             .groups
@@ -197,6 +221,67 @@ impl SnippetStore {
         self.groups.push(candidate.clone());
         self.save()?;
         Ok(Some(candidate))
+    }
+
+    pub fn rename_group(&mut self, index: usize, name: impl Into<String>) -> io::Result<bool> {
+        let Some(previous_name) = self.groups.get(index).cloned() else {
+            return Ok(false);
+        };
+        let candidate = sanitize_group_name(name.into());
+        if previous_name.eq_ignore_ascii_case(&candidate) {
+            return Ok(false);
+        }
+        if self.groups.iter().enumerate().any(|(group_index, group)| {
+            group_index != index && group.eq_ignore_ascii_case(&candidate)
+        }) {
+            return Ok(false);
+        }
+
+        self.groups[index] = candidate.clone();
+        for snippet in &mut self.items {
+            if snippet.group.eq_ignore_ascii_case(&previous_name) {
+                snippet.group = candidate.clone();
+            }
+        }
+        self.save()?;
+        Ok(true)
+    }
+
+    pub fn move_group_up(&mut self, index: usize) -> io::Result<Option<usize>> {
+        if index == 0 || index >= self.groups.len() {
+            return Ok(None);
+        }
+        self.groups.swap(index, index - 1);
+        self.save()?;
+        Ok(Some(index - 1))
+    }
+
+    pub fn move_group_down(&mut self, index: usize) -> io::Result<Option<usize>> {
+        if index + 1 >= self.groups.len() {
+            return Ok(None);
+        }
+        self.groups.swap(index, index + 1);
+        self.save()?;
+        Ok(Some(index + 1))
+    }
+
+    pub fn delete_group(&mut self, index: usize) -> io::Result<bool> {
+        if self.groups.len() <= 1 || index >= self.groups.len() {
+            return Ok(false);
+        }
+
+        let removed_name = self.groups[index].clone();
+        let fallback_index = if index == 0 { 1 } else { 0 };
+        let fallback_group = self.groups[fallback_index].clone();
+
+        for snippet in &mut self.items {
+            if snippet.group.eq_ignore_ascii_case(&removed_name) {
+                snippet.group = fallback_group.clone();
+            }
+        }
+        self.groups.remove(index);
+        self.save()?;
+        Ok(true)
     }
 
     pub fn add_snippet(
@@ -220,11 +305,23 @@ impl SnippetStore {
         };
 
         let group_name = sanitize_group_name(&snippet.group);
+        if self
+            .items
+            .iter()
+            .filter(|existing| existing.group.eq_ignore_ascii_case(&group_name))
+            .count()
+            >= Self::MAX_SNIPPETS_PER_GROUP
+        {
+            return Ok(None);
+        }
         if !self
             .groups
             .iter()
             .any(|existing| existing.eq_ignore_ascii_case(&group_name))
         {
+            if self.groups.len() >= Self::MAX_GROUPS {
+                return Ok(None);
+            }
             self.groups.push(group_name.clone());
         }
 
@@ -236,6 +333,52 @@ impl SnippetStore {
         Ok(Some(self.items.len().saturating_sub(1)))
     }
 
+    pub fn update_snippet(
+        &mut self,
+        index: usize,
+        title: impl Into<String>,
+        content: impl Into<String>,
+        group: Option<&str>,
+    ) -> io::Result<bool> {
+        if index >= self.items.len() {
+            return Ok(false);
+        }
+
+        let desired_group = sanitize_group_name(group.unwrap_or(DEFAULT_GROUP_NAME));
+        let current_group = self.items[index].group.clone();
+        if !current_group.eq_ignore_ascii_case(&desired_group)
+            && self
+                .items
+                .iter()
+                .enumerate()
+                .filter(|(item_index, snippet)| {
+                    *item_index != index && snippet.group.eq_ignore_ascii_case(&desired_group)
+                })
+                .count()
+                >= Self::MAX_SNIPPETS_PER_GROUP
+        {
+            return Ok(false);
+        }
+
+        if !self
+            .groups
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&desired_group))
+        {
+            if self.groups.len() >= Self::MAX_GROUPS {
+                return Ok(false);
+            }
+            self.groups.push(desired_group.clone());
+        }
+
+        let updated = Snippet::with_group(title, content, desired_group)
+            .sanitized()
+            .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "Snippet is empty"))?;
+        self.items[index] = updated;
+        self.save()?;
+        Ok(true)
+    }
+
     pub fn delete_snippet(&mut self, index: usize) -> io::Result<bool> {
         if index >= self.items.len() {
             return Ok(false);
@@ -244,6 +387,108 @@ impl SnippetStore {
         self.items.remove(index);
         self.save()?;
         Ok(true)
+    }
+
+    pub fn move_snippet_up(&mut self, index: usize) -> io::Result<Option<usize>> {
+        let Some(snippet) = self.items.get(index) else {
+            return Ok(None);
+        };
+        let group_name = snippet.group.clone();
+        let sibling_indices: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.group.eq_ignore_ascii_case(&group_name))
+            .map(|(item_index, _)| item_index)
+            .collect();
+        let Some(position) = sibling_indices
+            .iter()
+            .position(|item_index| *item_index == index)
+        else {
+            return Ok(None);
+        };
+        if position == 0 {
+            return Ok(None);
+        }
+
+        let target_index = sibling_indices[position - 1];
+        self.items.swap(index, target_index);
+        self.save()?;
+        Ok(Some(target_index))
+    }
+
+    pub fn move_snippet_down(&mut self, index: usize) -> io::Result<Option<usize>> {
+        let Some(snippet) = self.items.get(index) else {
+            return Ok(None);
+        };
+        let group_name = snippet.group.clone();
+        let sibling_indices: Vec<usize> = self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(_, item)| item.group.eq_ignore_ascii_case(&group_name))
+            .map(|(item_index, _)| item_index)
+            .collect();
+        let Some(position) = sibling_indices
+            .iter()
+            .position(|item_index| *item_index == index)
+        else {
+            return Ok(None);
+        };
+        if position + 1 >= sibling_indices.len() {
+            return Ok(None);
+        }
+
+        let target_index = sibling_indices[position + 1];
+        self.items.swap(index, target_index);
+        self.save()?;
+        Ok(Some(target_index))
+    }
+
+    pub fn move_snippet_to_group(&mut self, index: usize, target_group: &str) -> io::Result<bool> {
+        if index >= self.items.len() {
+            return Ok(false);
+        }
+
+        let target_group = sanitize_group_name(target_group);
+        if !self
+            .groups
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&target_group))
+        {
+            return Ok(false);
+        }
+        if self.items[index].group.eq_ignore_ascii_case(&target_group) {
+            return Ok(false);
+        }
+        if self
+            .items
+            .iter()
+            .enumerate()
+            .filter(|(item_index, snippet)| {
+                *item_index != index && snippet.group.eq_ignore_ascii_case(&target_group)
+            })
+            .count()
+            >= Self::MAX_SNIPPETS_PER_GROUP
+        {
+            return Ok(false);
+        }
+
+        self.items[index].group = target_group;
+        self.save()?;
+        Ok(true)
+    }
+
+    pub fn snippets_for_group(&self, group: Option<&str>) -> Vec<(usize, &Snippet)> {
+        self.items
+            .iter()
+            .enumerate()
+            .filter(|(_, snippet)| {
+                group
+                    .map(|group_name| snippet.group.eq_ignore_ascii_case(group_name))
+                    .unwrap_or(true)
+            })
+            .collect()
     }
 
     pub fn save(&self) -> io::Result<()> {
@@ -264,6 +509,11 @@ impl SnippetStore {
     }
 
     pub fn export_csv_to_path(&self, path: &Path) -> io::Result<()> {
+        self.export_csv_with_encoding(path, CsvEncoding::Utf8)?;
+        Ok(())
+    }
+
+    pub fn export_csv_with_encoding(&self, path: &Path, encoding: CsvEncoding) -> io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -278,7 +528,19 @@ impl SnippetStore {
             output.push('\n');
         }
 
-        fs::write(path, output)
+        match encoding {
+            CsvEncoding::Utf8 => fs::write(path, output),
+            CsvEncoding::ShiftJis => {
+                let (encoded, _encoding_used, had_errors) = SHIFT_JIS.encode(&output);
+                if had_errors {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "Failed to encode CSV as Shift_JIS",
+                    ));
+                }
+                fs::write(path, encoded.as_ref())
+            }
+        }
     }
 
     pub fn export_csv(&self) -> io::Result<PathBuf> {
@@ -288,7 +550,31 @@ impl SnippetStore {
     }
 
     pub fn import_csv_from_path(&mut self, path: &Path) -> io::Result<usize> {
-        let content = fs::read_to_string(path)?;
+        self.import_csv_with_encoding(path, CsvEncoding::Utf8, true)
+    }
+
+    pub fn import_csv_with_encoding(
+        &mut self,
+        path: &Path,
+        encoding: CsvEncoding,
+        clear_before_import: bool,
+    ) -> io::Result<usize> {
+        let raw = fs::read(path)?;
+        let content = match encoding {
+            CsvEncoding::Utf8 => {
+                String::from_utf8(raw).map_err(|err| io::Error::new(ErrorKind::InvalidData, err))?
+            }
+            CsvEncoding::ShiftJis => {
+                let (decoded, _encoding_used, had_errors) = SHIFT_JIS.decode(&raw);
+                if had_errors {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "Failed to decode CSV as Shift_JIS",
+                    ));
+                }
+                decoded.to_string()
+            }
+        };
         let mut items = Vec::new();
 
         for (row_index, row) in parse_csv_rows(&content)?.into_iter().enumerate() {
@@ -330,9 +616,17 @@ impl SnippetStore {
             ));
         }
 
-        let refreshed = Self::with_loaded_data(self.path.clone(), Vec::new(), items);
-        self.groups = refreshed.groups;
-        self.items = refreshed.items;
+        if clear_before_import {
+            let refreshed = Self::with_loaded_data(self.path.clone(), Vec::new(), items);
+            self.groups = refreshed.groups;
+            self.items = refreshed.items;
+        } else {
+            self.items.extend(items);
+            let refreshed =
+                Self::with_loaded_data(self.path.clone(), self.groups.clone(), self.items.clone());
+            self.groups = refreshed.groups;
+            self.items = refreshed.items;
+        }
         self.save()?;
         Ok(self.items.len())
     }
