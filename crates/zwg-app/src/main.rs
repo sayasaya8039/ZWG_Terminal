@@ -3,6 +3,12 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use std::borrow::Cow;
+use std::fs;
+use std::path::PathBuf;
+
+use anyhow::Result;
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -14,17 +20,37 @@ mod terminal;
 
 use gpui::*;
 
+struct Assets {
+    base: PathBuf,
+}
+
+impl AssetSource for Assets {
+    fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
+        fs::read(self.base.join(path))
+            .map(|data| Some(Cow::Owned(data)))
+            .map_err(|err| err.into())
+    }
+
+    fn list(&self, path: &str) -> Result<Vec<SharedString>> {
+        fs::read_dir(self.base.join(path))
+            .map(|entries| {
+                entries
+                    .filter_map(|entry| {
+                        entry
+                            .ok()
+                            .and_then(|entry| entry.file_name().into_string().ok())
+                            .map(SharedString::from)
+                    })
+                    .collect()
+            })
+            .map_err(|err| err.into())
+    }
+}
+
 actions!(
     zwg,
     [
-        Quit,
-        NewTab,
-        CloseTab,
-        SplitRight,
-        SplitDown,
-        ClosePane,
-        FocusNext,
-        FocusPrev,
+        Quit, NewTab, CloseTab, SplitRight, SplitDown, ClosePane, FocusNext, FocusPrev,
     ]
 );
 
@@ -36,7 +62,9 @@ fn main() {
 
     log::info!("ZWG Terminal v{} starting", env!("CARGO_PKG_VERSION"));
 
-    let app = Application::new();
+    let app = Application::new().with_assets(Assets {
+        base: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../resources"),
+    });
     app.run(|cx: &mut App| {
         // Global actions
         cx.on_action(|_: &Quit, cx| cx.quit());

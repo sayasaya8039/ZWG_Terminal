@@ -1160,7 +1160,7 @@ impl Render for RootView {
             .flex()
             .items_center()
             .gap(px(4.0))
-            .child(chrome_button("title-add", "+").on_mouse_down(
+            .child(chrome_button("title-add", "ui/plus.svg").on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                     this.show_settings = false;
@@ -1168,22 +1168,26 @@ impl Render for RootView {
                     cx.notify();
                 }),
             ))
-            .child(chrome_button("title-shells", "v").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                    this.show_settings = false;
-                    this.show_shell_menu = true;
-                    cx.notify();
-                }),
-            ))
-            .child(chrome_button("title-settings", "o").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                    this.show_shell_menu = false;
-                    this.show_settings = true;
-                    cx.notify();
-                }),
-            ));
+            .child(
+                chrome_button("title-shells", "ui/chevron-down.svg").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.show_settings = false;
+                        this.show_shell_menu = true;
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                chrome_button("title-settings", "ui/settings.svg").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.show_shell_menu = false;
+                        this.show_settings = true;
+                        cx.notify();
+                    }),
+                ),
+            );
 
         let title_bar = div()
             .id("title-bar")
@@ -1366,7 +1370,7 @@ fn shell_icon(shell_type: &ShellType) -> &'static str {
     }
 }
 
-fn chrome_button(id: &'static str, label: &'static str) -> Stateful<Div> {
+fn chrome_button(id: &'static str, icon_path: &'static str) -> Stateful<Div> {
     div()
         .id(id)
         .w(px(24.0))
@@ -1380,7 +1384,7 @@ fn chrome_button(id: &'static str, label: &'static str) -> Stateful<Div> {
         .text_size(px(12.0))
         .text_color(rgb(SUBTEXT1))
         .hover(|style| style.bg(rgba(0xffffff10)).text_color(rgb(TEXT)))
-        .child(label)
+        .child(svg().path(icon_path).size(px(14.0)))
 }
 
 fn settings_section_heading(label: &'static str) -> Div {
