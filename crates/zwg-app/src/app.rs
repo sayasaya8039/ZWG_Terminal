@@ -1,6 +1,7 @@
 //! Application state and root view — Figma-aligned macOS terminal chrome
 
 use std::io::Write;
+use std::ops::Range;
 use std::time::Instant;
 
 use gpui::prelude::FluentBuilder;
@@ -210,6 +211,14 @@ enum SnippetEditorField {
     Content,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnippetImeTarget {
+    PaletteQuery,
+    GroupName,
+    EditorTitle,
+    EditorContent,
+}
+
 #[derive(Clone)]
 struct SnippetEditorState {
     mode: SnippetEditorMode,
@@ -255,6 +264,9 @@ pub struct RootView {
     snippet_list_editor: Option<SnippetListEditorState>,
     snippet_editor: Option<SnippetEditorState>,
     snippet_csv_dialog: Option<SnippetCsvDialogState>,
+    snippet_ime_target: Option<SnippetImeTarget>,
+    snippet_ime_marked_range: Option<Range<usize>>,
+    snippet_ime_selected_range: Option<Range<usize>>,
     settings_category: SettingsCategory,
     last_bounds: Option<WindowState>,
     last_save_time: Instant,
@@ -373,11 +385,105 @@ impl RootView {
             snippet_list_editor: None,
             snippet_editor: None,
             snippet_csv_dialog: None,
+            snippet_ime_target: None,
+            snippet_ime_marked_range: None,
+            snippet_ime_selected_range: None,
             settings_category: SettingsCategory::General,
             last_bounds: None,
             last_save_time: Instant::now(),
             bounds_dirty: false,
         }
+    }
+
+    fn compute_snippet_ime_target(&self) -> Option<SnippetImeTarget> {
+        if let Some(editor) = self.snippet_editor.as_ref() {
+            return Some(match editor.active_field {
+                SnippetEditorField::Title => SnippetImeTarget::EditorTitle,
+                SnippetEditorField::Content => SnippetImeTarget::EditorContent,
+            });
+        }
+
+        if self
+            .snippet_group_editor
+            .as_ref()
+            .map(|editor| editor.edit_mode != SnippetGroupEditMode::None)
+            .unwrap_or(false)
+        {
+            return Some(SnippetImeTarget::GroupName);
+        }
+
+        if self.snippet_palette.is_visible()
+            && self.snippet_group_editor.is_none()
+            && self.snippet_list_editor.is_none()
+            && self.snippet_editor.is_none()
+            && self.snippet_csv_dialog.is_none()
+            && !self.show_snippet_settings
+            && !self.show_snippet_context_menu
+        {
+            return Some(SnippetImeTarget::PaletteQuery);
+        }
+
+        None
+    }
+
+    fn sync_snippet_ime_target(&mut self) {
+        let target = self.compute_snippet_ime_target();
+        if self.snippet_ime_target != target {
+            self.snippet_ime_target = target;
+            self.snippet_ime_marked_range = None;
+            self.snippet_ime_selected_range = None;
+        }
+    }
+
+    fn active_snippet_ime_text(&self) -> Option<String> {
+        match self
+            .snippet_ime_target
+            .or_else(|| self.compute_snippet_ime_target())?
+        {
+            SnippetImeTarget::PaletteQuery => Some(self.snippet_palette.query().to_string()),
+            SnippetImeTarget::GroupName => self
+                .snippet_group_editor
+                .as_ref()
+                .map(|editor| editor.draft_name.clone()),
+            SnippetImeTarget::EditorTitle => self
+                .snippet_editor
+                .as_ref()
+                .map(|editor| editor.title.clone()),
+            SnippetImeTarget::EditorContent => self
+                .snippet_editor
+                .as_ref()
+                .map(|editor| editor.content.clone()),
+        }
+    }
+
+    fn set_active_snippet_ime_text(&mut self, value: String) {
+        match self
+            .snippet_ime_target
+            .or_else(|| self.compute_snippet_ime_target())
+        {
+            Some(SnippetImeTarget::PaletteQuery) => self.snippet_palette.set_query(value),
+            Some(SnippetImeTarget::GroupName) => {
+                if let Some(editor) = self.snippet_group_editor.as_mut() {
+                    editor.draft_name = value;
+                }
+            }
+            Some(SnippetImeTarget::EditorTitle) => {
+                if let Some(editor) = self.snippet_editor.as_mut() {
+                    editor.title = value;
+                }
+            }
+            Some(SnippetImeTarget::EditorContent) => {
+                if let Some(editor) = self.snippet_editor.as_mut() {
+                    editor.content = value;
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn clear_snippet_ime_state(&mut self) {
+        self.snippet_ime_marked_range = None;
+        self.snippet_ime_selected_range = None;
     }
 
     fn open_snippet_settings(&mut self, cx: &mut Context<Self>) {
@@ -1168,6 +1274,7 @@ impl RootView {
         event: &KeyDownEvent,
         cx: &mut Context<Self>,
     ) -> bool {
+        let mut clear_ime = false;
         let Some(editor) = self.snippet_group_editor.as_mut() else {
             return false;
         };
@@ -1188,17 +1295,22 @@ impl RootView {
             }
             "enter" => {
                 if editor.edit_mode != SnippetGroupEditMode::None {
+                    clear_ime = true;
                     self.apply_group_editor_edit();
                     cx.notify();
                 }
             }
             "backspace" => {
                 if editor.edit_mode != SnippetGroupEditMode::None {
+                    clear_ime = true;
                     editor.draft_name.pop();
                     cx.notify();
                 }
             }
             _ => {
+                if editor.edit_mode != SnippetGroupEditMode::None {
+                    return false;
+                }
                 if let Some(text) = &event.keystroke.key_char {
                     if !text.is_empty()
                         && !event.keystroke.modifiers.control
@@ -1213,6 +1325,9 @@ impl RootView {
                     return false;
                 }
             }
+        }
+        if clear_ime {
+            self.clear_snippet_ime_state();
         }
         true
     }
@@ -1300,9 +1415,7 @@ impl RootView {
     }
 
     fn handle_snippet_editor_key(&mut self, event: &KeyDownEvent, cx: &mut Context<Self>) -> bool {
-        let Some(editor) = self.snippet_editor.as_mut() else {
-            return false;
-        };
+        let mut clear_ime = false;
 
         match event.keystroke.key.as_ref() {
             "escape" => {
@@ -1310,6 +1423,10 @@ impl RootView {
                 cx.notify();
             }
             "tab" => {
+                clear_ime = true;
+                let Some(editor) = self.snippet_editor.as_mut() else {
+                    return false;
+                };
                 editor.active_field = match editor.active_field {
                     SnippetEditorField::Title => SnippetEditorField::Content,
                     SnippetEditorField::Content => SnippetEditorField::Title,
@@ -1317,10 +1434,15 @@ impl RootView {
                 cx.notify();
             }
             "enter" if event.keystroke.modifiers.control => {
+                clear_ime = true;
                 self.save_snippet_editor();
                 cx.notify();
             }
             "enter" => {
+                clear_ime = true;
+                let Some(editor) = self.snippet_editor.as_mut() else {
+                    return false;
+                };
                 match editor.active_field {
                     SnippetEditorField::Title => editor.active_field = SnippetEditorField::Content,
                     SnippetEditorField::Content => editor.content.push('\n'),
@@ -1328,6 +1450,10 @@ impl RootView {
                 cx.notify();
             }
             "backspace" => {
+                clear_ime = true;
+                let Some(editor) = self.snippet_editor.as_mut() else {
+                    return false;
+                };
                 match editor.active_field {
                     SnippetEditorField::Title => {
                         editor.title.pop();
@@ -1339,8 +1465,17 @@ impl RootView {
                 cx.notify();
             }
             _ => {
+                if matches!(
+                    self.compute_snippet_ime_target(),
+                    Some(SnippetImeTarget::EditorTitle) | Some(SnippetImeTarget::EditorContent)
+                ) {
+                    return false;
+                }
                 if let Some(text) = &event.keystroke.key_char {
                     if !text.is_empty() && !event.keystroke.modifiers.control {
+                        let Some(editor) = self.snippet_editor.as_mut() else {
+                            return false;
+                        };
                         match editor.active_field {
                             SnippetEditorField::Title => editor.title.push_str(text),
                             SnippetEditorField::Content => editor.content.push_str(text),
@@ -1353,6 +1488,10 @@ impl RootView {
                     return false;
                 }
             }
+        }
+
+        if clear_ime {
+            self.clear_snippet_ime_state();
         }
         true
     }
@@ -1595,6 +1734,7 @@ impl RootView {
                 }
             }
             "backspace" => {
+                self.clear_snippet_ime_state();
                 let mut query = self.snippet_palette.query().to_string();
                 if query.pop().is_some() {
                     self.snippet_palette.set_query(query);
@@ -1609,6 +1749,10 @@ impl RootView {
                         cx.notify();
                     }
                     cx.stop_propagation();
+                    return;
+                }
+
+                if self.compute_snippet_ime_target() == Some(SnippetImeTarget::PaletteQuery) {
                     return;
                 }
 
@@ -2169,6 +2313,7 @@ impl RootView {
             return None;
         }
 
+        let ime_entity = cx.entity();
         let panel_w = (viewport_w - 48.0).clamp(640.0, 860.0);
         let panel_h = (viewport_h - 64.0).clamp(420.0, 600.0);
         let display_settings = self.snippet_settings.display.clone();
@@ -2411,6 +2556,7 @@ impl RootView {
                                             div()
                                                 .w_full()
                                                 .h(px(34.0))
+                                                .relative()
                                                 .rounded(px(8.0))
                                                 .border_1()
                                                 .border_color(rgba(0xD1D5DBFF))
@@ -2436,6 +2582,15 @@ impl RootView {
                                                         })
                                                         .child(display_text),
                                                 ),
+                                        )
+                                        .when(
+                                            self.snippet_ime_target
+                                                == Some(SnippetImeTarget::PaletteQuery),
+                                            |node| {
+                                                node.child(snippet_ime_input_overlay(
+                                                    ime_entity.clone(),
+                                                ))
+                                            },
                                         ),
                                 )
                                 .child(
@@ -3758,6 +3913,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let editor = self.snippet_group_editor.as_ref()?.clone();
+        let ime_entity = cx.entity();
         let groups = self.snippet_palette.groups().to_vec();
         let selected_index = editor.selected_index.min(groups.len().saturating_sub(1));
         let panel_w = 880.0;
@@ -4048,6 +4204,7 @@ impl RootView {
                                     div()
                                         .w_full()
                                         .h(px(38.0))
+                                        .relative()
                                         .rounded(px(8.0))
                                         .border_1()
                                         .border_color(rgb(if editing { ACCENT } else { SURFACE1 }))
@@ -4062,7 +4219,17 @@ impl RootView {
                                             editor.draft_name
                                         } else {
                                             String::new()
-                                        }),
+                                        })
+                                        .when(
+                                            editing
+                                                && self.snippet_ime_target
+                                                    == Some(SnippetImeTarget::GroupName),
+                                            |node| {
+                                                node.child(snippet_ime_input_overlay(
+                                                    ime_entity.clone(),
+                                                ))
+                                            },
+                                        ),
                                 ),
                         ),
                 )
@@ -4493,6 +4660,7 @@ impl RootView {
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let editor = self.snippet_editor.as_ref()?.clone();
+        let ime_entity = cx.entity();
         let groups = self.snippet_palette.groups().to_vec();
         let panel_w = 720.0;
         let top = ((viewport_h - 420.0) * 0.5).max(48.0);
@@ -4613,6 +4781,7 @@ impl RootView {
                                             div()
                                                 .w_full()
                                                 .h(px(40.0))
+                                                .relative()
                                                 .rounded(px(8.0))
                                                 .border_1()
                                                 .border_color(rgb(if title_active {
@@ -4643,7 +4812,12 @@ impl RootView {
                                                         },
                                                     ),
                                                 )
-                                                .child(title_display),
+                                                .child(title_display)
+                                                .when(title_active, |node| {
+                                                    node.child(snippet_ime_input_overlay(
+                                                        ime_entity.clone(),
+                                                    ))
+                                                }),
                                         ),
                                 )
                                 .child(
@@ -4662,6 +4836,7 @@ impl RootView {
                                             div()
                                                 .w_full()
                                                 .min_h(px(180.0))
+                                                .relative()
                                                 .rounded(px(8.0))
                                                 .border_1()
                                                 .border_color(rgb(if content_active {
@@ -4690,7 +4865,12 @@ impl RootView {
                                                         },
                                                     ),
                                                 )
-                                                .child(content_display),
+                                                .child(content_display)
+                                                .when(content_active, |node| {
+                                                    node.child(snippet_ime_input_overlay(
+                                                        ime_entity.clone(),
+                                                    ))
+                                                }),
                                         ),
                                 )
                                 .child(
@@ -5424,6 +5604,7 @@ impl RootView {
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_clear_snippet_notice();
+        self.sync_snippet_ime_target();
 
         let bounds = window.bounds();
         let new_state = WindowState {
@@ -5942,6 +6123,187 @@ fn shell_icon(shell_type: &ShellType) -> &'static str {
         ShellType::Wsl => "🐧",
         ShellType::GitBash => "🔀",
     }
+}
+
+impl EntityInputHandler for RootView {
+    fn text_for_range(
+        &mut self,
+        range_utf16: Range<usize>,
+        adjusted_range: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        let text = self.active_snippet_ime_text()?;
+        let range = utf16_range_to_utf8(&text, &range_utf16);
+        *adjusted_range = Some(utf8_range_to_utf16(&text, &range));
+        Some(text.get(range)?.to_string())
+    }
+
+    fn selected_text_range(
+        &mut self,
+        _ignore_disabled_input: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        let text = self.active_snippet_ime_text()?;
+        let selected = self
+            .snippet_ime_selected_range
+            .clone()
+            .unwrap_or_else(|| text.len()..text.len());
+        Some(UTF16Selection {
+            range: utf8_range_to_utf16(&text, &selected),
+            reversed: false,
+        })
+    }
+
+    fn marked_text_range(
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        let text = self.active_snippet_ime_text()?;
+        Some(utf8_range_to_utf16(
+            &text,
+            self.snippet_ime_marked_range.as_ref()?,
+        ))
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.clear_snippet_ime_state();
+    }
+
+    fn replace_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(current) = self.active_snippet_ime_text() {
+            let replacement_range = range_utf16
+                .as_ref()
+                .map(|range| utf16_range_to_utf8(&current, range))
+                .or_else(|| self.snippet_ime_marked_range.clone())
+                .unwrap_or(current.len()..current.len());
+            let mut next = current;
+            next.replace_range(replacement_range.clone(), text);
+            let cursor = replacement_range.start + text.len();
+            self.set_active_snippet_ime_text(next);
+            self.snippet_ime_marked_range = None;
+            self.snippet_ime_selected_range = Some(cursor..cursor);
+            cx.notify();
+        }
+    }
+
+    fn replace_and_mark_text_in_range(
+        &mut self,
+        range_utf16: Option<Range<usize>>,
+        new_text: &str,
+        new_selected_range_utf16: Option<Range<usize>>,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(current) = self.active_snippet_ime_text() {
+            let replacement_range = range_utf16
+                .as_ref()
+                .map(|range| utf16_range_to_utf8(&current, range))
+                .or_else(|| self.snippet_ime_marked_range.clone())
+                .unwrap_or(current.len()..current.len());
+            let mut next = current;
+            next.replace_range(replacement_range.clone(), new_text);
+            let marked_start = replacement_range.start;
+            let marked_end = marked_start + new_text.len();
+            self.set_active_snippet_ime_text(next);
+            self.snippet_ime_marked_range =
+                (!new_text.is_empty()).then_some(marked_start..marked_end);
+            self.snippet_ime_selected_range = Some(
+                new_selected_range_utf16
+                    .map(|range| {
+                        let start = utf16_index_to_utf8(new_text, range.start) + marked_start;
+                        let end = utf16_index_to_utf8(new_text, range.end) + marked_start;
+                        start..end
+                    })
+                    .unwrap_or(marked_end..marked_end),
+            );
+            cx.notify();
+        }
+    }
+
+    fn bounds_for_range(
+        &mut self,
+        _range_utf16: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        Some(Bounds::new(
+            point(
+                element_bounds.left() + px(12.0),
+                element_bounds.top() + px(8.0),
+            ),
+            size(px(2.0), px(20.0)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        let text = self.active_snippet_ime_text()?;
+        Some(utf8_index_to_utf16(&text, text.len()))
+    }
+}
+
+fn snippet_ime_input_overlay(entity: Entity<RootView>) -> AnyElement {
+    canvas(
+        |_bounds, _window, _cx| {},
+        move |bounds, _, window, cx| {
+            let focus_handle = entity.read(cx).focus_handle.clone();
+            window.handle_input(
+                &focus_handle,
+                ElementInputHandler::new(bounds, entity.clone()),
+                cx,
+            );
+        },
+    )
+    .absolute()
+    .top_0()
+    .left_0()
+    .size_full()
+    .into_any_element()
+}
+
+fn utf16_index_to_utf8(text: &str, utf16_index: usize) -> usize {
+    if utf16_index == 0 {
+        return 0;
+    }
+
+    let mut utf16_count = 0;
+    for (byte_index, ch) in text.char_indices() {
+        utf16_count += ch.len_utf16();
+        if utf16_count >= utf16_index {
+            return byte_index + ch.len_utf8();
+        }
+    }
+
+    text.len()
+}
+
+fn utf8_index_to_utf16(text: &str, utf8_index: usize) -> usize {
+    text[..utf8_index.min(text.len())]
+        .chars()
+        .map(char::len_utf16)
+        .sum()
+}
+
+fn utf16_range_to_utf8(text: &str, range_utf16: &Range<usize>) -> Range<usize> {
+    utf16_index_to_utf8(text, range_utf16.start)..utf16_index_to_utf8(text, range_utf16.end)
+}
+
+fn utf8_range_to_utf16(text: &str, range_utf8: &Range<usize>) -> Range<usize> {
+    utf8_index_to_utf16(text, range_utf8.start)..utf8_index_to_utf16(text, range_utf8.end)
 }
 
 fn chrome_button(id: &'static str, icon_path: &'static str) -> Stateful<Div> {
