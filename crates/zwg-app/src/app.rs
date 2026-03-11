@@ -1140,6 +1140,8 @@ impl RootView {
                                 .flex_col()
                                 .child(
                                     div()
+                                        .w_full()
+                                        .h_full()
                                         .flex_1()
                                         .p(px(6.0))
                                         .flex()
@@ -1245,6 +1247,7 @@ impl RootView {
                         )
                         .child(
                             div()
+                                .w_full()
                                 .flex_1()
                                 .h_full()
                                 .py(px(8.0))
