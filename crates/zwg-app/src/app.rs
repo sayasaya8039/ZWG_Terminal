@@ -419,6 +419,8 @@ impl RootView {
                 .left(px(left))
                 .w(px(panel_w))
                 .h(px(panel_h))
+                .flex()
+                .flex_col()
                 .rounded(px(12.0))
                 .overflow_hidden()
                 .shadow_lg()
@@ -447,6 +449,7 @@ impl RootView {
                 )
                 .child(
                     div()
+                        .flex_1()
                         .p(px(16.0))
                         .flex()
                         .flex_col()
@@ -483,7 +486,14 @@ impl RootView {
                                 .text_color(rgb(SUBTEXT1))
                                 .child("AVAILABLE SHELLS"),
                         )
-                        .child(div().flex().flex_col().gap(px(2.0)).children(shell_items))
+                        .child(
+                            div()
+                                .id("shell-list-scroll")
+                                .flex_1()
+                                .overflow_y_scroll()
+                                .scrollbar_width(px(6.0))
+                                .child(div().flex().flex_col().gap(px(2.0)).children(shell_items)),
+                        )
                         .child(
                             div()
                                 .font_family(UI_FONT)
@@ -1382,9 +1392,13 @@ fn chrome_button(id: &'static str, icon_path: &'static str) -> Stateful<Div> {
         .justify_center()
         .font_family(UI_FONT)
         .text_size(px(12.0))
-        .text_color(rgb(SUBTEXT1))
-        .hover(|style| style.bg(rgba(0xffffff10)).text_color(rgb(TEXT)))
-        .child(svg().path(icon_path).size(px(14.0)))
+        .hover(|style| style.bg(rgba(0xffffff10)))
+        .child(
+            svg()
+                .path(icon_path)
+                .size(px(14.0))
+                .text_color(rgb(SUBTEXT1)),
+        )
 }
 
 fn settings_section_heading(label: &'static str) -> Div {
