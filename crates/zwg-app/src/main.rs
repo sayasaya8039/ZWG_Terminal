@@ -12,8 +12,6 @@ mod shell;
 mod split;
 mod terminal;
 
-use std::sync::{Arc, Mutex};
-
 use gpui::*;
 
 actions!(
@@ -55,25 +53,8 @@ fn main() {
             KeyBinding::new("ctrl-shift-q", Quit, None),
         ]);
 
-        // Load saved window state
+        // Load saved window state (position + size)
         let window_state = config::WindowState::load();
-        let last_bounds: Arc<Mutex<Option<config::WindowState>>> = Arc::new(Mutex::new(None));
-        let bounds_for_quit = last_bounds.clone();
-
-        // Save window state on app quit (covers X button, Ctrl+Shift+Q, etc.)
-        // Must keep Subscription alive for the duration of the app
-        let _quit_sub = cx.on_app_quit({
-            move |_cx| {
-                let bounds_ref = bounds_for_quit.clone();
-                async move {
-                    if let Some(state) = bounds_ref.lock().unwrap().take() {
-                        if let Err(e) = state.save() {
-                            log::warn!("Failed to save window state: {}", e);
-                        }
-                    }
-                }
-            }
-        });
 
         let app_state = app::AppState::new(cx);
         let state = cx.new(|_cx| app_state);
@@ -97,7 +78,7 @@ fn main() {
         };
 
         cx.open_window(opts, |_window, cx| {
-            cx.new(|cx| app::RootView::new(state.clone(), last_bounds.clone(), cx))
+            cx.new(|cx| app::RootView::new(state.clone(), cx))
         })
         .ok();
     });

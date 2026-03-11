@@ -1,7 +1,5 @@
 //! Application state and root view — multi-tab + split pane support
 
-use std::sync::{Arc, Mutex};
-
 use gpui::*;
 use uuid::Uuid;
 
@@ -131,20 +129,16 @@ impl AppState {
 pub struct RootView {
     state: Entity<AppState>,
     show_shell_menu: bool,
-    /// Shared ref for saving window bounds on quit
-    last_bounds: Arc<Mutex<Option<WindowState>>>,
+    /// Cached window bounds — saved to disk on Drop
+    last_bounds: Option<WindowState>,
 }
 
 impl RootView {
-    pub fn new(
-        state: Entity<AppState>,
-        last_bounds: Arc<Mutex<Option<WindowState>>>,
-        _cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
         Self {
             state,
             show_shell_menu: false,
-            last_bounds,
+            last_bounds: None,
         }
     }
 
@@ -228,9 +222,9 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Track window bounds for save-on-quit
+        // Track window bounds every frame for save-on-drop
         let bounds = window.bounds();
-        *self.last_bounds.lock().unwrap() = Some(WindowState {
+        self.last_bounds = Some(WindowState {
             x: f32::from(bounds.origin.x),
             y: f32::from(bounds.origin.y),
             width: f32::from(bounds.size.width),
@@ -562,5 +556,17 @@ impl RootView {
                     .text_color(rgb(SURFACE1))
                     .child(format!("ZWG v{}", version)),
             )
+    }
+}
+
+impl Drop for RootView {
+    fn drop(&mut self) {
+        if let Some(ref state) = self.last_bounds {
+            if let Err(e) = state.save() {
+                log::warn!("Failed to save window state: {}", e);
+            } else {
+                log::info!("Window state saved on exit");
+            }
+        }
     }
 }
