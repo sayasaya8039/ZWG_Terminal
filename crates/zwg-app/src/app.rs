@@ -414,6 +414,10 @@ impl RootView {
         Some(
             div()
                 .id("shell-selector")
+                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.show_shell_menu = false;
+                    cx.notify();
+                }))
                 .absolute()
                 .top(px(top))
                 .left(px(left))
@@ -608,6 +612,10 @@ impl RootView {
         Some(
             div()
                 .id("settings-panel")
+                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.show_settings = false;
+                    cx.notify();
+                }))
                 .absolute()
                 .top(px(top))
                 .left(px(left))
@@ -1241,14 +1249,7 @@ impl Render for RootView {
                     .top_0()
                     .left_0()
                     .size_full()
-                    .bg(rgba(BACKDROP))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                            this.show_shell_menu = false;
-                            cx.notify();
-                        }),
-                    ),
+                    .bg(rgba(BACKDROP)),
             )
         } else {
             None
@@ -1262,14 +1263,7 @@ impl Render for RootView {
                     .top_0()
                     .left_0()
                     .size_full()
-                    .bg(rgba(BACKDROP))
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                            this.show_settings = false;
-                            cx.notify();
-                        }),
-                    ),
+                    .bg(rgba(BACKDROP)),
             )
         } else {
             None
