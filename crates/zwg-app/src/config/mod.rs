@@ -2,6 +2,16 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+#[cfg(windows)]
+use std::process::Command;
+
+pub const CONFIG_VERSION: u32 = 2;
+const DEFAULT_WINDOW_COLS: u16 = 120;
+const DEFAULT_WINDOW_ROWS: u16 = 30;
+#[cfg(windows)]
+const RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+#[cfg(windows)]
+const RUN_VALUE_NAME: &str = "ZWG Terminal";
 
 /// Color theme definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,6 +108,7 @@ impl Theme {
 
 /// Font configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct FontConfig {
     pub family: String,
     pub size: f32,
@@ -116,7 +127,9 @@ impl Default for FontConfig {
 
 /// Application configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AppConfig {
+    pub version: u32,
     pub shell: String,
     pub font: FontConfig,
     pub theme: String, // theme name
@@ -124,11 +137,16 @@ pub struct AppConfig {
     pub cursor_blink: bool,
     pub tab_bar_visible: bool,
     pub status_bar_visible: bool,
+    pub launch_on_login: bool,
+    pub confirm_on_close: bool,
+    pub default_window_cols: u16,
+    pub default_window_rows: u16,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
+            version: CONFIG_VERSION,
             shell: crate::shell::detect_default_shell(),
             font: FontConfig::default(),
             theme: "Catppuccin Mocha".into(),
@@ -136,6 +154,10 @@ impl Default for AppConfig {
             cursor_blink: true,
             tab_bar_visible: true,
             status_bar_visible: true,
+            launch_on_login: false,
+            confirm_on_close: true,
+            default_window_cols: DEFAULT_WINDOW_COLS,
+            default_window_rows: DEFAULT_WINDOW_ROWS,
         }
     }
 }
@@ -157,18 +179,19 @@ impl AppConfig {
                 Ok(content) => match serde_json::from_str::<AppConfig>(&content) {
                     Ok(config) => {
                         log::info!("Loaded config from {:?}", path);
-                        return config.validated();
+                        return config.validated().sync_launch_on_login();
                     }
                     Err(e) => log::warn!("Invalid config file: {}", e),
                 },
                 Err(e) => log::warn!("Failed to read config: {}", e),
             }
         }
-        Self::default()
+        Self::default().sync_launch_on_login()
     }
 
     /// Clamp config values to safe ranges
     fn validated(mut self) -> Self {
+        self.version = CONFIG_VERSION;
         if self.shell.trim().is_empty() {
             log::warn!("Empty shell in config, using default");
             self.shell = crate::shell::detect_default_shell();
@@ -176,6 +199,19 @@ impl AppConfig {
         self.scrollback_lines = self.scrollback_lines.clamp(100, 100_000);
         self.font.size = self.font.size.clamp(6.0, 72.0);
         self.font.line_height = self.font.line_height.clamp(1.0, 3.0);
+        self.default_window_cols = self.default_window_cols.clamp(60, 240);
+        self.default_window_rows = self.default_window_rows.clamp(18, 120);
+        self
+    }
+
+    pub fn sanitized(self) -> Self {
+        self.validated()
+    }
+
+    fn sync_launch_on_login(mut self) -> Self {
+        if let Ok(enabled) = launch_on_login_enabled() {
+            self.launch_on_login = enabled;
+        }
         self
     }
 
@@ -204,6 +240,61 @@ impl AppConfig {
     /// Available theme names
     pub fn available_themes() -> Vec<&'static str> {
         vec!["Catppuccin Mocha", "Catppuccin Latte", "Tokyo Night"]
+    }
+}
+
+pub fn launch_on_login_enabled() -> std::io::Result<bool> {
+    #[cfg(windows)]
+    {
+        let output = Command::new("reg")
+            .args(["query", RUN_KEY_PATH, "/v", RUN_VALUE_NAME])
+            .output()?;
+        return Ok(output.status.success());
+    }
+
+    #[cfg(not(windows))]
+    {
+        Ok(false)
+    }
+}
+
+pub fn set_launch_on_login(enabled: bool) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        let output = if enabled {
+            let exe = std::env::current_exe()?;
+            let command = format!("\"{}\"", exe.display());
+            Command::new("reg")
+                .args([
+                    "add",
+                    RUN_KEY_PATH,
+                    "/v",
+                    RUN_VALUE_NAME,
+                    "/t",
+                    "REG_SZ",
+                    "/d",
+                    &command,
+                    "/f",
+                ])
+                .output()?
+        } else {
+            Command::new("reg")
+                .args(["delete", RUN_KEY_PATH, "/v", RUN_VALUE_NAME, "/f"])
+                .output()?
+        };
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(std::io::Error::other(stderr.trim().to_string()));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = enabled;
+        Ok(())
     }
 }
 
@@ -286,6 +377,7 @@ mod tests {
 
     fn make_test_config() -> AppConfig {
         AppConfig {
+            version: CONFIG_VERSION,
             shell: "cmd.exe".into(),
             font: FontConfig::default(),
             theme: "Catppuccin Mocha".into(),
@@ -293,12 +385,17 @@ mod tests {
             cursor_blink: true,
             tab_bar_visible: true,
             status_bar_visible: true,
+            launch_on_login: false,
+            confirm_on_close: true,
+            default_window_cols: DEFAULT_WINDOW_COLS,
+            default_window_rows: DEFAULT_WINDOW_ROWS,
         }
     }
 
     #[test]
     fn config_round_trip_serde() {
         let config = AppConfig {
+            version: CONFIG_VERSION,
             shell: "cmd.exe".into(),
             font: FontConfig {
                 family: "Consolas".into(),
@@ -310,9 +407,14 @@ mod tests {
             cursor_blink: false,
             tab_bar_visible: true,
             status_bar_visible: false,
+            launch_on_login: true,
+            confirm_on_close: false,
+            default_window_cols: 132,
+            default_window_rows: 40,
         };
         let json = serde_json::to_string(&config).unwrap();
         let restored: AppConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored.version, CONFIG_VERSION);
         assert_eq!(restored.shell, "cmd.exe");
         assert_eq!(restored.font.family, "Consolas");
         assert_eq!(restored.font.size, 16.0);
@@ -320,6 +422,10 @@ mod tests {
         assert_eq!(restored.scrollback_lines, 5000);
         assert!(!restored.cursor_blink);
         assert!(!restored.status_bar_visible);
+        assert!(restored.launch_on_login);
+        assert!(!restored.confirm_on_close);
+        assert_eq!(restored.default_window_cols, 132);
+        assert_eq!(restored.default_window_rows, 40);
     }
 
     #[test]
@@ -359,6 +465,23 @@ mod tests {
         let mut config2 = make_test_config();
         config2.font.line_height = 5.0;
         assert_eq!(config2.validated().font.line_height, 3.0);
+    }
+
+    #[test]
+    fn config_validated_clamps_window_grid() {
+        let mut config = make_test_config();
+        config.default_window_cols = 10;
+        config.default_window_rows = 5;
+        let validated = config.validated();
+        assert_eq!(validated.default_window_cols, 60);
+        assert_eq!(validated.default_window_rows, 18);
+
+        let mut config2 = make_test_config();
+        config2.default_window_cols = 999;
+        config2.default_window_rows = 999;
+        let validated2 = config2.validated();
+        assert_eq!(validated2.default_window_cols, 240);
+        assert_eq!(validated2.default_window_rows, 120);
     }
 
     #[test]

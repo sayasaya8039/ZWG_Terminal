@@ -66,8 +66,12 @@ fn main() {
         base: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../resources"),
     });
     app.run(|cx: &mut App| {
-        // Global actions
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
 
         // Keybindings
         cx.bind_keys([

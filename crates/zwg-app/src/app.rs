@@ -4,9 +4,11 @@ use std::time::Instant;
 
 use gpui::*;
 
-use crate::config::WindowState;
+use crate::config::{AppConfig, WindowState, set_launch_on_login};
 use crate::shell::{self, ShellType};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
+use crate::terminal::TerminalSettings;
+use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
 use crate::{ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, SplitDown, SplitRight};
 
 const WINDOW_BG: u32 = 0x1C1C1E;
@@ -61,6 +63,7 @@ pub struct AppState {
     pub tabs: Vec<Tab>,
     pub active_tab: usize,
     pub available_shells: Vec<ShellEntry>,
+    pub config: AppConfig,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -105,6 +108,7 @@ pub struct RootView {
     state: Entity<AppState>,
     show_shell_menu: bool,
     show_settings: bool,
+    show_close_confirm: bool,
     settings_category: SettingsCategory,
     last_bounds: Option<WindowState>,
     last_save_time: Instant,
@@ -122,12 +126,18 @@ impl AppState {
             })
             .collect();
 
-        let default_shell = available_shells
-            .first()
-            .map(|entry| entry.command.clone())
-            .unwrap_or_else(shell::detect_default_shell);
+        let mut config = AppConfig::load();
+        let default_shell = resolve_default_shell_command(&config.shell, &available_shells);
+        if config.shell != default_shell {
+            config.shell = default_shell.clone();
+            if let Err(err) = config.save() {
+                log::warn!("Failed to normalize default shell in config: {}", err);
+            }
+        }
+
         let (shell_type, title) = shell_meta_for_command(&default_shell, &available_shells);
-        let split = cx.new(|cx| SplitContainer::new(&default_shell, cx));
+        let terminal_settings = terminal_settings_from_config(&config);
+        let split = cx.new(|cx| SplitContainer::new(&default_shell, terminal_settings, cx));
 
         Self {
             tabs: vec![Tab {
@@ -137,21 +147,19 @@ impl AppState {
             }],
             active_tab: 0,
             available_shells,
+            config,
         }
     }
 
     pub fn add_tab(&mut self, cx: &mut App) {
-        let shell = self
-            .available_shells
-            .first()
-            .map(|entry| entry.command.clone())
-            .unwrap_or_else(shell::detect_default_shell);
+        let shell = resolve_default_shell_command(&self.config.shell, &self.available_shells);
         self.add_tab_with_shell(&shell, cx);
     }
 
     pub fn add_tab_with_shell(&mut self, shell: &str, cx: &mut App) {
         let (shell_type, title) = shell_meta_for_command(shell, &self.available_shells);
-        let split = cx.new(|cx| SplitContainer::new(shell, cx));
+        let terminal_settings = terminal_settings_from_config(&self.config);
+        let split = cx.new(|cx| SplitContainer::new(shell, terminal_settings, cx));
 
         self.tabs.push(Tab {
             title,
@@ -174,6 +182,16 @@ impl AppState {
     pub fn active_split(&self) -> Option<&Entity<SplitContainer>> {
         self.tabs.get(self.active_tab).map(|t| &t.split)
     }
+
+    pub fn apply_config(&mut self, config: AppConfig, cx: &mut App) {
+        self.config = config;
+        let terminal_settings = terminal_settings_from_config(&self.config);
+        for tab in &self.tabs {
+            tab.split.update(cx, |split, _cx| {
+                split.update_terminal_settings(terminal_settings);
+            });
+        }
+    }
 }
 
 impl RootView {
@@ -182,6 +200,7 @@ impl RootView {
             state,
             show_shell_menu: false,
             show_settings: false,
+            show_close_confirm: false,
             settings_category: SettingsCategory::General,
             last_bounds: None,
             last_save_time: Instant::now(),
@@ -247,7 +266,125 @@ impl RootView {
         }
     }
 
-    fn render_window_traffic_lights(&mut self, cx: &mut Context<Self>) -> Div {
+    fn on_quit_requested(
+        &mut self,
+        _action: &crate::Quit,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.request_window_close(window, cx);
+    }
+
+    fn request_window_close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let should_confirm = self.state.read(cx).config.confirm_on_close;
+        if should_confirm {
+            self.show_shell_menu = false;
+            self.show_settings = false;
+            self.show_close_confirm = true;
+            cx.notify();
+        } else {
+            window.remove_window();
+        }
+    }
+
+    fn persist_config_update<F>(&mut self, cx: &mut Context<Self>, mutate: F)
+    where
+        F: FnOnce(&mut AppConfig),
+    {
+        let mut config = self.state.read(cx).config.clone();
+        mutate(&mut config);
+        let config = config.sanitized();
+
+        self.state.update(cx, |state, cx| {
+            state.apply_config(config.clone(), cx);
+            if let Err(err) = state.config.save() {
+                log::warn!("Failed to save config: {}", err);
+            }
+            cx.notify();
+        });
+    }
+
+    fn cycle_default_profile(&mut self, cx: &mut Context<Self>) {
+        let (available_shells, current_shell) = {
+            let state = self.state.read(cx);
+            (state.available_shells.clone(), state.config.shell.clone())
+        };
+
+        if available_shells.is_empty() {
+            return;
+        }
+
+        let current_index = available_shells
+            .iter()
+            .position(|entry| entry.command == current_shell)
+            .unwrap_or(0);
+        let next_index = (current_index + 1) % available_shells.len();
+        let next_shell = available_shells[next_index].command.clone();
+        self.persist_config_update(cx, move |config| {
+            config.shell = next_shell;
+        });
+    }
+
+    fn toggle_launch_on_login(&mut self, cx: &mut Context<Self>) {
+        let next_value = !self.state.read(cx).config.launch_on_login;
+        match set_launch_on_login(next_value) {
+            Ok(()) => self.persist_config_update(cx, move |config| {
+                config.launch_on_login = next_value;
+            }),
+            Err(err) => log::warn!("Failed to update launch-on-login setting: {}", err),
+        }
+    }
+
+    fn toggle_tab_bar_visibility(&mut self, cx: &mut Context<Self>) {
+        let next_value = !self.state.read(cx).config.tab_bar_visible;
+        self.persist_config_update(cx, move |config| {
+            config.tab_bar_visible = next_value;
+        });
+    }
+
+    fn toggle_confirm_on_close(&mut self, cx: &mut Context<Self>) {
+        let next_value = !self.state.read(cx).config.confirm_on_close;
+        self.persist_config_update(cx, move |config| {
+            config.confirm_on_close = next_value;
+        });
+    }
+
+    fn adjust_window_grid(
+        &mut self,
+        cols_delta: i32,
+        rows_delta: i32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let current_config = self.state.read(cx).config.clone();
+        let next_cols =
+            ((current_config.default_window_cols as i32) + cols_delta).clamp(60, 240) as u16;
+        let next_rows =
+            ((current_config.default_window_rows as i32) + rows_delta).clamp(18, 120) as u16;
+
+        self.persist_config_update(cx, move |config| {
+            config.default_window_cols = next_cols;
+            config.default_window_rows = next_rows;
+        });
+
+        if !window.is_maximized() {
+            window.resize(window_size_from_grid(next_cols, next_rows));
+        }
+    }
+
+    fn adjust_scrollback_lines(&mut self, delta: i32, cx: &mut Context<Self>) {
+        let current_value = self.state.read(cx).config.scrollback_lines as i32;
+        let next_value = (current_value + delta).clamp(100, 100_000) as usize;
+        self.persist_config_update(cx, move |config| {
+            config.scrollback_lines = next_value;
+        });
+    }
+
+    fn render_window_traffic_lights(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
         div()
             .flex()
             .items_center()
@@ -262,7 +399,9 @@ impl RootView {
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|_this, _: &MouseDownEvent, _window, cx| cx.quit()),
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.request_window_close(window, cx);
+                        }),
                     ),
             )
             .child(
@@ -558,6 +697,7 @@ impl RootView {
         &mut self,
         viewport_w: f32,
         viewport_h: f32,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         if !self.show_settings {
@@ -682,16 +822,101 @@ impl RootView {
                             div()
                                 .flex_1()
                                 .p(px(24.0))
-                                .children(Some(self.render_settings_content())),
+                                .children(Some(self.render_settings_content(window, cx))),
                         ),
                 )
                 .into_any_element(),
         )
     }
 
-    fn render_settings_content(&self) -> AnyElement {
+    fn render_close_confirm_dialog(
+        &mut self,
+        viewport_w: f32,
+        viewport_h: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.show_close_confirm {
+            return None;
+        }
+
+        let panel_w = 360.0;
+        let panel_h = 180.0;
+        let top = ((viewport_h - panel_h) * 0.5).max(24.0);
+        let left = ((viewport_w - panel_w) * 0.5).max(24.0);
+
+        Some(
+            div()
+                .id("close-confirm-dialog")
+                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                    this.show_close_confirm = false;
+                    cx.notify();
+                }))
+                .absolute()
+                .top(px(top))
+                .left(px(left))
+                .w(px(panel_w))
+                .h(px(panel_h))
+                .rounded(px(12.0))
+                .border_1()
+                .border_color(rgba(0xffffff16))
+                .bg(rgb(PANEL_BG))
+                .shadow_lg()
+                .p(px(20.0))
+                .flex()
+                .flex_col()
+                .gap(px(18.0))
+                .child(
+                    div()
+                        .font_family(UI_FONT)
+                        .text_size(px(18.0))
+                        .text_color(rgb(TEXT))
+                        .child("ZWG Terminal を終了しますか？"),
+                )
+                .child(
+                    div()
+                        .font_family(UI_FONT)
+                        .text_size(px(13.0))
+                        .text_color(rgb(SUBTEXT1))
+                        .child("実行中のセッションはそのまま終了します。"),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .w_full()
+                        .flex()
+                        .justify_end()
+                        .gap(px(10.0))
+                        .child(interactive_action_button(
+                            "キャンセル",
+                            false,
+                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                this.show_close_confirm = false;
+                                cx.notify();
+                            }),
+                        ))
+                        .child(interactive_action_button(
+                            "終了",
+                            true,
+                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                this.show_close_confirm = false;
+                                cx.notify();
+                                window.remove_window();
+                            }),
+                        )),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_settings_content(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         match self.settings_category {
-            SettingsCategory::General => self.render_general_settings().into_any_element(),
+            SettingsCategory::General => {
+                self.render_general_settings(window, cx).into_any_element()
+            }
             SettingsCategory::Appearance => self.render_appearance_settings().into_any_element(),
             SettingsCategory::Profiles => self.render_profiles_settings().into_any_element(),
             SettingsCategory::Keyboard => self.render_keyboard_settings().into_any_element(),
@@ -703,7 +928,17 @@ impl RootView {
         }
     }
 
-    fn render_general_settings(&self) -> Div {
+    fn render_general_settings(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let (config, available_shells) = {
+            let state = self.state.read(cx);
+            (state.config.clone(), state.available_shells.clone())
+        };
+        let default_profile_name = available_shells
+            .iter()
+            .find(|entry| entry.command == config.shell)
+            .map(|entry| entry.display_name.clone())
+            .unwrap_or_else(|| shell_meta_for_command(&config.shell, &available_shells).1);
+
         div()
             .flex()
             .flex_col()
@@ -711,11 +946,41 @@ impl RootView {
             .child(settings_section_heading("起動"))
             .child(settings_row(
                 "既定のプロファイル",
-                select_box("PowerShell", 150.0),
+                interactive_select_box(
+                    default_profile_name,
+                    150.0,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.cycle_default_profile(cx);
+                    }),
+                ),
             ))
-            .child(settings_row("ログイン時に起動", toggle(true)))
-            .child(settings_row("タブバーを表示", toggle(true)))
-            .child(settings_row("終了前に確認", toggle(true)))
+            .child(settings_row(
+                "ログイン時に起動",
+                interactive_toggle(
+                    config.launch_on_login,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.toggle_launch_on_login(cx);
+                    }),
+                ),
+            ))
+            .child(settings_row(
+                "タブバーを表示",
+                interactive_toggle(
+                    config.tab_bar_visible,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.toggle_tab_bar_visibility(cx);
+                    }),
+                ),
+            ))
+            .child(settings_row(
+                "終了前に確認",
+                interactive_toggle(
+                    config.confirm_on_close,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.toggle_confirm_on_close(cx);
+                    }),
+                ),
+            ))
             .child(section_divider())
             .child(settings_section_heading("ウィンドウ"))
             .child(settings_row(
@@ -724,7 +989,17 @@ impl RootView {
                     .flex()
                     .items_center()
                     .gap(px(8.0))
-                    .child(input_box("120", 64.0, false))
+                    .child(number_stepper(
+                        config.default_window_cols.to_string(),
+                        64.0,
+                        false,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.adjust_window_grid(-1, 0, window, cx);
+                        }),
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.adjust_window_grid(1, 0, window, cx);
+                        }),
+                    ))
                     .child(
                         div()
                             .font_family(UI_FONT)
@@ -732,11 +1007,31 @@ impl RootView {
                             .text_color(rgb(SUBTEXT1))
                             .child("x"),
                     )
-                    .child(input_box("30", 64.0, false)),
+                    .child(number_stepper(
+                        config.default_window_rows.to_string(),
+                        64.0,
+                        false,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.adjust_window_grid(0, -1, window, cx);
+                        }),
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.adjust_window_grid(0, 1, window, cx);
+                        }),
+                    )),
             ))
             .child(settings_row(
                 "スクロールバック行数",
-                input_box("10000", 96.0, false),
+                number_stepper(
+                    config.scrollback_lines.to_string(),
+                    96.0,
+                    false,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.adjust_scrollback_lines(-1_000, cx);
+                    }),
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.adjust_scrollback_lines(1_000, cx);
+                    }),
+                ),
             ))
     }
 
@@ -1021,6 +1316,7 @@ impl RootView {
         shell_name: &str,
         pane_count: usize,
         tab_count: usize,
+        grid_label: &str,
     ) -> impl IntoElement {
         let mut bar = div()
             .id("status-bar")
@@ -1040,7 +1336,7 @@ impl RootView {
             .child(status_separator())
             .child("UTF-8")
             .child(status_separator())
-            .child("120x30");
+            .child(grid_label.to_string());
 
         if pane_count > 1 {
             bar = bar
@@ -1103,6 +1399,12 @@ impl Render for RootView {
             .get(active_tab)
             .map(|tab| tab.title.clone())
             .unwrap_or_else(|| "PowerShell".to_string());
+        let config = state.config.clone();
+        let tab_bar_visible = config.tab_bar_visible;
+        let grid_label = format!(
+            "{}x{}",
+            config.default_window_cols, config.default_window_rows
+        );
         let tab_infos: Vec<(usize, String, ShellType, bool)> = state
             .tabs
             .iter()
@@ -1229,7 +1531,7 @@ impl Render for RootView {
             .bg(rgb(TITLEBAR_BG))
             .flex()
             .items_center()
-            .child(self.render_window_traffic_lights(cx))
+            .child(self.render_window_traffic_lights(window, cx))
             .child(
                 div()
                     .flex_1()
@@ -1237,7 +1539,18 @@ impl Render for RootView {
                     .flex()
                     .items_center()
                     .gap(px(2.0))
-                    .children(tab_elements),
+                    .children(if tab_bar_visible {
+                        tab_elements
+                    } else {
+                        vec![
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(12.0))
+                                .text_color(rgb(SUBTEXT0))
+                                .child(active_shell_name.clone())
+                                .into_any_element(),
+                        ]
+                    }),
             )
             .child(titlebar_actions);
 
@@ -1269,6 +1582,20 @@ impl Render for RootView {
             None
         };
 
+        let close_confirm_backdrop = if self.show_close_confirm {
+            Some(
+                div()
+                    .id("close-confirm-backdrop")
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .size_full()
+                    .bg(rgba(BACKDROP)),
+            )
+        } else {
+            None
+        };
+
         div()
             .id("root")
             .size_full()
@@ -1284,6 +1611,7 @@ impl Render for RootView {
             .on_action(cx.listener(Self::on_close_pane))
             .on_action(cx.listener(Self::on_focus_next))
             .on_action(cx.listener(Self::on_focus_prev))
+            .on_action(cx.listener(Self::on_quit_requested))
             .child(title_bar)
             .child(
                 div()
@@ -1297,6 +1625,7 @@ impl Render for RootView {
                 &active_shell_name,
                 pane_count,
                 tab_count,
+                &grid_label,
             ))
             .children(shell_backdrop)
             .children(self.render_shell_selector(
@@ -1306,7 +1635,9 @@ impl Render for RootView {
                 cx,
             ))
             .children(settings_backdrop)
-            .children(self.render_settings_panel(new_state.width, new_state.height, cx))
+            .children(self.render_settings_panel(new_state.width, new_state.height, window, cx))
+            .children(close_confirm_backdrop)
+            .children(self.render_close_confirm_dialog(new_state.width, new_state.height, cx))
     }
 }
 
@@ -1318,6 +1649,29 @@ impl Drop for RootView {
             }
         }
     }
+}
+
+fn terminal_settings_from_config(config: &AppConfig) -> TerminalSettings {
+    TerminalSettings {
+        cols: config.default_window_cols,
+        rows: config.default_window_rows,
+        scrollback_lines: config.scrollback_lines,
+    }
+}
+
+fn resolve_default_shell_command(config_shell: &str, available_shells: &[ShellEntry]) -> String {
+    available_shells
+        .iter()
+        .find(|entry| entry.command == config_shell)
+        .map(|entry| entry.command.clone())
+        .or_else(|| available_shells.first().map(|entry| entry.command.clone()))
+        .unwrap_or_else(shell::detect_default_shell)
+}
+
+fn window_size_from_grid(cols: u16, rows: u16) -> Size<Pixels> {
+    let width = ((cols as f32 * CELL_WIDTH_ESTIMATE) + 48.0).clamp(400.0, 2400.0);
+    let height = ((rows as f32 * CELL_HEIGHT_ESTIMATE) + WINDOW_CHROME_HEIGHT).clamp(300.0, 1600.0);
+    size(px(width), px(height))
 }
 
 fn shell_meta_for_command(command: &str, available_shells: &[ShellEntry]) -> (ShellType, String) {
@@ -1468,7 +1822,67 @@ fn select_box(value: &'static str, width: f32) -> Div {
         )
 }
 
+fn interactive_select_box(
+    value: String,
+    width: f32,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .w(px(width))
+        .h(px(32.0))
+        .rounded(px(8.0))
+        .bg(rgba(0xffffff10))
+        .border_1()
+        .border_color(rgba(0xffffff10))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .justify_between()
+        .cursor_pointer()
+        .hover(|style| style.bg(rgba(0xffffff16)))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(13.0))
+                .text_color(rgb(TEXT))
+                .child(value),
+        )
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(10.0))
+                .text_color(rgb(SUBTEXT1))
+                .child("v"),
+        )
+}
+
 fn input_box(value: &'static str, width: f32, mono: bool) -> Div {
+    let mut input = div()
+        .w(px(width))
+        .h(px(32.0))
+        .rounded(px(8.0))
+        .bg(rgba(0xffffff10))
+        .border_1()
+        .border_color(rgba(0xffffff10))
+        .px(px(12.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(13.0))
+        .text_color(rgb(TEXT))
+        .child(value);
+
+    if mono {
+        input = input.font_family("JetBrains Mono");
+    } else {
+        input = input.font_family(UI_FONT);
+    }
+
+    input
+}
+
+fn input_box_dynamic(value: String, width: f32, mono: bool) -> Div {
     let mut input = div()
         .w(px(width))
         .h(px(32.0))
@@ -1514,6 +1928,90 @@ fn toggle(on: bool) -> Div {
             .rounded_full()
             .bg(rgb(0xffffff)),
     )
+}
+
+fn interactive_toggle(
+    on: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    toggle(on)
+        .cursor_pointer()
+        .hover(|style| style.opacity(0.92))
+        .on_mouse_down(MouseButton::Left, listener)
+}
+
+fn stepper_button(
+    label: &'static str,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .w(px(22.0))
+        .h(px(22.0))
+        .rounded(px(6.0))
+        .bg(rgba(0xffffff10))
+        .border_1()
+        .border_color(rgba(0xffffff10))
+        .cursor_pointer()
+        .hover(|style| style.bg(rgba(0xffffff16)))
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(UI_FONT)
+        .text_size(px(12.0))
+        .text_color(rgb(TEXT))
+        .on_mouse_down(MouseButton::Left, listener)
+        .child(label)
+}
+
+fn number_stepper(
+    value: String,
+    width: f32,
+    mono: bool,
+    on_decrement: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    on_increment: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    div()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .child(stepper_button("-", on_decrement))
+        .child(input_box_dynamic(value, width, mono))
+        .child(stepper_button("+", on_increment))
+}
+
+fn interactive_action_button(
+    label: &'static str,
+    accent: bool,
+    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> Div {
+    let mut button = div()
+        .h(px(32.0))
+        .px(px(14.0))
+        .rounded(px(8.0))
+        .border_1()
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .justify_center()
+        .font_family(UI_FONT)
+        .text_size(px(13.0))
+        .on_mouse_down(MouseButton::Left, listener);
+
+    if accent {
+        button = button
+            .bg(rgb(ACCENT))
+            .border_color(rgb(ACCENT))
+            .text_color(rgb(0xffffff))
+            .hover(|style| style.bg(rgb(0x409CFF)));
+    } else {
+        button = button
+            .bg(rgba(0xffffff10))
+            .border_color(rgba(0xffffff10))
+            .text_color(rgb(TEXT))
+            .hover(|style| style.bg(rgba(0xffffff16)));
+    }
+
+    button.child(label)
 }
 
 fn slider_with_value(fill_ratio: f32, value: &'static str) -> Div {

@@ -11,6 +11,11 @@ pub const PINNED_ZIG_VERSION: &str = "0.15.2";
 
 unsafe extern "C" {
     pub fn ghostty_vt_terminal_new(cols: u16, rows: u16) -> *mut core::ffi::c_void;
+    pub fn ghostty_vt_terminal_new_with_scrollback(
+        cols: u16,
+        rows: u16,
+        max_scrollback: usize,
+    ) -> *mut core::ffi::c_void;
     pub fn ghostty_vt_terminal_free(terminal: *mut core::ffi::c_void);
 
     pub fn ghostty_vt_terminal_set_default_colors(
@@ -78,9 +83,7 @@ unsafe extern "C" {
         rows: u16,
     ) -> ghostty_vt_bytes_t;
 
-    pub fn ghostty_vt_terminal_take_viewport_scroll_delta(
-        terminal: *mut core::ffi::c_void,
-    ) -> i32;
+    pub fn ghostty_vt_terminal_take_viewport_scroll_delta(terminal: *mut core::ffi::c_void) -> i32;
 
     pub fn ghostty_vt_terminal_hyperlink_at(
         terminal: *mut core::ffi::c_void,

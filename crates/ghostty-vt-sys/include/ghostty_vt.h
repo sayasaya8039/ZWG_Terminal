@@ -37,6 +37,9 @@ typedef struct ghostty_vt_cell_style_s {
 // - 0x40: strikethrough
 
 ghostty_vt_terminal_t ghostty_vt_terminal_new(uint16_t cols, uint16_t rows);
+ghostty_vt_terminal_t ghostty_vt_terminal_new_with_scrollback(uint16_t cols,
+                                                              uint16_t rows,
+                                                              size_t max_scrollback);
 void ghostty_vt_terminal_free(ghostty_vt_terminal_t terminal);
 
 void ghostty_vt_terminal_set_default_colors(ghostty_vt_terminal_t terminal,

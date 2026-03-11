@@ -6,6 +6,13 @@ pub mod view;
 #[cfg(not(feature = "ghostty_vt"))]
 pub mod vt_parser;
 
+#[derive(Debug, Clone, Copy)]
+pub struct TerminalSettings {
+    pub cols: u16,
+    pub rows: u16,
+    pub scrollback_lines: usize,
+}
+
 #[cfg(not(feature = "ghostty_vt"))]
 use std::collections::VecDeque;
 #[cfg(not(feature = "ghostty_vt"))]

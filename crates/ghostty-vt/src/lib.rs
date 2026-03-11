@@ -106,6 +106,14 @@ impl Terminal {
         Ok(Self { ptr })
     }
 
+    pub fn new_with_scrollback(cols: u16, rows: u16, max_scrollback: usize) -> Result<Self, Error> {
+        let ptr = unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_new_with_scrollback(cols, rows, max_scrollback)
+        };
+        let ptr = NonNull::new(ptr).ok_or(Error::CreateFailed)?;
+        Ok(Self { ptr })
+    }
+
     pub fn set_default_colors(&mut self, fg: Rgb, bg: Rgb) {
         unsafe {
             ghostty_vt_sys::ghostty_vt_terminal_set_default_colors(
@@ -331,5 +339,20 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         unsafe { ghostty_vt_sys::ghostty_vt_terminal_free(self.ptr.as_ptr()) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Terminal;
+
+    #[test]
+    fn constructors_create_terminal() {
+        let terminal = Terminal::new(80, 24).expect("default constructor should succeed");
+        drop(terminal);
+
+        let terminal = Terminal::new_with_scrollback(80, 24, 0)
+            .expect("scrollback constructor should succeed");
+        drop(terminal);
     }
 }

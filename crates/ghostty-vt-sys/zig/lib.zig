@@ -15,13 +15,38 @@ const TerminalHandle = struct {
     has_viewport_top_y_screen: bool,
 
     fn init(alloc: Allocator, cols: u16, rows: u16) !*TerminalHandle {
+        return initWithOptions(alloc, cols, rows, null);
+    }
+
+    fn initWithScrollback(
+        alloc: Allocator,
+        cols: u16,
+        rows: u16,
+        max_scrollback: usize,
+    ) !*TerminalHandle {
+        return initWithOptions(alloc, cols, rows, max_scrollback);
+    }
+
+    fn initWithOptions(
+        alloc: Allocator,
+        cols: u16,
+        rows: u16,
+        max_scrollback: ?usize,
+    ) !*TerminalHandle {
         const handle = try alloc.create(TerminalHandle);
         errdefer alloc.destroy(handle);
 
-        const t = try terminal.Terminal.init(alloc, .{
-            .cols = cols,
-            .rows = rows,
-        });
+        const t = if (max_scrollback) |limit|
+            try terminal.Terminal.init(alloc, .{
+                .cols = cols,
+                .rows = rows,
+                .max_scrollback = limit,
+            })
+        else
+            try terminal.Terminal.init(alloc, .{
+                .cols = cols,
+                .rows = rows,
+            });
         errdefer {
             var tmp = t;
             tmp.deinit(alloc);
@@ -195,6 +220,16 @@ const StyleRun = extern struct {
 export fn ghostty_vt_terminal_new(cols: u16, rows: u16) callconv(.c) ?*anyopaque {
     const alloc = std.heap.c_allocator;
     const handle = TerminalHandle.init(alloc, cols, rows) catch return null;
+    return @ptrCast(handle);
+}
+
+export fn ghostty_vt_terminal_new_with_scrollback(
+    cols: u16,
+    rows: u16,
+    max_scrollback: usize,
+) callconv(.c) ?*anyopaque {
+    const alloc = std.heap.c_allocator;
+    const handle = TerminalHandle.initWithScrollback(alloc, cols, rows, max_scrollback) catch return null;
     return @ptrCast(handle);
 }
 

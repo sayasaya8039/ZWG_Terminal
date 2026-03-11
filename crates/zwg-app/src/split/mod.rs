@@ -3,7 +3,7 @@
 use gpui::*;
 use uuid::Uuid;
 
-use crate::terminal::TerminalPane;
+use crate::terminal::{TerminalPane, TerminalSettings};
 
 /// Direction of a split
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -31,16 +31,18 @@ pub struct SplitContainer {
     root: SplitNode,
     focused_id: Uuid,
     shell: String,
+    terminal_settings: TerminalSettings,
 }
 
 impl SplitContainer {
-    pub fn new(shell: &str, cx: &mut Context<Self>) -> Self {
+    pub fn new(shell: &str, terminal_settings: TerminalSettings, cx: &mut Context<Self>) -> Self {
         let id = Uuid::new_v4();
-        let terminal = cx.new(|cx| TerminalPane::new(shell, cx));
+        let terminal = cx.new(|cx| TerminalPane::new(shell, terminal_settings, cx));
         Self {
             root: SplitNode::Leaf { id, terminal },
             focused_id: id,
             shell: shell.to_string(),
+            terminal_settings,
         }
     }
 
@@ -49,7 +51,8 @@ impl SplitContainer {
         let target_id = self.focused_id;
         let shell = self.shell.clone();
         let new_id = Uuid::new_v4();
-        let new_terminal = cx.new(|cx| TerminalPane::new(&shell, cx));
+        let terminal_settings = self.terminal_settings;
+        let new_terminal = cx.new(|cx| TerminalPane::new(&shell, terminal_settings, cx));
 
         self.root = Self::split_node(
             std::mem::replace(
@@ -268,6 +271,10 @@ impl SplitContainer {
 
     pub fn focused_id(&self) -> Uuid {
         self.focused_id
+    }
+
+    pub fn update_terminal_settings(&mut self, terminal_settings: TerminalSettings) {
+        self.terminal_settings = terminal_settings;
     }
 }
 

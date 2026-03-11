@@ -6,11 +6,14 @@ use gpui::*;
 
 use super::pty::{ConPtyConfig, spawn_pty};
 use super::surface::TerminalSurface;
-use super::{DEFAULT_BG, DEFAULT_FG};
+use super::{DEFAULT_BG, DEFAULT_FG, TerminalSettings};
 
 const FONT_FAMILY: &str = "JetBrains Mono";
 const FONT_SIZE: f32 = 13.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.5;
+pub const CELL_WIDTH_ESTIMATE: f32 = 8.4;
+pub const CELL_HEIGHT_ESTIMATE: f32 = FONT_SIZE * LINE_HEIGHT_FACTOR;
+pub const WINDOW_CHROME_HEIGHT: f32 = 60.0;
 
 // Figma-aligned chrome colors for status text
 const SUBTEXT0: u32 = 0x8E8E93;
@@ -44,13 +47,15 @@ pub struct TerminalPane {
 }
 
 impl TerminalPane {
-    pub fn new(shell: &str, cx: &mut Context<Self>) -> Self {
+    pub fn new(shell: &str, settings: TerminalSettings, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        let surface = TerminalSurface::new(80, 24);
+        let surface = TerminalSurface::new(settings.cols, settings.rows, settings.scrollback_lines);
 
         // Phase A: Return immediately with Pending state (<1ms)
         // Phase B: Spawn PTY in background thread
         let shell_owned = shell.to_string();
+        let initial_cols = settings.cols;
+        let initial_rows = settings.rows;
         cx.spawn(
             async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
                 // Run ConPTY creation on background executor (off UI thread)
@@ -60,8 +65,8 @@ impl TerminalPane {
                     .spawn(async move {
                         let config = ConPtyConfig {
                             shell: shell_for_spawn,
-                            cols: 80,
-                            rows: 24,
+                            cols: initial_cols,
+                            rows: initial_rows,
                             working_directory: None,
                             env: Vec::new(),
                         };
@@ -124,10 +129,10 @@ impl TerminalPane {
             surface,
             focus_handle,
             state: TerminalState::Pending,
-            cell_width: 8.4,
-            cell_height: FONT_SIZE * LINE_HEIGHT_FACTOR,
-            term_cols: 80,
-            term_rows: 24,
+            cell_width: CELL_WIDTH_ESTIMATE,
+            cell_height: CELL_HEIGHT_ESTIMATE,
+            term_cols: settings.cols,
+            term_rows: settings.rows,
             last_width: 0.0,
             last_height: 0.0,
         }
@@ -219,7 +224,7 @@ impl TerminalPane {
         let vp = window.viewport_size();
         let vp_w: f32 = vp.width.into();
         let vp_h: f32 = vp.height.into();
-        let avail_h = (vp_h - 60.0).max(100.0);
+        let avail_h = (vp_h - WINDOW_CHROME_HEIGHT).max(100.0);
         self.handle_resize(vp_w, avail_h);
 
         // Snapshot backend state under brief lock

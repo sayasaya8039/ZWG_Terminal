@@ -1,8 +1,8 @@
 //! Terminal surface — manages PTY + terminal backend
 
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
@@ -30,16 +30,20 @@ mod backend {
     }
 
     impl TerminalBackend {
-        pub fn new(cols: u16, rows: u16) -> Self {
+        pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Self {
             // M4: log error but continue — panic in constructor is unrecoverable
-            let mut terminal = match ghostty_vt::Terminal::new(cols, rows) {
-                Ok(t) => t,
-                Err(e) => {
-                    log::error!("Failed to create ghostty terminal: {}. Retrying with defaults.", e);
-                    ghostty_vt::Terminal::new(80, 24)
-                        .expect("ghostty terminal creation failed with defaults")
-                }
-            };
+            let mut terminal =
+                match ghostty_vt::Terminal::new_with_scrollback(cols, rows, max_scrollback) {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::error!(
+                            "Failed to create ghostty terminal: {}. Retrying with defaults.",
+                            e
+                        );
+                        ghostty_vt::Terminal::new_with_scrollback(80, 24, max_scrollback)
+                            .expect("ghostty terminal creation failed with defaults")
+                    }
+                };
             terminal.set_default_colors(
                 ghostty_vt::Rgb {
                     r: ((DEFAULT_FG >> 16) & 0xFF) as u8,
@@ -70,9 +74,7 @@ mod backend {
         }
 
         pub fn row_text(&self, row: u16) -> String {
-            self.terminal
-                .dump_viewport_row(row)
-                .unwrap_or_default()
+            self.terminal.dump_viewport_row(row).unwrap_or_default()
         }
 
         pub fn row_style_runs(&self, row: u16) -> Vec<ghostty_vt::StyleRun> {
@@ -91,8 +93,8 @@ mod backend {
 #[cfg(not(feature = "ghostty_vt"))]
 mod backend {
     use super::*;
-    use crate::terminal::vt_parser::VtParser;
     use crate::terminal::ScreenBuffer;
+    use crate::terminal::vt_parser::VtParser;
 
     pub struct TerminalBackend {
         parser: VtParser,
@@ -102,10 +104,10 @@ mod backend {
     }
 
     impl TerminalBackend {
-        pub fn new(cols: u16, rows: u16) -> Self {
+        pub fn new(cols: u16, rows: u16, max_scrollback: usize) -> Self {
             Self {
                 parser: VtParser::new(),
-                screen: ScreenBuffer::new(cols, rows, 10_000),
+                screen: ScreenBuffer::new(cols, rows, max_scrollback),
                 cols,
                 rows,
             }
@@ -152,11 +154,15 @@ pub struct TerminalSurface {
 }
 
 impl TerminalSurface {
-    pub fn new(cols: u16, rows: u16) -> Self {
+    pub fn new(cols: u16, rows: u16, scrollback_lines: usize) -> Self {
         // H1: bounded(1) — reader only needs to signal "data available"
         let (event_tx, event_rx) = flume::bounded(4);
         Self {
-            backend: Arc::new(Mutex::new(TerminalBackend::new(cols, rows))),
+            backend: Arc::new(Mutex::new(TerminalBackend::new(
+                cols,
+                rows,
+                scrollback_lines,
+            ))),
             event_rx,
             event_tx,
             pty: None,
