@@ -5,7 +5,7 @@ use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
 
-const SNIPPET_STORE_VERSION: u32 = 2;
+const SNIPPET_STORE_VERSION: u32 = 3;
 const DEFAULT_GROUP_NAME: &str = "General";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -21,6 +21,7 @@ pub struct Snippet {
     pub title: String,
     pub content: String,
     pub group: String,
+    pub is_favorite: bool,
 }
 
 impl Default for Snippet {
@@ -29,6 +30,7 @@ impl Default for Snippet {
             title: String::new(),
             content: String::new(),
             group: DEFAULT_GROUP_NAME.to_string(),
+            is_favorite: false,
         }
     }
 }
@@ -48,6 +50,7 @@ impl Snippet {
             title: title.into(),
             content: content.into(),
             group: group.into(),
+            is_favorite: false,
         }
     }
 
@@ -371,12 +374,24 @@ impl SnippetStore {
             self.groups.push(desired_group.clone());
         }
 
-        let updated = Snippet::with_group(title, content, desired_group)
+        let mut updated = Snippet::with_group(title, content, desired_group)
             .sanitized()
             .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "Snippet is empty"))?;
+        updated.is_favorite = self.items[index].is_favorite;
         self.items[index] = updated;
         self.save()?;
         Ok(true)
+    }
+
+    pub fn toggle_favorite(&mut self, index: usize) -> io::Result<Option<bool>> {
+        let Some(snippet) = self.items.get_mut(index) else {
+            return Ok(None);
+        };
+
+        snippet.is_favorite = !snippet.is_favorite;
+        let is_favorite = snippet.is_favorite;
+        self.save()?;
+        Ok(Some(is_favorite))
     }
 
     pub fn delete_snippet(&mut self, index: usize) -> io::Result<bool> {
@@ -833,6 +848,47 @@ mod tests {
         assert_eq!(imported.items()[0].content, "line1\nline2");
 
         let _ = fs::remove_file(csv_path);
+    }
+
+    #[test]
+    fn updating_snippet_preserves_favorite_state() {
+        let path = temp_path();
+        let mut store = SnippetStore::with_loaded_data(
+            path.clone(),
+            vec!["Alpha".to_string()],
+            vec![Snippet {
+                title: "One".to_string(),
+                content: "1".to_string(),
+                group: "Alpha".to_string(),
+                is_favorite: true,
+            }],
+        );
+
+        assert!(
+            store
+                .update_snippet(0, "Renamed", "2", Some("Alpha"))
+                .unwrap()
+        );
+        assert!(store.items()[0].is_favorite);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn toggling_favorite_updates_store() {
+        let path = temp_path();
+        let mut store = SnippetStore::with_loaded_data(
+            path.clone(),
+            vec!["Alpha".to_string()],
+            vec![Snippet::with_group("One", "1", "Alpha")],
+        );
+
+        assert_eq!(store.toggle_favorite(0).unwrap(), Some(true));
+        assert!(store.items()[0].is_favorite);
+        assert_eq!(store.toggle_favorite(0).unwrap(), Some(false));
+        assert!(!store.items()[0].is_favorite);
+
+        let _ = fs::remove_file(path);
     }
 
     fn temp_path() -> PathBuf {

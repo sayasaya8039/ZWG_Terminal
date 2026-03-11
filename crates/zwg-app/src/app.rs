@@ -530,18 +530,6 @@ impl RootView {
         }
     }
 
-    fn activate_snippet_index(
-        &mut self,
-        store_index: usize,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        match self.snippet_palette.activate_store_index(store_index) {
-            Some(content) => self.dispatch_snippet_to_active_terminal(content, window, cx),
-            None => cx.notify(),
-        }
-    }
-
     fn paste_next_queued_snippet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(content) = self.snippet_palette.dequeue() else {
             return;
@@ -1598,7 +1586,7 @@ impl RootView {
                     .unwrap_or(usize::MAX),
             )
             .map(|(store_index, _)| *store_index);
-        let filtered_items: Vec<(usize, String, String, String)> = self
+        let filtered_items: Vec<(usize, String, String, String, bool)> = self
             .snippet_palette
             .filtered_entries()
             .into_iter()
@@ -1608,6 +1596,7 @@ impl RootView {
                     snippet.title.clone(),
                     snippet.content.clone(),
                     snippet.group.clone(),
+                    snippet.is_favorite,
                 )
             })
             .collect();
@@ -1865,7 +1854,7 @@ impl RootView {
                                 } else {
                                     filtered_items
                                         .iter()
-                                        .map(|(store_index, title, content, group_name)| {
+                                        .map(|(store_index, title, content, group_name, is_favorite)| {
                                             let index = *store_index;
                                             let is_selected = selected_store_index == Some(index);
                                             let preview = content.replace('\n', " ");
@@ -1893,20 +1882,7 @@ impl RootView {
                                                     rgba(0xFFFFFFFF)
                                                 })
                                                 .py(px(12.0))
-                                                .cursor_pointer()
                                                 .hover(|style| style.border_color(rgba(0xD1D5DBFF)))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(
-                                                        move |this,
-                                                              _: &MouseDownEvent,
-                                                              _window,
-                                                              cx| {
-                                                            this.snippet_palette.select_store_index(index);
-                                                            cx.notify();
-                                                        },
-                                                    ),
-                                                )
                                                 .child(
                                                     div()
                                                         .w_full()
@@ -1920,6 +1896,20 @@ impl RootView {
                                                                 .flex()
                                                                 .flex_col()
                                                                 .gap(px(4.0))
+                                                                .cursor_pointer()
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    cx.listener(
+                                                                        move |this,
+                                                                              _: &MouseDownEvent,
+                                                                              _window,
+                                                                              cx| {
+                                                                            this.snippet_palette
+                                                                                .select_store_index(index);
+                                                                            cx.notify();
+                                                                        },
+                                                                    ),
+                                                                )
                                                                 .child(
                                                                     div()
                                                                         .font_family(UI_FONT)
@@ -1970,16 +1960,27 @@ impl RootView {
                                                                 )
                                                                 .child(
                                                                     snippet_list_icon_button(
-                                                                        "ui/copy.svg",
-                                                                        rgba(0x9CA3AFFF),
-                                                                        rgba(0xEFF6FFFF),
+                                                                        if *is_favorite {
+                                                                            "ui/star-filled.svg"
+                                                                        } else {
+                                                                            "ui/star.svg"
+                                                                        },
+                                                                        if *is_favorite {
+                                                                            rgba(0xF59E0BFF)
+                                                                        } else {
+                                                                            rgba(0x9CA3AFFF)
+                                                                        },
+                                                                        rgba(0xFFFBEBFF),
                                                                         cx.listener(
                                                                             move |this,
                                                                                   _: &MouseDownEvent,
-                                                                                  window,
+                                                                                  _window,
                                                                                   cx| {
-                                                                                this.activate_snippet_index(index, window, cx);
+                                                                                let _ = this
+                                                                                    .snippet_palette
+                                                                                    .toggle_favorite(index);
                                                                                 cx.stop_propagation();
+                                                                                cx.notify();
                                                                             },
                                                                         ),
                                                                     ),

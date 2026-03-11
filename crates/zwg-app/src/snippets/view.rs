@@ -405,6 +405,22 @@ impl SnippetPalette {
         }
     }
 
+    pub fn toggle_favorite(&mut self, index: usize) -> Option<bool> {
+        match self.store.toggle_favorite(index) {
+            Ok(is_favorite) => {
+                if is_favorite.is_some() {
+                    self.selected_store_index = Some(index);
+                    self.sync_selection();
+                }
+                is_favorite
+            }
+            Err(error) => {
+                log::warn!("Failed to toggle snippet favorite: {}", error);
+                None
+            }
+        }
+    }
+
     pub fn snippets_for_group(&self, group: Option<&str>) -> Vec<(usize, &Snippet)> {
         self.store.snippets_for_group(group)
     }
@@ -673,5 +689,16 @@ mod tests {
 
         assert_eq!(palette.dequeue(), Some("A".to_string()));
         assert_eq!(palette.dequeue(), Some("B".to_string()));
+    }
+
+    #[test]
+    fn toggling_favorite_updates_selected_item() {
+        let store = SnippetStore::from_items(vec![Snippet::new("One", "A")]);
+        let mut palette = SnippetPalette::new(store);
+
+        assert_eq!(palette.toggle_favorite(0), Some(true));
+        assert!(palette.selected_item().unwrap().is_favorite);
+        assert_eq!(palette.toggle_favorite(0), Some(false));
+        assert!(!palette.selected_item().unwrap().is_favorite);
     }
 }
