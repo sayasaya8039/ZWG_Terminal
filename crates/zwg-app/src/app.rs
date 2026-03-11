@@ -1497,14 +1497,9 @@ impl RootView {
                 cx.notify();
             }
             _ => {
-                if matches!(
-                    self.compute_snippet_ime_target(),
-                    Some(SnippetImeTarget::EditorTitle) | Some(SnippetImeTarget::EditorContent)
-                ) {
-                    return true;
-                }
                 if let Some(text) = &event.keystroke.key_char {
                     if !text.is_empty() && !event.keystroke.modifiers.control {
+                        clear_ime = true;
                         let Some(editor) = self.snippet_editor.as_mut() else {
                             return false;
                         };
