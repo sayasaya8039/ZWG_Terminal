@@ -1345,17 +1345,7 @@ impl RootView {
                 if editor.edit_mode == SnippetGroupEditMode::None {
                     return false;
                 }
-                if let Some(text) = &event.keystroke.key_char {
-                    if !text.is_empty() && !event.keystroke.modifiers.control {
-                        clear_ime = true;
-                        editor.draft_name.push_str(text);
-                        cx.notify();
-                    } else {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
+                return false;
             }
         }
         if clear_ime {
@@ -1497,23 +1487,7 @@ impl RootView {
                 cx.notify();
             }
             _ => {
-                if let Some(text) = &event.keystroke.key_char {
-                    if !text.is_empty() && !event.keystroke.modifiers.control {
-                        clear_ime = true;
-                        let Some(editor) = self.snippet_editor.as_mut() else {
-                            return false;
-                        };
-                        match editor.active_field {
-                            SnippetEditorField::Title => editor.title.push_str(text),
-                            SnippetEditorField::Content => editor.content.push_str(text),
-                        }
-                        cx.notify();
-                    } else {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
+                return false;
             }
         }
 
