@@ -145,7 +145,7 @@ pub use backend::TerminalBackend;
 /// Terminal surface: connects PTY ↔ terminal backend
 pub struct TerminalSurface {
     pub backend: Arc<Mutex<TerminalBackend>>,
-    pub event_rx: Receiver<TerminalEvent>,
+    event_rx: Option<Receiver<TerminalEvent>>,
     event_tx: Sender<TerminalEvent>,
     pty: Option<Arc<PtyPair>>,
     reader_handle: Option<std::thread::JoinHandle<()>>,
@@ -163,12 +163,18 @@ impl TerminalSurface {
                 rows,
                 scrollback_lines,
             ))),
-            event_rx,
+            event_rx: Some(event_rx),
             event_tx,
             pty: None,
             reader_handle: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    pub fn take_event_rx(&mut self) -> Receiver<TerminalEvent> {
+        self.event_rx
+            .take()
+            .expect("terminal event receiver already taken")
     }
 
     /// Spawn a shell and start reading PTY output

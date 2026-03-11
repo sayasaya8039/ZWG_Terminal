@@ -30,11 +30,40 @@ enum TerminalState {
     Failed(String),
 }
 
+#[derive(Clone, Default)]
+struct CachedTerminalRow {
+    text: String,
+    #[cfg(feature = "ghostty_vt")]
+    style_runs: Vec<ghostty_vt::StyleRun>,
+}
+
+struct TerminalSnapshot {
+    rows: Vec<CachedTerminalRow>,
+    cursor_x: u16,
+    cursor_y: u16,
+}
+
+impl TerminalSnapshot {
+    fn new(rows: u16) -> Self {
+        Self {
+            rows: vec![CachedTerminalRow::default(); rows as usize],
+            cursor_x: 0,
+            cursor_y: 0,
+        }
+    }
+
+    fn resize(&mut self, rows: u16) {
+        self.rows
+            .resize(rows as usize, CachedTerminalRow::default());
+    }
+}
+
 /// Terminal pane: GPUI component that wraps a TerminalSurface
 pub struct TerminalPane {
     surface: TerminalSurface,
     focus_handle: FocusHandle,
     state: TerminalState,
+    snapshot: TerminalSnapshot,
     /// Cached cell dimensions
     cell_width: f32,
     cell_height: f32,
@@ -44,12 +73,16 @@ pub struct TerminalPane {
     /// Last known layout size for resize detection
     last_width: f32,
     last_height: f32,
+    #[cfg(not(feature = "ghostty_vt"))]
+    row_generations: Vec<u64>,
 }
 
 impl TerminalPane {
     pub fn new(shell: &str, settings: TerminalSettings, cx: &mut Context<Self>) -> Self {
         let focus_handle = cx.focus_handle();
-        let surface = TerminalSurface::new(settings.cols, settings.rows, settings.scrollback_lines);
+        let mut surface =
+            TerminalSurface::new(settings.cols, settings.rows, settings.scrollback_lines);
+        let event_rx = surface.take_event_rx();
 
         // Phase A: Return immediately with Pending state (<1ms)
         // Phase B: Spawn PTY in background thread
@@ -83,6 +116,7 @@ impl TerminalPane {
                                 log::error!("Failed to attach PTY: {}", e);
                             } else {
                                 pane.state = TerminalState::Running;
+                                pane.refresh_snapshot(true);
                                 log::info!("PTY connected for shell: {}", shell_owned);
                             }
                         }
@@ -97,28 +131,43 @@ impl TerminalPane {
         )
         .detach();
 
-        // Poll for PTY output every 16ms (~60fps)
+        // Wait for PTY output, then coalesce updates to one present every ~16.7ms.
         cx.spawn(
             async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
+                let frame_budget = std::time::Duration::from_micros(16_667);
+                let mut last_presented: Option<std::time::Instant> = None;
+
                 loop {
-                    cx.background_executor()
-                        .timer(std::time::Duration::from_millis(16))
-                        .await;
+                    if event_rx.recv_async().await.is_err() {
+                        break;
+                    }
+                    while event_rx.try_recv().is_ok() {}
 
-                    let should_notify = this
-                        .update(cx, |pane: &mut TerminalPane, _cx| {
-                            let mut dirty = false;
-                            while let Ok(_event) = pane.surface.event_rx.try_recv() {
-                                dirty = true;
-                            }
-                            dirty
-                        })
-                        .unwrap_or(false);
+                    if let Some(last_presented_at) = last_presented {
+                        let elapsed = last_presented_at.elapsed();
+                        if elapsed < frame_budget {
+                            cx.background_executor().timer(frame_budget - elapsed).await;
+                        }
+                    }
 
+                    let should_notify = match this.update(cx, |pane: &mut TerminalPane, _cx| {
+                        pane.refresh_snapshot(false)
+                    }) {
+                        Ok(should_notify) => should_notify,
+                        Err(_) => break,
+                    };
+
+                    if should_notify
+                        && this
+                            .update(cx, |_pane: &mut TerminalPane, cx| {
+                                cx.notify();
+                            })
+                            .is_err()
+                    {
+                        break;
+                    }
                     if should_notify {
-                        let _ = this.update(cx, |_pane: &mut TerminalPane, cx| {
-                            cx.notify();
-                        });
+                        last_presented = Some(std::time::Instant::now());
                     }
                 }
             },
@@ -129,19 +178,22 @@ impl TerminalPane {
             surface,
             focus_handle,
             state: TerminalState::Pending,
+            snapshot: TerminalSnapshot::new(settings.rows),
             cell_width: CELL_WIDTH_ESTIMATE,
             cell_height: CELL_HEIGHT_ESTIMATE,
             term_cols: settings.cols,
             term_rows: settings.rows,
             last_width: 0.0,
             last_height: 0.0,
+            #[cfg(not(feature = "ghostty_vt"))]
+            row_generations: vec![0; settings.rows as usize],
         }
     }
 
     /// Recalculate terminal grid size from pixel dimensions
-    fn handle_resize(&mut self, width_px: f32, height_px: f32) {
+    fn handle_resize(&mut self, width_px: f32, height_px: f32) -> bool {
         if (width_px - self.last_width).abs() < 2.0 && (height_px - self.last_height).abs() < 2.0 {
-            return;
+            return false;
         }
         self.last_width = width_px;
         self.last_height = height_px;
@@ -153,7 +205,105 @@ impl TerminalPane {
             self.term_cols = new_cols;
             self.term_rows = new_rows;
             self.surface.resize(new_cols, new_rows);
+            self.snapshot.resize(new_rows);
+            #[cfg(not(feature = "ghostty_vt"))]
+            self.row_generations.resize(new_rows as usize, 0);
+            return true;
         }
+        false
+    }
+
+    fn refresh_snapshot(&mut self, force_full: bool) -> bool {
+        let mut backend = self.surface.backend.lock();
+        let rows = backend.rows;
+
+        #[cfg(feature = "ghostty_vt")]
+        let (cursor_x, cursor_y) = {
+            let pos = backend.cursor_position();
+            (pos.0.saturating_sub(1), pos.1.saturating_sub(1))
+        };
+
+        #[cfg(not(feature = "ghostty_vt"))]
+        let (cursor_x, cursor_y) = backend.cursor_position();
+
+        let mut changed = self.snapshot.cursor_x != cursor_x || self.snapshot.cursor_y != cursor_y;
+
+        if self.snapshot.rows.len() != rows as usize {
+            self.snapshot.resize(rows);
+            changed = true;
+        }
+
+        #[cfg(feature = "ghostty_vt")]
+        let dirty_rows: Vec<u16> = if force_full {
+            (0..rows).collect()
+        } else {
+            match backend.terminal.take_dirty_viewport_rows(rows) {
+                Ok(dirty_rows) => dirty_rows,
+                Err(err) => {
+                    log::debug!("Failed to collect dirty terminal rows: {}", err);
+                    (0..rows).collect()
+                }
+            }
+        };
+
+        #[cfg(not(feature = "ghostty_vt"))]
+        let dirty_rows: Vec<u16> = if force_full {
+            (0..rows).collect()
+        } else {
+            let mut dirty_rows = Vec::new();
+            for row in 0..rows as usize {
+                let next_generation = backend
+                    .screen
+                    .row_generations
+                    .get(row)
+                    .copied()
+                    .unwrap_or(0);
+                if self.row_generations.get(row).copied().unwrap_or(0) != next_generation {
+                    dirty_rows.push(row as u16);
+                }
+            }
+            dirty_rows
+        };
+
+        for row in dirty_rows {
+            let index = row as usize;
+            if index >= self.snapshot.rows.len() {
+                continue;
+            }
+
+            let cached_row = &mut self.snapshot.rows[index];
+            cached_row.text = backend.row_text(row);
+            #[cfg(feature = "ghostty_vt")]
+            {
+                cached_row.style_runs = backend.row_style_runs(row);
+            }
+            #[cfg(not(feature = "ghostty_vt"))]
+            {
+                self.row_generations[index] = backend
+                    .screen
+                    .row_generations
+                    .get(index)
+                    .copied()
+                    .unwrap_or(0);
+            }
+            changed = true;
+        }
+
+        #[cfg(not(feature = "ghostty_vt"))]
+        if force_full {
+            for row in 0..self.snapshot.rows.len() {
+                self.row_generations[row] = backend
+                    .screen
+                    .row_generations
+                    .get(row)
+                    .copied()
+                    .unwrap_or(0);
+            }
+        }
+
+        self.snapshot.cursor_x = cursor_x;
+        self.snapshot.cursor_y = cursor_y;
+        changed
     }
 
     /// Render the "Connecting..." placeholder
@@ -225,37 +375,23 @@ impl TerminalPane {
         let vp_w: f32 = vp.width.into();
         let vp_h: f32 = vp.height.into();
         let avail_h = (vp_h - WINDOW_CHROME_HEIGHT).max(100.0);
-        self.handle_resize(vp_w, avail_h);
-
-        // Snapshot backend state under brief lock
-        let rows: u16;
-        let cursor_x: u16;
-        let cursor_y: u16;
-        let mut row_texts: Vec<String>;
-        #[cfg(feature = "ghostty_vt")]
-        let row_styles: Vec<Vec<ghostty_vt::StyleRun>>;
-        {
-            let backend = self.surface.backend.lock();
-            rows = backend.rows;
-            let pos = backend.cursor_position();
-            cursor_x = pos.0.saturating_sub(1);
-            cursor_y = pos.1.saturating_sub(1);
-            row_texts = (0..rows).map(|r| backend.row_text(r)).collect();
-            #[cfg(feature = "ghostty_vt")]
-            {
-                row_styles = (0..rows).map(|r| backend.row_style_runs(r)).collect();
-            }
+        if self.handle_resize(vp_w, avail_h) {
+            self.refresh_snapshot(true);
         }
+
+        let rows = self.snapshot.rows.len() as u16;
+        let cursor_x = self.snapshot.cursor_x;
+        let cursor_y = self.snapshot.cursor_y;
 
         let mut line_elements: Vec<AnyElement> = Vec::with_capacity(rows as usize);
 
         for row in 0..rows {
             let ri = row as usize;
-            let text = std::mem::take(&mut row_texts[ri]);
+            let text = self.snapshot.rows[ri].text.clone();
             let is_cursor_row = row == cursor_y;
 
             #[cfg(feature = "ghostty_vt")]
-            let style_runs = &row_styles[ri];
+            let style_runs = &self.snapshot.rows[ri].style_runs;
 
             let row_el = div()
                 .h(px(self.cell_height))
@@ -480,7 +616,6 @@ impl TerminalPane {
 
         if let Some(bytes) = data {
             let _ = self.surface.write_input(&bytes);
-            cx.notify();
         }
     }
 
