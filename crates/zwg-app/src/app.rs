@@ -33,8 +33,8 @@ const WINDOW_STATE_SAVE_INTERVAL_SECS: u64 = 2;
 
 /// Theme preview cards in the settings panel.
 const THEME_PREVIEWS: [(&str, u32); 6] = [
-    ("Dark", WINDOW_BG),
-    ("Light", 0xF5F5F7),
+    ("ダーク", WINDOW_BG),
+    ("ライト", 0xF5F5F7),
     ("Solarized", 0x002B36),
     ("Monokai", 0x272822),
     ("Dracula", 0x282A36),
@@ -77,25 +77,25 @@ enum SettingsCategory {
 impl SettingsCategory {
     fn all() -> &'static [(SettingsCategory, &'static str, &'static str)] {
         &[
-            (Self::General, "General", "◻"),
-            (Self::Appearance, "Appearance", "◌"),
-            (Self::Profiles, "Profiles", ">_"),
-            (Self::Keyboard, "Keyboard", "⌨"),
-            (Self::Notifications, "Notifications", "♪"),
-            (Self::Privacy, "Privacy", "⌂"),
-            (Self::Advanced, "Advanced", "⚙"),
+            (Self::General, "一般", "◻"),
+            (Self::Appearance, "外観", "◌"),
+            (Self::Profiles, "プロファイル", ">_"),
+            (Self::Keyboard, "キーボード", "⌨"),
+            (Self::Notifications, "通知", "♪"),
+            (Self::Privacy, "プライバシー", "⌂"),
+            (Self::Advanced, "詳細", "⚙"),
         ]
     }
 
     fn title(self) -> &'static str {
         match self {
-            Self::General => "General",
-            Self::Appearance => "Appearance",
-            Self::Profiles => "Profiles",
-            Self::Keyboard => "Keyboard",
-            Self::Notifications => "Notifications",
-            Self::Privacy => "Privacy",
-            Self::Advanced => "Advanced",
+            Self::General => "一般",
+            Self::Appearance => "外観",
+            Self::Profiles => "プロファイル",
+            Self::Keyboard => "キーボード",
+            Self::Notifications => "通知",
+            Self::Privacy => "プライバシー",
+            Self::Advanced => "詳細",
         }
     }
 }
@@ -489,10 +489,19 @@ impl RootView {
                         .child(
                             div()
                                 .id("shell-list-scroll")
-                                .flex_1()
-                                .overflow_y_scroll()
+                                .w_full()
+                                .h(px(176.0))
+                                .max_h(px(176.0))
+                                .overflow_scroll()
                                 .scrollbar_width(px(6.0))
-                                .child(div().flex().flex_col().gap(px(2.0)).children(shell_items)),
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(2.0))
+                                        .children(shell_items),
+                                ),
                         )
                         .child(
                             div()
@@ -691,18 +700,18 @@ impl RootView {
             .flex()
             .flex_col()
             .gap(px(24.0))
-            .child(settings_section_heading("Startup"))
+            .child(settings_section_heading("起動"))
             .child(settings_row(
-                "Default Profile",
+                "既定のプロファイル",
                 select_box("PowerShell", 150.0),
             ))
-            .child(settings_row("Launch on Login", toggle(true)))
-            .child(settings_row("Show Tab Bar", toggle(true)))
-            .child(settings_row("Confirm on Close", toggle(true)))
+            .child(settings_row("ログイン時に起動", toggle(true)))
+            .child(settings_row("タブバーを表示", toggle(true)))
+            .child(settings_row("終了前に確認", toggle(true)))
             .child(section_divider())
-            .child(settings_section_heading("Window"))
+            .child(settings_section_heading("ウィンドウ"))
             .child(settings_row(
-                "New Window Size",
+                "新規ウィンドウのサイズ",
                 div()
                     .flex()
                     .items_center()
@@ -718,7 +727,7 @@ impl RootView {
                     .child(input_box("30", 64.0, false)),
             ))
             .child(settings_row(
-                "Scrollback Lines",
+                "スクロールバック行数",
                 input_box("10000", 96.0, false),
             ))
     }
@@ -740,7 +749,7 @@ impl RootView {
             .flex()
             .flex_col()
             .gap(px(24.0))
-            .child(settings_section_heading("Theme"))
+            .child(settings_section_heading("テーマ"))
             .child(
                 div()
                     .flex()
@@ -750,29 +759,29 @@ impl RootView {
                     .child(div().flex().gap(px(12.0)).children(theme_rows_bottom)),
             )
             .child(section_divider())
-            .child(settings_section_heading("Font"))
+            .child(settings_section_heading("フォント"))
             .child(settings_row(
-                "Font Family",
+                "フォントファミリー",
                 select_box("JetBrains Mono", 180.0),
             ))
-            .child(settings_row("Font Size", slider_with_value(0.45, "13px")))
-            .child(section_divider())
-            .child(settings_section_heading("Cursor"))
             .child(settings_row(
-                "Cursor Style",
-                segmented_control(&[("Bar", true), ("Block", false), ("Underline", false)]),
+                "フォントサイズ",
+                slider_with_value(0.45, "13px"),
             ))
-            .child(settings_row("Cursor Blink", toggle(true)))
             .child(section_divider())
-            .child(settings_section_heading("Transparency"))
+            .child(settings_section_heading("カーソル"))
             .child(settings_row(
-                "Window Opacity",
+                "カーソル形状",
+                segmented_control(&[("バー", true), ("ブロック", false), ("下線", false)]),
+            ))
+            .child(settings_row("カーソル点滅", toggle(true)))
+            .child(section_divider())
+            .child(settings_section_heading("透明効果"))
+            .child(settings_row(
+                "ウィンドウ不透明度",
                 slider_with_value(0.95, "95%"),
             ))
-            .child(settings_row(
-                "Background Blur",
-                slider_with_value(0.33, "10px"),
-            ))
+            .child(settings_row("背景ぼかし", slider_with_value(0.33, "10px")))
     }
 
     fn render_profiles_settings(&self) -> Div {
@@ -856,7 +865,7 @@ impl RootView {
                         .font_family(UI_FONT)
                         .text_size(px(10.0))
                         .text_color(rgb(ACCENT))
-                        .child("Default")
+                        .child("既定")
                         .into_any_element()
                 } else {
                     div().into_any_element()
@@ -870,7 +879,7 @@ impl RootView {
             .flex()
             .flex_col()
             .gap(px(10.0))
-            .child(settings_section_heading("Shell Profiles"))
+            .child(settings_section_heading("シェルプロファイル"))
             .children(rows)
             .child(
                 div()
@@ -883,20 +892,20 @@ impl RootView {
                     .text_size(px(13.0))
                     .text_color(rgb(ACCENT))
                     .text_center()
-                    .child("+ Add New Profile"),
+                    .child("+ 新しいプロファイルを追加"),
             )
     }
 
     fn render_keyboard_settings(&self) -> Div {
         let shortcuts = [
-            ("New Tab", "Ctrl Shift T"),
-            ("Close Tab", "Ctrl Shift W"),
-            ("Split Pane Horizontal", "Ctrl Shift D"),
-            ("Split Pane Vertical", "Ctrl Shift E"),
-            ("Close Pane", "Ctrl Shift X"),
-            ("Next Tab", "Ctrl Tab"),
-            ("Previous Tab", "Ctrl Shift Tab"),
-            ("Settings", "Ctrl Comma"),
+            ("新しいタブ", "Ctrl Shift T"),
+            ("タブを閉じる", "Ctrl Shift W"),
+            ("ペインを左右分割", "Ctrl Shift D"),
+            ("ペインを上下分割", "Ctrl Shift E"),
+            ("ペインを閉じる", "Ctrl Shift X"),
+            ("次のタブ", "Ctrl Tab"),
+            ("前のタブ", "Ctrl Shift Tab"),
+            ("設定", "Ctrl Comma"),
         ];
 
         let mut rows: Vec<AnyElement> = Vec::new();
@@ -944,7 +953,7 @@ impl RootView {
             .flex()
             .flex_col()
             .gap(px(8.0))
-            .child(settings_section_heading("Keyboard Shortcuts"))
+            .child(settings_section_heading("キーボードショートカット"))
             .children(rows)
     }
 
@@ -953,10 +962,10 @@ impl RootView {
             .flex()
             .flex_col()
             .gap(px(16.0))
-            .child(settings_section_heading("Notifications"))
-            .child(settings_row("Bell Sound", toggle(false)))
-            .child(settings_row("Visual Bell", toggle(true)))
-            .child(settings_row("Process Completion Alerts", toggle(true)))
+            .child(settings_section_heading("通知"))
+            .child(settings_row("ベル音", toggle(false)))
+            .child(settings_row("ビジュアルベル", toggle(true)))
+            .child(settings_row("処理完了アラート", toggle(true)))
     }
 
     fn render_privacy_settings(&self) -> Div {
@@ -964,10 +973,10 @@ impl RootView {
             .flex()
             .flex_col()
             .gap(px(16.0))
-            .child(settings_section_heading("Privacy & Security"))
-            .child(settings_row("Copy on Select", toggle(true)))
-            .child(settings_row("Clear History on Close", toggle(false)))
-            .child(settings_row("Send Telemetry", toggle(false)))
+            .child(settings_section_heading("プライバシーとセキュリティ"))
+            .child(settings_row("選択時にコピー", toggle(true)))
+            .child(settings_row("終了時に履歴を消去", toggle(false)))
+            .child(settings_row("テレメトリを送信", toggle(false)))
     }
 
     fn render_advanced_settings(&self) -> Div {
@@ -975,14 +984,17 @@ impl RootView {
             .flex()
             .flex_col()
             .gap(px(16.0))
-            .child(settings_section_heading("Advanced Settings"))
-            .child(settings_row("GPU Acceleration", toggle(true)))
-            .child(settings_row("Text Rendering", select_box("LCD", 120.0)))
+            .child(settings_section_heading("詳細設定"))
+            .child(settings_row("GPU アクセラレーション", toggle(true)))
             .child(settings_row(
-                "Word Separators",
+                "テキストレンダリング",
+                select_box("LCD", 120.0),
+            ))
+            .child(settings_row(
+                "単語区切り文字",
                 input_box("./\\()\"'-:,.;<>", 180.0, true),
             ))
-            .child(settings_row("Enable Experimental Features", toggle(false)))
+            .child(settings_row("実験的機能を有効化", toggle(false)))
             .child(section_divider())
             .child(
                 div()
@@ -993,7 +1005,7 @@ impl RootView {
                     .font_family(UI_FONT)
                     .text_size(px(13.0))
                     .text_color(rgb(0xFF453A))
-                    .child("Reset All Settings to Default"),
+                    .child("すべての設定を初期値に戻す"),
             )
     }
 
