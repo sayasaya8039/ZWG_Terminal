@@ -1052,6 +1052,14 @@ impl RootView {
         });
     }
 
+    fn open_new_snippet_group_editor(&mut self) {
+        self.open_snippet_group_editor();
+        if let Some(editor) = self.snippet_group_editor.as_mut() {
+            editor.edit_mode = SnippetGroupEditMode::New;
+            editor.draft_name.clear();
+        }
+    }
+
     fn open_snippet_list_editor(&mut self) {
         self.close_snippet_dialogs();
         self.snippet_palette.hide();
@@ -1308,14 +1316,12 @@ impl RootView {
                 }
             }
             _ => {
-                if editor.edit_mode != SnippetGroupEditMode::None {
+                if editor.edit_mode == SnippetGroupEditMode::None {
                     return false;
                 }
                 if let Some(text) = &event.keystroke.key_char {
-                    if !text.is_empty()
-                        && !event.keystroke.modifiers.control
-                        && editor.edit_mode != SnippetGroupEditMode::None
-                    {
+                    if !text.is_empty() && !event.keystroke.modifiers.control {
+                        clear_ime = true;
                         editor.draft_name.push_str(text);
                         cx.notify();
                     } else {
@@ -3505,13 +3511,26 @@ impl RootView {
                     .items_center()
                     .justify_between()
                     .child(light_section_title("定型文管理"))
-                    .child(light_outline_button(
-                        "新規作成",
-                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                            this.open_snippet_editor(SnippetEditorMode::Add, None, window);
-                            cx.notify();
-                        }),
-                    )),
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(light_outline_button(
+                                "グループ新規作成",
+                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    this.open_new_snippet_group_editor();
+                                    cx.notify();
+                                }),
+                            ))
+                            .child(light_outline_button(
+                                "定型文新規作成",
+                                cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                    this.open_snippet_editor(SnippetEditorMode::Add, None, window);
+                                    cx.notify();
+                                }),
+                            )),
+                    ),
             )
             .children(if items.is_empty() {
                 vec![light_empty_state("定型文が登録されていません").into_any_element()]
