@@ -1,5 +1,7 @@
 //! Application state and root view — multi-tab + split pane support
 
+use std::time::Instant;
+
 use gpui::*;
 use uuid::Uuid;
 
@@ -129,9 +131,16 @@ impl AppState {
 pub struct RootView {
     state: Entity<AppState>,
     show_shell_menu: bool,
-    /// Cached window bounds — saved to disk on Drop
+    /// Cached window bounds — saved to disk periodically and on Drop
     last_bounds: Option<WindowState>,
+    /// Last time window state was saved (for debouncing)
+    last_save_time: Instant,
+    /// Whether bounds have changed since last save
+    bounds_dirty: bool,
 }
+
+/// Minimum interval between window state saves (seconds)
+const WINDOW_STATE_SAVE_INTERVAL_SECS: u64 = 2;
 
 impl RootView {
     pub fn new(state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
@@ -139,6 +148,8 @@ impl RootView {
             state,
             show_shell_menu: false,
             last_bounds: None,
+            last_save_time: Instant::now(),
+            bounds_dirty: false,
         }
     }
 
@@ -222,15 +233,42 @@ impl RootView {
 
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Track window bounds every frame for save-on-drop
+        // Track window bounds and save periodically (debounced)
         let bounds = window.bounds();
-        self.last_bounds = Some(WindowState {
+        let new_state = WindowState {
             x: f32::from(bounds.origin.x),
             y: f32::from(bounds.origin.y),
             width: f32::from(bounds.size.width),
             height: f32::from(bounds.size.height),
             maximized: window.is_maximized(),
-        });
+        };
+
+        // Check if bounds changed
+        if let Some(ref prev) = self.last_bounds {
+            if (prev.x - new_state.x).abs() > 1.0
+                || (prev.y - new_state.y).abs() > 1.0
+                || (prev.width - new_state.width).abs() > 1.0
+                || (prev.height - new_state.height).abs() > 1.0
+            {
+                self.bounds_dirty = true;
+            }
+        } else {
+            self.bounds_dirty = true;
+        }
+        self.last_bounds = Some(new_state);
+
+        // Debounced save: write to disk at most every N seconds when dirty
+        if self.bounds_dirty
+            && self.last_save_time.elapsed().as_secs() >= WINDOW_STATE_SAVE_INTERVAL_SECS
+        {
+            if let Some(ref state) = self.last_bounds {
+                if let Err(e) = state.save() {
+                    log::warn!("Failed to save window state: {}", e);
+                }
+            }
+            self.bounds_dirty = false;
+            self.last_save_time = Instant::now();
+        }
 
         let state = self.state.read(cx);
         let active_tab = state.active_tab;
