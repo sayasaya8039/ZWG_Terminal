@@ -16,6 +16,7 @@ use super::{DEFAULT_BG, DEFAULT_FG, TerminalSettings};
 const FONT_FAMILY: &str = "Consolas";
 const FONT_SIZE: f32 = 13.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.5;
+const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
 pub const CELL_WIDTH_ESTIMATE: f32 = 8.4;
 pub const CELL_HEIGHT_ESTIMATE: f32 = FONT_SIZE * LINE_HEIGHT_FACTOR;
 pub const WINDOW_CHROME_HEIGHT: f32 = 60.0;
@@ -24,6 +25,7 @@ pub const WINDOW_CHROME_HEIGHT: f32 = 60.0;
 const SUBTEXT0: u32 = 0x8E8E93;
 const SURFACE0: u32 = 0x48484A;
 const RED: u32 = 0xFF5F57;
+const SELECTION_BG: u32 = 0x2F6FED;
 
 // ── IME hook: fix Japanese/Chinese/Korean input for gpui 0.2.2 ──────
 //
@@ -115,6 +117,34 @@ fn col_to_char_index(text: &str, target_col: usize) -> usize {
     text.chars().count()
 }
 
+fn normalize_terminal_newlines(text: &str) -> Vec<u8> {
+    let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
+    normalized.into_bytes()
+}
+
+fn quote_path_for_terminal(path: &str) -> String {
+    if path.contains([' ', '\t']) {
+        format!("\"{}\"", path.replace('"', "\\\""))
+    } else {
+        path.to_string()
+    }
+}
+
+fn format_dropped_paths(paths: &ExternalPaths) -> String {
+    paths
+        .paths()
+        .iter()
+        .map(|path| quote_path_for_terminal(&path.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct SelectionPoint {
+    row: u16,
+    col: u16,
+}
+
 /// Terminal connection state — two-phase init pattern
 enum TerminalState {
     /// PTY is being spawned in background
@@ -170,6 +200,10 @@ pub struct TerminalPane {
     /// Last known layout size for resize detection
     last_width: f32,
     last_height: f32,
+    last_bounds: Option<Bounds<Pixels>>,
+    selection_anchor: Option<SelectionPoint>,
+    selection_head: Option<SelectionPoint>,
+    is_selecting: bool,
     /// Keystrokes buffered while PTY is still connecting (Pending state)
     pending_input: Vec<u8>,
     #[cfg(not(feature = "ghostty_vt"))]
@@ -294,6 +328,10 @@ impl TerminalPane {
             term_rows: settings.rows,
             last_width: 0.0,
             last_height: 0.0,
+            last_bounds: None,
+            selection_anchor: None,
+            selection_head: None,
+            is_selecting: false,
             pending_input: Vec::new(),
             #[cfg(not(feature = "ghostty_vt"))]
             row_generations: vec![0; settings.rows as usize],
@@ -424,10 +462,13 @@ impl TerminalPane {
         canvas(
             |_, _, _| (),
             move |bounds, _, window, cx| {
+                let _ = entity.update(cx, |pane, _cx| {
+                    pane.last_bounds = Some(bounds);
+                });
                 // Don't register IME handler when input is suppressed
                 // (e.g., group editor overlay is open)
                 if !suppressed.load(Ordering::Relaxed) {
-                    let handler = ElementInputHandler::new(bounds, entity);
+                    let handler = ElementInputHandler::new(bounds, entity.clone());
                     window.handle_input(&focus, handler, cx);
                 }
             },
@@ -445,6 +486,9 @@ impl TerminalPane {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_drop(cx.listener(Self::on_external_paths_drop))
             .flex()
             .items_center()
             .justify_center()
@@ -525,6 +569,7 @@ impl TerminalPane {
         for row in 0..rows {
             let ri = row as usize;
             let is_cursor_row = row == cursor_y;
+            let selection_overlay = self.selection_overlay(row, cell_w, cell_h);
 
             #[cfg(feature = "ghostty_vt")]
             let style_runs = &self.snapshot.rows[ri].style_runs;
@@ -559,11 +604,12 @@ impl TerminalPane {
                 let cursor_char = chars.get(char_idx).copied().unwrap_or(' ');
                 let cursor_w = if is_fullwidth(cursor_char) { cell_w * 2.0 } else { cell_w };
 
+                let mut row_el = div().h(px(cell_h)).w_full().relative();
+                if let Some(selection_overlay) = selection_overlay {
+                    row_el = row_el.child(selection_overlay);
+                }
                 line_elements.push(
-                    div()
-                        .h(px(cell_h))
-                        .w_full()
-                        .relative()
+                    row_el
                         .child(
                             div()
                                 .h(px(cell_h))
@@ -589,7 +635,7 @@ impl TerminalPane {
                                 .overflow_hidden()
                                 .child(
                                     div()
-                                        .pl(px(4.0))
+                                        .pl(px(HORIZONTAL_TEXT_PADDING))
                                         .text_color(rgba(0x00000000))
                                         .child(before_cursor),
                                 )
@@ -605,9 +651,11 @@ impl TerminalPane {
                 );
             } else if text.is_empty() {
                 // Perf: empty rows — lightweight div, no text child
-                line_elements.push(
-                    div().h(px(cell_h)).w_full().into_any_element(),
-                );
+                let mut row_el = div().h(px(cell_h)).w_full().relative();
+                if let Some(selection_overlay) = selection_overlay {
+                    row_el = row_el.child(selection_overlay);
+                }
+                line_elements.push(row_el.into_any_element());
             } else {
                 // Perf: non-cursor row — use SharedString directly (zero-copy)
                 #[cfg(feature = "ghostty_vt")]
@@ -615,18 +663,19 @@ impl TerminalPane {
                 #[cfg(not(feature = "ghostty_vt"))]
                 let text_child = div().pl(px(4.0)).child(text.clone());
 
-                line_elements.push(
-                    div()
-                        .h(px(cell_h))
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .text_size(px(FONT_SIZE))
-                        .font_family(FONT_FAMILY)
-                        .text_color(rgb(DEFAULT_FG))
-                        .child(text_child)
-                        .into_any_element(),
-                );
+                let mut row_el = div()
+                    .h(px(cell_h))
+                    .w_full()
+                    .relative()
+                    .flex()
+                    .items_center()
+                    .text_size(px(FONT_SIZE))
+                    .font_family(FONT_FAMILY)
+                    .text_color(rgb(DEFAULT_FG));
+                if let Some(selection_overlay) = selection_overlay {
+                    row_el = row_el.child(selection_overlay);
+                }
+                line_elements.push(row_el.child(text_child).into_any_element());
             }
         }
 
@@ -639,6 +688,9 @@ impl TerminalPane {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_drop(cx.listener(Self::on_external_paths_drop))
             .children(line_elements)
             .child(ime)
     }
@@ -724,6 +776,162 @@ impl TerminalPane {
         self.surface.write_input(data)
     }
 
+    fn selection_range(&self) -> Option<(SelectionPoint, SelectionPoint)> {
+        let start = self.selection_anchor?;
+        let end = self.selection_head?;
+        if start == end {
+            None
+        } else if start <= end {
+            Some((start, end))
+        } else {
+            Some((end, start))
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selection_head = None;
+        self.is_selecting = false;
+    }
+
+    fn mouse_to_selection_point(&self, position: Point<Pixels>) -> Option<SelectionPoint> {
+        let bounds = self.last_bounds?;
+        let local = bounds.localize(&position)?;
+        let row_count = self.snapshot.rows.len();
+        if row_count == 0 {
+            return None;
+        }
+
+        let x = f32::from(local.x);
+        let y = f32::from(local.y);
+        let row = (y.max(0.0) / self.cell_height)
+            .floor()
+            .clamp(0.0, (row_count.saturating_sub(1)) as f32) as u16;
+        let col = ((x - HORIZONTAL_TEXT_PADDING).max(0.0) / self.cell_width).floor() as u16;
+
+        Some(SelectionPoint {
+            row,
+            col: col.min(self.term_cols),
+        })
+    }
+
+    fn selection_cols_for_row(&self, row: u16) -> Option<(u16, u16)> {
+        let (start, end) = self.selection_range()?;
+        if row < start.row || row > end.row {
+            return None;
+        }
+
+        let start_col = if row == start.row { start.col } else { 0 };
+        let end_col = if row == end.row {
+            end.col
+        } else {
+            self.term_cols
+        };
+
+        if start_col >= end_col {
+            None
+        } else {
+            Some((start_col, end_col.min(self.term_cols)))
+        }
+    }
+
+    fn selection_overlay(&self, row: u16, cell_w: f32, cell_h: f32) -> Option<Div> {
+        let (start_col, end_col) = self.selection_cols_for_row(row)?;
+        let width_cols = end_col.saturating_sub(start_col);
+        if width_cols == 0 {
+            return None;
+        }
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left(px(HORIZONTAL_TEXT_PADDING + cell_w * start_col as f32))
+                .h(px(cell_h))
+                .w(px(cell_w * width_cols as f32))
+                .bg(rgba(((SELECTION_BG << 8) | 0x55) as u32))
+                .rounded(px(2.0)),
+        )
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        let (start, end) = self.selection_range()?;
+        let mut lines = Vec::new();
+
+        for row in start.row..=end.row {
+            let row_text = self.snapshot.rows.get(row as usize)?.text.as_ref();
+            let text = if start.row == end.row {
+                slice_text_by_cols(row_text, start.col as usize, end.col as usize)
+            } else if row == start.row {
+                slice_text_by_cols(row_text, start.col as usize, usize::MAX)
+            } else if row == end.row {
+                slice_text_by_cols(row_text, 0, end.col as usize)
+            } else {
+                row_text.to_string()
+            };
+            lines.push(text);
+        }
+
+        Some(lines.join("\n"))
+    }
+
+    fn copy_selection_to_clipboard(&self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = self.selected_text() else {
+            return false;
+        };
+        if text.is_empty() {
+            return false;
+        }
+
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
+        true
+    }
+
+    fn write_terminal_bytes(&mut self, data: &[u8]) {
+        match self.state {
+            TerminalState::Running => {
+                let _ = self.surface.write_input(data);
+            }
+            TerminalState::Pending => self.pending_input.extend_from_slice(data),
+            TerminalState::Failed(_) => {}
+        }
+    }
+
+    fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(text) = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+        else {
+            return false;
+        };
+
+        let bytes = normalize_terminal_newlines(&text);
+        if bytes.is_empty() {
+            return false;
+        }
+
+        self.clear_selection();
+        self.write_terminal_bytes(&bytes);
+        true
+    }
+
+    fn on_external_paths_drop(
+        &mut self,
+        paths: &ExternalPaths,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let text = format_dropped_paths(paths);
+        if text.is_empty() {
+            return;
+        }
+
+        window.focus(&self.focus_handle);
+        self.clear_selection();
+        self.write_terminal_bytes(text.as_bytes());
+        cx.notify();
+    }
+
     /// Convert a keystroke to bytes for PTY. Returns None if the key should not
     /// be sent (e.g., modifier-only keys).
     fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
@@ -802,6 +1010,20 @@ impl TerminalPane {
             return;
         }
 
+        let key: &str = event.keystroke.key.as_ref();
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control && !modifiers.alt && key == "c" && self.copy_selection_to_clipboard(cx) {
+            cx.stop_propagation();
+            return;
+        }
+        if modifiers.control && !modifiers.alt && key == "v" {
+            if self.paste_from_clipboard(cx) {
+                cx.notify();
+            }
+            cx.stop_propagation();
+            return;
+        }
+
         let bytes = match Self::keystroke_to_bytes(&event.keystroke) {
             Some(b) => b,
             None => {
@@ -814,11 +1036,13 @@ impl TerminalPane {
 
         match self.state {
             TerminalState::Running => {
+                self.clear_selection();
                 let _ = self.surface.write_input(&bytes);
                 cx.stop_propagation();
             }
             TerminalState::Pending => {
                 // Buffer input while PTY is connecting
+                self.clear_selection();
                 self.pending_input.extend_from_slice(&bytes);
                 cx.stop_propagation();
             }
@@ -828,11 +1052,56 @@ impl TerminalPane {
 
     fn on_mouse_down(
         &mut self,
-        _event: &MouseDownEvent,
+        event: &MouseDownEvent,
         window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        if self.input_suppressed.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(point) = self.mouse_to_selection_point(event.position) {
+            self.selection_anchor = Some(point);
+            self.selection_head = Some(point);
+            self.is_selecting = true;
+            cx.notify();
+        } else {
+            self.clear_selection();
+        }
+    }
+
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_selecting || event.pressed_button != Some(MouseButton::Left) {
+            return;
+        }
+        if let Some(point) = self.mouse_to_selection_point(event.position) {
+            self.selection_head = Some(point);
+            cx.notify();
+        }
+    }
+
+    fn on_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_selecting {
+            return;
+        }
+        if let Some(point) = self.mouse_to_selection_point(event.position) {
+            self.selection_head = Some(point);
+        }
+        self.is_selecting = false;
+        if self.selection_range().is_none() {
+            self.clear_selection();
+        }
+        cx.notify();
     }
 }
 
@@ -916,3 +1185,17 @@ impl EntityInputHandler for TerminalPane {
 }
 
 impl EventEmitter<()> for TerminalPane {}
+
+fn slice_text_by_cols(text: &str, start_col: usize, end_col: usize) -> String {
+    let start_idx = col_to_char_index(text, start_col);
+    let end_idx = if end_col == usize::MAX {
+        text.chars().count()
+    } else {
+        col_to_char_index(text, end_col)
+    };
+
+    text.chars()
+        .skip(start_idx)
+        .take(end_idx.saturating_sub(start_idx))
+        .collect()
+}
