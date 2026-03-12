@@ -694,8 +694,12 @@ impl TerminalPane {
                         strikethrough: None,
                     }];
 
+                    // force_width=None: let each glyph use its natural advance.
+                    // Consolas is monospace so glyphs align naturally.
+                    // force_width breaks when font fallback produces
+                    // extra glyphs for block/box-drawing characters.
                     let shaped = text_system.shape_line(
-                        text.clone(), font_size, &runs, Some(px(cell_w)),
+                        text.clone(), font_size, &runs, None,
                     );
                     // Skip paint_background — backgrounds painted via paint_quad above
                     let _ = shaped.paint(origin, line_height_px, window, cx);
