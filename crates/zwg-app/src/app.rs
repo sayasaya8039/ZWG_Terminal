@@ -1366,7 +1366,15 @@ impl RootView {
                 if editor.edit_mode == SnippetGroupEditMode::None {
                     return false;
                 }
-                return false;
+                // Handle character input for group name editing
+                if let Some(text) = &event.keystroke.key_char {
+                    if !text.is_empty() && !event.keystroke.modifiers.control {
+                        editor.draft_name.push_str(text);
+                        cx.notify();
+                    }
+                } else {
+                    // Consume event to prevent it reaching terminal, but no action
+                }
             }
         }
         if clear_ime {
