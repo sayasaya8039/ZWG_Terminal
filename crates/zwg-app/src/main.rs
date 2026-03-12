@@ -121,8 +121,13 @@ fn main() {
             ..Default::default()
         };
 
-        cx.open_window(opts, |_window, cx| {
-            cx.new(|cx| app::RootView::new(state.clone(), cx))
+        cx.open_window(opts, |window, cx| {
+            let root = cx.new(|cx| app::RootView::new(state.clone(), cx));
+            // Auto-focus terminal so the user can type immediately at startup
+            root.update(cx, |view, cx| {
+                view.focus_active_terminal(window, cx);
+            });
+            root
         })
         .ok();
     });

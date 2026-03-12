@@ -965,7 +965,7 @@ impl RootView {
         });
     }
 
-    fn focus_active_terminal(&self, window: &mut Window, cx: &Context<Self>) {
+    pub fn focus_active_terminal(&self, window: &mut Window, cx: &Context<Self>) {
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             if let Some(terminal) = split.read(cx).focused_terminal() {
