@@ -7,6 +7,7 @@ use std::sync::{
 };
 
 use gpui::*;
+use gpui::ElementInputHandler;
 
 use super::pty::{ConPtyConfig, spawn_pty};
 use super::surface::TerminalSurface;
@@ -381,8 +382,23 @@ impl TerminalPane {
         changed
     }
 
+    /// Create a canvas element that registers the IME input handler during paint
+    fn ime_canvas(&self, cx: &mut Context<Self>) -> Canvas<()> {
+        let entity = cx.entity().clone();
+        let focus = self.focus_handle.clone();
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, window, cx| {
+                let handler = ElementInputHandler::new(bounds, entity);
+                window.handle_input(&focus, handler, cx);
+            },
+        )
+        .size_full()
+    }
+
     /// Render the "Connecting..." placeholder (with key buffering support)
     fn render_pending(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let ime = self.ime_canvas(cx);
         div()
             .id("terminal-pane")
             .size_full()
@@ -412,6 +428,7 @@ impl TerminalPane {
                             .child("Initializing ConPTY"),
                     ),
             )
+            .child(ime)
     }
 
     /// Render the error state
@@ -551,6 +568,7 @@ impl TerminalPane {
             }
         }
 
+        let ime = self.ime_canvas(cx);
         div()
             .id("terminal-pane")
             .size_full()
@@ -560,6 +578,7 @@ impl TerminalPane {
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .children(line_elements)
+            .child(ime)
     }
 }
 
