@@ -767,7 +767,9 @@ impl RootView {
             state.add_tab(cx);
             cx.notify();
         });
-        self.focus_active_terminal(window, cx);
+        cx.defer_in(window, |this, window, cx| {
+            this.focus_active_terminal(window, cx);
+        });
     }
 
     fn on_close_tab(&mut self, _action: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -775,7 +777,9 @@ impl RootView {
             state.close_tab(state.active_tab);
             cx.notify();
         });
-        self.focus_active_terminal(window, cx);
+        cx.defer_in(window, |this, window, cx| {
+            this.focus_active_terminal(window, cx);
+        });
     }
 
     fn on_split_right(
@@ -788,7 +792,9 @@ impl RootView {
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.split(SplitDirection::Horizontal, cx));
         }
-        self.focus_active_terminal(window, cx);
+        cx.defer_in(window, |this, window, cx| {
+            this.focus_active_terminal(window, cx);
+        });
     }
 
     fn on_split_down(&mut self, _action: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
@@ -796,7 +802,9 @@ impl RootView {
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.split(SplitDirection::Vertical, cx));
         }
-        self.focus_active_terminal(window, cx);
+        cx.defer_in(window, |this, window, cx| {
+            this.focus_active_terminal(window, cx);
+        });
     }
 
     fn on_close_pane(&mut self, _action: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
@@ -806,7 +814,9 @@ impl RootView {
                 sc.close_focused(cx);
             });
         }
-        self.focus_active_terminal(window, cx);
+        cx.defer_in(window, |this, window, cx| {
+            this.focus_active_terminal(window, cx);
+        });
     }
 
     fn on_focus_next(&mut self, _action: &FocusNext, window: &mut Window, cx: &mut Context<Self>) {
@@ -814,7 +824,9 @@ impl RootView {
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.focus_direction(FocusDir::Next, cx));
         }
-        self.focus_active_terminal(window, cx);
+        cx.defer_in(window, |this, window, cx| {
+            this.focus_active_terminal(window, cx);
+        });
     }
 
     fn on_focus_prev(&mut self, _action: &FocusPrev, window: &mut Window, cx: &mut Context<Self>) {
@@ -822,7 +834,9 @@ impl RootView {
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.focus_direction(FocusDir::Prev, cx));
         }
-        self.focus_active_terminal(window, cx);
+        cx.defer_in(window, |this, window, cx| {
+            this.focus_active_terminal(window, cx);
+        });
     }
 
     fn on_toggle_snippet_palette(
@@ -1912,7 +1926,9 @@ impl RootView {
                                 state.add_tab_with_shell(&command, cx);
                                 cx.notify();
                             });
-                            this.focus_active_terminal(window, cx);
+                            cx.defer_in(window, |this, window, cx| {
+                                this.focus_active_terminal(window, cx);
+                            });
                         }),
                     )
                     .child(
@@ -5716,8 +5732,10 @@ impl Render for RootView {
                         this.state.update(cx, |state, _cx| {
                             state.active_tab = idx;
                         });
-                        this.focus_active_terminal(window, cx);
                         cx.notify();
+                        cx.defer_in(window, |this, window, cx| {
+                            this.focus_active_terminal(window, cx);
+                        });
                     }),
                 );
 
