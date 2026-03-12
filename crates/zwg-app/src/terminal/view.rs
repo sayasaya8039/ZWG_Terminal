@@ -47,11 +47,11 @@ fn measure_cell_dimensions(cx: &App) -> (f32, f32) {
     let cell_height = ascent + descent.abs();
     let cell_height = if cell_height > FONT_SIZE { cell_height } else { CELL_HEIGHT_FALLBACK };
 
-    // cell_width: use exact advance — ceil would widen cells and create gaps
-    // in block/pixel-art characters (▄█▀).
-    // cell_height: ceil to integer pixels — prevents sub-pixel gaps between
-    // rows where box-drawing characters (│) must connect seamlessly.
-    (cell_width, cell_height.ceil())
+    // Use exact measured values — NO rounding.
+    // cell_height = ascent + descent means paint_line's padding_top = 0,
+    // so glyphs fill the full cell height with no gaps between rows.
+    // Backgrounds are painted manually via paint_quad at grid positions.
+    (cell_width, cell_height)
 }
 
 // Figma-aligned chrome colors for status text
@@ -640,12 +640,44 @@ impl TerminalPane {
 
                 // 2) Paint text rows
                 for (row_idx, row_data) in rows_snapshot.iter().enumerate() {
+                    let row_y = row_idx as f32 * cell_h;
+
+                    // 2a) Paint cell backgrounds at exact grid positions.
+                    // Manual paint_quad avoids sub-pixel tiling gaps that
+                    // shaped.paint_background() produces at fractional coords.
+                    #[cfg(feature = "ghostty_vt")]
+                    for srun in &row_data.style_runs {
+                        let bg_val = ((srun.bg.r as u32) << 16)
+                            | ((srun.bg.g as u32) << 8)
+                            | (srun.bg.b as u32);
+                        if bg_val != DEFAULT_BG {
+                            let sc = srun.start_col.saturating_sub(1) as f32;
+                            let ec = srun.end_col as f32;
+                            if ec > sc {
+                                window.paint_quad(fill(
+                                    Bounds::new(
+                                        point(
+                                            bounds.origin.x
+                                                + px(HORIZONTAL_TEXT_PADDING + sc * cell_w),
+                                            bounds.origin.y + px(row_y),
+                                        ),
+                                        size(px((ec - sc) * cell_w), line_height_px),
+                                    ),
+                                    Hsla::from(rgb(bg_val)),
+                                ));
+                            }
+                        }
+                    }
+
+                    // 2b) Shape and paint text glyphs
                     let text = &row_data.text;
-                    if text.is_empty() { continue; }
+                    if text.is_empty() {
+                        continue;
+                    }
 
                     let origin = point(
                         bounds.origin.x + px(HORIZONTAL_TEXT_PADDING),
-                        bounds.origin.y + px(row_idx as f32 * cell_h),
+                        bounds.origin.y + px(row_y),
                     );
 
                     #[cfg(feature = "ghostty_vt")]
@@ -662,12 +694,10 @@ impl TerminalPane {
                         strikethrough: None,
                     }];
 
-                    // force_width = cell_w: snap every glyph to exact grid columns
-                    // (prevents box-drawing chars from drifting)
                     let shaped = text_system.shape_line(
                         text.clone(), font_size, &runs, Some(px(cell_w)),
                     );
-                    let _ = shaped.paint_background(origin, line_height_px, window, cx);
+                    // Skip paint_background — backgrounds painted via paint_quad above
                     let _ = shaped.paint(origin, line_height_px, window, cx);
                 }
 
@@ -781,7 +811,7 @@ fn build_canvas_text_runs(
             len: byte_end - byte_start,
             font: run_font,
             color: fg_color,
-            background_color: if bg_val != DEFAULT_BG { Some(Hsla::from(rgb(bg_val))) } else { None },
+            background_color: None, // painted manually via paint_quad at grid positions
             underline: if run.flags & 0x04 != 0 {
                 Some(UnderlineStyle { thickness: px(1.0), color: Some(fg_color), wavy: false })
             } else { None },
