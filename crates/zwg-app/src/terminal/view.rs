@@ -82,6 +82,39 @@ fn install_ime_hook() {
 #[cfg(not(target_os = "windows"))]
 fn install_ime_hook() {}
 
+/// Check if a character is fullwidth (CJK, etc.) — occupies 2 terminal columns
+fn is_fullwidth(ch: char) -> bool {
+    matches!(ch,
+        '\u{1100}'..='\u{115F}'    // Hangul Jamo
+        | '\u{2E80}'..='\u{303E}'  // CJK Radicals, Kangxi, Ideographic
+        | '\u{3040}'..='\u{33BF}'  // Hiragana, Katakana, Bopomofo, CJK Compat
+        | '\u{3400}'..='\u{4DBF}'  // CJK Unified Ideographs Extension A
+        | '\u{4E00}'..='\u{9FFF}'  // CJK Unified Ideographs
+        | '\u{A000}'..='\u{A4CF}'  // Yi
+        | '\u{AC00}'..='\u{D7AF}'  // Hangul Syllables
+        | '\u{F900}'..='\u{FAFF}'  // CJK Compatibility Ideographs
+        | '\u{FE30}'..='\u{FE6F}'  // CJK Compatibility Forms
+        | '\u{FF01}'..='\u{FF60}'  // Fullwidth Forms
+        | '\u{FFE0}'..='\u{FFE6}'  // Fullwidth Signs
+        | '\u{20000}'..='\u{2A6DF}' // CJK Extension B
+        | '\u{2A700}'..='\u{2CEAF}' // CJK Extensions C-F
+        | '\u{2CEB0}'..='\u{2EBEF}' // CJK Extension F
+        | '\u{30000}'..='\u{3134F}' // CJK Extension G
+    )
+}
+
+/// Convert terminal column position to character index in a string
+fn col_to_char_index(text: &str, target_col: usize) -> usize {
+    let mut col = 0;
+    for (i, ch) in text.chars().enumerate() {
+        if col >= target_col {
+            return i;
+        }
+        col += if is_fullwidth(ch) { 2 } else { 1 };
+    }
+    text.chars().count()
+}
+
 /// Terminal connection state — two-phase init pattern
 enum TerminalState {
     /// PTY is being spawned in background
@@ -498,18 +531,24 @@ impl TerminalPane {
 
             if is_cursor_row {
                 let cursor_col = cursor_x as usize;
+                // Pad text so cursor position is always within the string
                 let display_text = if text.is_empty() {
                     " ".repeat(cursor_col + 1)
                 } else {
                     let mut t = text;
-                    while t.chars().count() <= cursor_col {
+                    // Pad using column width, not character count
+                    let mut col_count = t.chars().map(|c| if is_fullwidth(c) { 2 } else { 1 }).sum::<usize>();
+                    while col_count <= cursor_col {
                         t.push(' ');
+                        col_count += 1;
                     }
                     t
                 };
 
+                // Convert column position to character index for cursor placement
+                let char_idx = col_to_char_index(&display_text, cursor_col);
                 let chars: Vec<char> = display_text.chars().collect();
-                let before_cursor: String = chars[..cursor_col.min(chars.len())].iter().collect();
+                let before_cursor: String = chars[..char_idx.min(chars.len())].iter().collect();
 
                 #[cfg(feature = "ghostty_vt")]
                 let text_child = render_styled_text(&display_text, style_runs, self.cell_width);
@@ -517,6 +556,14 @@ impl TerminalPane {
                 let text_child = div().pl(px(4.0)).child(display_text);
 
                 let row_with_text = row_el.child(text_child);
+
+                // Cursor block width: 2 cells for fullwidth (CJK) chars, 1 cell otherwise
+                let cursor_char = chars.get(char_idx).copied().unwrap_or(' ');
+                let cursor_w = if is_fullwidth(cursor_char) {
+                    self.cell_width * 2.0
+                } else {
+                    self.cell_width
+                };
 
                 let cursor_overlay = div()
                     .absolute()
@@ -537,7 +584,7 @@ impl TerminalPane {
                     )
                     .child(
                         div()
-                            .w(px(self.cell_width))
+                            .w(px(cursor_w))
                             .h(px(self.cell_height))
                             .bg(rgba(0xF5F5F780))
                             .rounded(px(1.0)),
