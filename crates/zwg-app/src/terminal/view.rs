@@ -47,7 +47,9 @@ fn measure_cell_dimensions(cx: &App) -> (f32, f32) {
     let cell_height = ascent + descent.abs();
     let cell_height = if cell_height > FONT_SIZE { cell_height } else { CELL_HEIGHT_FALLBACK };
 
-    (cell_width, cell_height)
+    // Snap to integer pixels — prevents sub-pixel gaps between rows and
+    // accumulated horizontal drift. Essential for box-drawing characters.
+    (cell_width.ceil(), cell_height.ceil())
 }
 
 // Figma-aligned chrome colors for status text
@@ -658,8 +660,10 @@ impl TerminalPane {
                         strikethrough: None,
                     }];
 
+                    // force_width = cell_w: snap every glyph to exact grid columns
+                    // (prevents box-drawing chars from drifting)
                     let shaped = text_system.shape_line(
-                        text.clone(), font_size, &runs, None,
+                        text.clone(), font_size, &runs, Some(px(cell_w)),
                     );
                     let _ = shaped.paint_background(origin, line_height_px, window, cx);
                     let _ = shaped.paint(origin, line_height_px, window, cx);
