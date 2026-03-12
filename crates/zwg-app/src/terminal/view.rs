@@ -15,29 +15,39 @@ use super::{DEFAULT_BG, DEFAULT_FG, TerminalSettings};
 
 const FONT_FAMILY: &str = "Consolas";
 const FONT_SIZE: f32 = 13.0;
-const LINE_HEIGHT_FACTOR: f32 = 1.5;
 const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
-/// Fallback only — replaced at runtime by measured font advance width
+/// Fallback values — replaced at runtime by measured font metrics
 const CELL_WIDTH_FALLBACK: f32 = 8.4;
+const CELL_HEIGHT_FALLBACK: f32 = 19.5;
 pub const CELL_WIDTH_ESTIMATE: f32 = CELL_WIDTH_FALLBACK;
-pub const CELL_HEIGHT_ESTIMATE: f32 = FONT_SIZE * LINE_HEIGHT_FACTOR;
+pub const CELL_HEIGHT_ESTIMATE: f32 = CELL_HEIGHT_FALLBACK;
 pub const WINDOW_CHROME_HEIGHT: f32 = 60.0;
 
-/// Measure the actual monospace cell width from the font at FONT_SIZE.
-/// Falls back to CELL_WIDTH_FALLBACK if measurement fails.
-fn measure_cell_width(cx: &App) -> f32 {
+/// Measure the actual monospace cell dimensions from the font at FONT_SIZE.
+/// Cell width = advance width of 'M'.
+/// Cell height = ascent + descent (no extra leading — required for
+/// box-drawing characters │─┌┐└┘ to connect between adjacent rows).
+fn measure_cell_dimensions(cx: &App) -> (f32, f32) {
     let text_system = cx.text_system();
     let font_desc = font(FONT_FAMILY);
     let font_id = text_system.resolve_font(&font_desc);
     let font_size = px(FONT_SIZE);
-    // Use advance of 'M' — monospace fonts have uniform advance for all ASCII
-    text_system
+
+    let cell_width = text_system
         .advance(font_id, font_size, 'M')
         .map(|size| {
             let w: f32 = size.width.into();
             if w > 1.0 { w } else { CELL_WIDTH_FALLBACK }
         })
-        .unwrap_or(CELL_WIDTH_FALLBACK)
+        .unwrap_or(CELL_WIDTH_FALLBACK);
+
+    let ascent: f32 = text_system.ascent(font_id, font_size).into();
+    let descent: f32 = text_system.descent(font_id, font_size).into();
+    // descent may be negative (OpenType convention) — use abs
+    let cell_height = ascent + descent.abs();
+    let cell_height = if cell_height > FONT_SIZE { cell_height } else { CELL_HEIGHT_FALLBACK };
+
+    (cell_width, cell_height)
 }
 
 // Figma-aligned chrome colors for status text
@@ -335,11 +345,10 @@ impl TerminalPane {
         )
         .detach();
 
-        let measured_cell_width = measure_cell_width(cx);
+        let (measured_w, measured_h) = measure_cell_dimensions(cx);
         log::info!(
-            "Terminal cell width: measured={:.2}px (fallback={:.1}px)",
-            measured_cell_width,
-            CELL_WIDTH_FALLBACK,
+            "Terminal cell: width={:.2}px height={:.2}px (fallback w={:.1} h={:.1})",
+            measured_w, measured_h, CELL_WIDTH_FALLBACK, CELL_HEIGHT_FALLBACK,
         );
 
         Self {
@@ -348,8 +357,8 @@ impl TerminalPane {
             input_suppressed: settings.input_suppressed.clone(),
             state: TerminalState::Pending,
             snapshot: TerminalSnapshot::new(settings.rows),
-            cell_width: measured_cell_width,
-            cell_height: CELL_HEIGHT_ESTIMATE,
+            cell_width: measured_w,
+            cell_height: measured_h,
             term_cols: settings.cols,
             term_rows: settings.rows,
             last_width: 0.0,
@@ -640,9 +649,8 @@ impl TerminalPane {
                             div()
                                 .h(px(cell_h))
                                 .w_full()
-                                .flex()
-                                .items_center()
                                 .text_size(px(FONT_SIZE))
+                                .line_height(px(cell_h))
                                 .font_family(FONT_FAMILY)
                                 .text_color(rgb(DEFAULT_FG))
                                 .child(text_child),
@@ -654,9 +662,8 @@ impl TerminalPane {
                                 .left_0()
                                 .h(px(cell_h))
                                 .w_full()
-                                .flex()
-                                .items_center()
                                 .text_size(px(FONT_SIZE))
+                                .line_height(px(cell_h))
                                 .font_family(FONT_FAMILY)
                                 .overflow_hidden()
                                 .child(
@@ -693,9 +700,8 @@ impl TerminalPane {
                     .h(px(cell_h))
                     .w_full()
                     .relative()
-                    .flex()
-                    .items_center()
                     .text_size(px(FONT_SIZE))
+                    .line_height(px(cell_h))
                     .font_family(FONT_FAMILY)
                     .text_color(rgb(DEFAULT_FG));
                 if let Some(selection_overlay) = selection_overlay {
