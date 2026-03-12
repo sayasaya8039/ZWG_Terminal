@@ -419,11 +419,16 @@ impl TerminalPane {
     fn ime_canvas(&self, cx: &mut Context<Self>) -> Canvas<()> {
         let entity = cx.entity().clone();
         let focus = self.focus_handle.clone();
+        let suppressed = self.input_suppressed.clone();
         canvas(
             |_, _, _| (),
             move |bounds, _, window, cx| {
-                let handler = ElementInputHandler::new(bounds, entity);
-                window.handle_input(&focus, handler, cx);
+                // Don't register IME handler when input is suppressed
+                // (e.g., group editor overlay is open)
+                if !suppressed.load(Ordering::Relaxed) {
+                    let handler = ElementInputHandler::new(bounds, entity);
+                    window.handle_input(&focus, handler, cx);
+                }
             },
         )
         .size_full()

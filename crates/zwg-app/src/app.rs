@@ -2569,8 +2569,9 @@ impl RootView {
                                                 .child("グループ追加")
                                                 .on_mouse_down(
                                                     MouseButton::Left,
-                                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                                         this.open_new_snippet_group_editor();
+                                                        this.focus_handle.focus(window);
                                                         cx.notify();
                                                     }),
                                                 ),
@@ -3578,8 +3579,9 @@ impl RootView {
                             .gap(px(8.0))
                             .child(light_outline_button(
                                 "グループ新規作成",
-                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                     this.open_new_snippet_group_editor();
+                                    this.focus_handle.focus(window);
                                     cx.notify();
                                 }),
                             ))
@@ -3936,9 +3938,10 @@ impl RootView {
                         .child(snippet_menu_item(
                             "定型文グループの編集(G)",
                             false,
-                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                 this.show_snippet_context_menu = false;
                                 this.open_snippet_group_editor();
+                                this.focus_handle.focus(window);
                                 cx.notify();
                             }),
                         ))
