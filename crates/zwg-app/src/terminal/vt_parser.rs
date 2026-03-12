@@ -270,7 +270,11 @@ impl VtParser {
 
     fn execute_csi(&mut self, cmd: u8, screen: &mut ScreenBuffer) {
         let p = |i: usize, def: u16| -> u16 {
-            self.params.get(i).copied().filter(|&v| v > 0).unwrap_or(def)
+            self.params
+                .get(i)
+                .copied()
+                .filter(|&v| v > 0)
+                .unwrap_or(def)
         };
 
         match cmd {
@@ -452,11 +456,11 @@ impl VtParser {
                             screen.current_bg = super::DEFAULT_BG;
                             screen.current_flags = 0;
                         }
-                        1 => screen.current_flags |= 0x01,  // Bold
-                        3 => screen.current_flags |= 0x02,  // Italic
-                        4 => screen.current_flags |= 0x04,  // Underline
-                        7 => screen.current_flags |= 0x08,  // Inverse
-                        9 => screen.current_flags |= 0x10,  // Strikethrough
+                        1 => screen.current_flags |= 0x01, // Bold
+                        3 => screen.current_flags |= 0x02, // Italic
+                        4 => screen.current_flags |= 0x04, // Underline
+                        7 => screen.current_flags |= 0x08, // Inverse
+                        9 => screen.current_flags |= 0x10, // Strikethrough
                         22 => screen.current_flags &= !0x01, // Not bold
                         23 => screen.current_flags &= !0x02, // Not italic
                         24 => screen.current_flags &= !0x04, // Not underline
@@ -526,7 +530,9 @@ impl VtParser {
                         // Switch to alt screen
                         let saved = std::mem::replace(
                             &mut screen.viewport,
-                            (0..screen.rows).map(|_| super::TerminalLine::new()).collect(),
+                            (0..screen.rows)
+                                .map(|_| super::TerminalLine::new())
+                                .collect(),
                         );
                         screen.alternate_screen = Some(saved);
                         screen.cursor.x = 0;
@@ -637,7 +643,10 @@ impl VtParser {
         // M6: decode OSC buffer as UTF-8 (lossy)
         let osc_str = String::from_utf8_lossy(&self.osc_buf);
         // OSC 0 or 2: Set window title
-        if let Some(rest) = osc_str.strip_prefix("0;").or_else(|| osc_str.strip_prefix("2;")) {
+        if let Some(rest) = osc_str
+            .strip_prefix("0;")
+            .or_else(|| osc_str.strip_prefix("2;"))
+        {
             screen.title = Some(rest.to_string());
         }
     }

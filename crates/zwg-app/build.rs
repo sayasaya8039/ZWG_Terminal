@@ -11,7 +11,10 @@ fn main() {
     {
         let mut res = winresource::WindowsResource::new();
         res.set("ProductName", "ZWG Terminal");
-        res.set("FileDescription", "ZWG Terminal — Ghostty-powered Windows terminal");
+        res.set(
+            "FileDescription",
+            "ZWG Terminal — Ghostty-powered Windows terminal",
+        );
         res.set("LegalCopyright", "MIT License");
         res.set_icon("../../resources/icons/zwg.ico");
 

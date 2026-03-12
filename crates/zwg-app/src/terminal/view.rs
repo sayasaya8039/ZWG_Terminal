@@ -1,5 +1,6 @@
 //! Terminal pane — GPUI view that renders the terminal and handles input
 
+use std::ops::Range;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
@@ -22,6 +23,63 @@ pub const WINDOW_CHROME_HEIGHT: f32 = 60.0;
 const SUBTEXT0: u32 = 0x8E8E93;
 const SURFACE0: u32 = 0x48484A;
 const RED: u32 = 0xFF5F57;
+
+// ── IME hook: fix Japanese/Chinese/Korean input for gpui 0.2.2 ──────
+//
+// gpui 0.2.2 calls TranslateMessage inside WndProc with a synthetic MSG
+// (time=0), preventing IME from generating WM_IME_COMPOSITION.
+// WH_GETMESSAGE hook intercepts VK_PROCESSKEY and calls TranslateMessage
+// with the real MSG so IME composition works correctly.
+
+static IME_VK_PROCESSKEY: AtomicBool = AtomicBool::new(false);
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn ime_getmessage_hook_proc(
+    code: i32,
+    wparam: windows::Win32::Foundation::WPARAM,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        CallNextHookEx, TranslateMessage, MSG, WM_KEYDOWN, PM_REMOVE,
+    };
+
+    if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
+        unsafe {
+            let msg = &*(lparam.0 as *const MSG);
+            if msg.message == WM_KEYDOWN {
+                let vk = (msg.wParam.0 & 0xFFFF) as u16;
+                if vk == 0xE5 {
+                    // VK_PROCESSKEY: IME is processing this key.
+                    // Call TranslateMessage with the ORIGINAL MSG (real time/pt).
+                    let _ = TranslateMessage(msg as *const MSG);
+                    IME_VK_PROCESSKEY.store(true, Ordering::Release);
+                }
+            }
+        }
+    }
+    unsafe { CallNextHookEx(None, code, wparam, lparam) }
+}
+
+#[cfg(target_os = "windows")]
+fn install_ime_hook() {
+    use std::sync::Once;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_GETMESSAGE};
+    use windows::Win32::System::Threading::GetCurrentThreadId;
+
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        unsafe {
+            let thread_id = GetCurrentThreadId();
+            match SetWindowsHookExW(WH_GETMESSAGE, Some(ime_getmessage_hook_proc), None, thread_id) {
+                Ok(_) => log::info!("IME GetMessage hook installed"),
+                Err(e) => log::error!("Failed to install IME hook: {}", e),
+            }
+        }
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
+fn install_ime_hook() {}
 
 /// Terminal connection state — two-phase init pattern
 enum TerminalState {
@@ -77,12 +135,17 @@ pub struct TerminalPane {
     /// Last known layout size for resize detection
     last_width: f32,
     last_height: f32,
+    /// Keystrokes buffered while PTY is still connecting (Pending state)
+    pending_input: Vec<u8>,
     #[cfg(not(feature = "ghostty_vt"))]
     row_generations: Vec<u64>,
 }
 
 impl TerminalPane {
     pub fn new(shell: &str, settings: TerminalSettings, cx: &mut Context<Self>) -> Self {
+        // Install IME hook once per process
+        install_ime_hook();
+
         let focus_handle = cx.focus_handle();
         let mut surface =
             TerminalSurface::new(settings.cols, settings.rows, settings.scrollback_lines);
@@ -122,6 +185,12 @@ impl TerminalPane {
                                 pane.state = TerminalState::Running;
                                 pane.refresh_snapshot(true);
                                 log::info!("PTY connected for shell: {}", shell_owned);
+
+                                // Flush any keystrokes buffered during Pending state
+                                if !pane.pending_input.is_empty() {
+                                    let buf = std::mem::take(&mut pane.pending_input);
+                                    let _ = pane.surface.write_input(&buf);
+                                }
                             }
                         }
                         Err(e) => {
@@ -190,6 +259,7 @@ impl TerminalPane {
             term_rows: settings.rows,
             last_width: 0.0,
             last_height: 0.0,
+            pending_input: Vec::new(),
             #[cfg(not(feature = "ghostty_vt"))]
             row_generations: vec![0; settings.rows as usize],
         }
@@ -311,13 +381,15 @@ impl TerminalPane {
         changed
     }
 
-    /// Render the "Connecting..." placeholder
-    fn render_pending(&self) -> impl IntoElement {
+    /// Render the "Connecting..." placeholder (with key buffering support)
+    fn render_pending(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("terminal-pane")
             .size_full()
             .bg(rgb(DEFAULT_BG))
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .flex()
             .items_center()
             .justify_center()
@@ -494,7 +566,7 @@ impl TerminalPane {
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         match &self.state {
-            TerminalState::Pending => self.render_pending().into_any_element(),
+            TerminalState::Pending => self.render_pending(cx).into_any_element(),
             TerminalState::Failed(err) => {
                 let err = err.clone();
                 self.render_failed(&err).into_any_element()
@@ -571,35 +643,39 @@ impl TerminalPane {
         self.surface.write_input(data)
     }
 
-    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, _cx: &mut Context<Self>) {
-        if self.input_suppressed.load(Ordering::Relaxed) {
-            return;
+    /// Convert a keystroke to bytes for PTY. Returns None if the key should not
+    /// be sent (e.g., modifier-only keys).
+    fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
+        // IME VK_PROCESSKEY: hook already called TranslateMessage.
+        // Text will arrive via EntityInputHandler::replace_text_in_range.
+        if IME_VK_PROCESSKEY.compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+            return None;
         }
 
-        // Ignore input while PTY is not connected
-        if !matches!(self.state, TerminalState::Running) {
-            return;
-        }
-
-        let ks = &event.keystroke;
-
-        // Try key_char first (IME / composed input)
+        // key_char: actual character from ToUnicode (shift/layout aware)
         if let Some(ref kc) = ks.key_char {
             if !kc.is_empty() {
-                let _ = self.surface.write_input(kc.as_bytes());
-                return;
+                if ks.modifiers.alt {
+                    let mut buf = vec![0x1b];
+                    buf.extend_from_slice(kc.as_bytes());
+                    return Some(buf);
+                }
+                return Some(kc.as_bytes().to_vec());
             }
         }
 
-        // Handle special keys
         let key_str = ks.key.as_ref();
         let ctrl = ks.modifiers.control;
+        let alt = ks.modifiers.alt;
 
-        let data: Option<Vec<u8>> = match key_str {
+        match key_str {
             "enter" => Some(b"\r".to_vec()),
             "backspace" => Some(vec![0x7f]),
             "tab" => Some(b"\t".to_vec()),
             "escape" => Some(vec![0x1b]),
+            "space" => {
+                if alt { Some(vec![0x1b, b' ']) } else { Some(vec![b' ']) }
+            }
             "up" => Some(b"\x1b[A".to_vec()),
             "down" => Some(b"\x1b[B".to_vec()),
             "right" => Some(b"\x1b[C".to_vec()),
@@ -610,6 +686,18 @@ impl TerminalPane {
             "pagedown" => Some(b"\x1b[6~".to_vec()),
             "delete" => Some(b"\x1b[3~".to_vec()),
             "insert" => Some(b"\x1b[2~".to_vec()),
+            "f1" => Some(b"\x1bOP".to_vec()),
+            "f2" => Some(b"\x1bOQ".to_vec()),
+            "f3" => Some(b"\x1bOR".to_vec()),
+            "f4" => Some(b"\x1bOS".to_vec()),
+            "f5" => Some(b"\x1b[15~".to_vec()),
+            "f6" => Some(b"\x1b[17~".to_vec()),
+            "f7" => Some(b"\x1b[18~".to_vec()),
+            "f8" => Some(b"\x1b[19~".to_vec()),
+            "f9" => Some(b"\x1b[20~".to_vec()),
+            "f10" => Some(b"\x1b[21~".to_vec()),
+            "f11" => Some(b"\x1b[23~".to_vec()),
+            "f12" => Some(b"\x1b[24~".to_vec()),
             _ => {
                 if ctrl && key_str.len() == 1 {
                     let ch = key_str.chars().next().unwrap();
@@ -619,15 +707,41 @@ impl TerminalPane {
                         None
                     }
                 } else if key_str.len() == 1 {
+                    // Fallback: single-char key without key_char (shouldn't normally happen)
                     Some(key_str.as_bytes().to_vec())
                 } else {
                     None
                 }
             }
+        }
+    }
+
+    fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.input_suppressed.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let bytes = match Self::keystroke_to_bytes(&event.keystroke) {
+            Some(b) => b,
+            None => {
+                // IME key or unknown — stop propagation to prevent gpui's
+                // broken TranslateMessage from interfering with IME.
+                cx.stop_propagation();
+                return;
+            }
         };
 
-        if let Some(bytes) = data {
-            let _ = self.surface.write_input(&bytes);
+        match self.state {
+            TerminalState::Running => {
+                let _ = self.surface.write_input(&bytes);
+                cx.stop_propagation();
+            }
+            TerminalState::Pending => {
+                // Buffer input while PTY is connecting
+                self.pending_input.extend_from_slice(&bytes);
+                cx.stop_propagation();
+            }
+            TerminalState::Failed(_) => {}
         }
     }
 
@@ -644,6 +758,79 @@ impl TerminalPane {
 impl Focusable for TerminalPane {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
+    }
+}
+
+// ── IME support via EntityInputHandler ──────────────────────────────
+// Receives committed text from Windows IME (Japanese/Chinese/Korean)
+// via gpui's WM_IME_COMPOSITION → replace_text_in_range path.
+
+impl EntityInputHandler for TerminalPane {
+    fn text_for_range(
+        &mut self, _range: Range<usize>, _adjusted: &mut Option<Range<usize>>,
+        _window: &mut Window, _cx: &mut Context<Self>,
+    ) -> Option<String> {
+        None
+    }
+
+    fn selected_text_range(
+        &mut self, _ignore: bool, _window: &mut Window, _cx: &mut Context<Self>,
+    ) -> Option<UTF16Selection> {
+        Some(UTF16Selection { range: 0..0, reversed: false })
+    }
+
+    fn marked_text_range(
+        &self, _window: &mut Window, _cx: &mut Context<Self>,
+    ) -> Option<Range<usize>> {
+        None
+    }
+
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+
+    /// Committed text from IME → send to PTY
+    fn replace_text_in_range(
+        &mut self, _range: Option<Range<usize>>, text: &str,
+        _window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        match self.state {
+            TerminalState::Running => {
+                let _ = self.surface.write_input(text.as_bytes());
+            }
+            TerminalState::Pending => {
+                self.pending_input.extend_from_slice(text.as_bytes());
+            }
+            TerminalState::Failed(_) => {}
+        }
+        cx.notify();
+    }
+
+    /// Preedit (composing) text from IME — currently not displayed,
+    /// but accepting the call prevents gpui from dropping the composition.
+    fn replace_and_mark_text_in_range(
+        &mut self, _range: Option<Range<usize>>, _new_text: &str,
+        _new_selected: Option<Range<usize>>, _window: &mut Window, cx: &mut Context<Self>,
+    ) {
+        cx.notify();
+    }
+
+    fn bounds_for_range(
+        &mut self, _range: Range<usize>, element_bounds: Bounds<Pixels>,
+        _window: &mut Window, _cx: &mut Context<Self>,
+    ) -> Option<Bounds<Pixels>> {
+        // Position IME candidate window near cursor
+        Some(Bounds::new(
+            element_bounds.origin,
+            size(px(self.cell_width), px(self.cell_height)),
+        ))
+    }
+
+    fn character_index_for_point(
+        &mut self, _point: Point<Pixels>, _window: &mut Window, _cx: &mut Context<Self>,
+    ) -> Option<usize> {
+        None
     }
 }
 
