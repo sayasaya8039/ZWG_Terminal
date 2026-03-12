@@ -17,6 +17,7 @@ use super::{DEFAULT_BG, DEFAULT_FG, TerminalSettings};
 const FONT_FAMILY: &str = "Consolas";
 const FONT_SIZE: f32 = 13.0;
 const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
+const BRAILLE_BLANK: char = '\u{2800}';
 /// Fallback values — replaced at runtime by measured font metrics
 const CELL_WIDTH_FALLBACK: f32 = 8.4;
 const CELL_HEIGHT_FALLBACK: f32 = 19.5;
@@ -50,8 +51,7 @@ fn measure_cell_dimensions(cx: &App) -> (f32, f32) {
             let w: f32 = size.width.into();
             if w > 1.0 { w } else { CELL_WIDTH_FALLBACK }
         })
-        .fold(CELL_WIDTH_FALLBACK, f32::max)
-        .ceil();
+        .fold(CELL_WIDTH_FALLBACK, f32::max);
 
     let ascent: f32 = text_system.ascent(font_id, font_size).into();
     let descent: f32 = text_system.descent(font_id, font_size).into();
@@ -130,7 +130,27 @@ fn install_ime_hook() {
 fn install_ime_hook() {}
 
 fn char_cell_width(ch: char) -> usize {
-    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
+    UnicodeWidthChar::width(ch).unwrap_or(0)
+}
+
+fn is_geometric_block_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2580}'
+            | '\u{2584}'
+            | '\u{2588}'
+            | '\u{258C}'
+            | '\u{2590}'
+            | '\u{2591}'
+            | '\u{2592}'
+            | '\u{2593}'
+    )
+}
+
+fn sanitize_text_for_shaping(text: &str) -> String {
+    text.chars()
+        .map(|ch| if is_geometric_block_char(ch) { BRAILLE_BLANK } else { ch })
+        .collect()
 }
 
 /// Convert terminal column position to character index in a string
@@ -674,6 +694,7 @@ impl TerminalPane {
                     if text.is_empty() {
                         continue;
                     }
+                    let shaped_text = sanitize_text_for_shaping(text);
 
                     let origin = point(
                         bounds.origin.x + px(HORIZONTAL_TEXT_PADDING),
@@ -682,11 +703,14 @@ impl TerminalPane {
 
                     #[cfg(feature = "ghostty_vt")]
                     let runs = build_canvas_text_runs(
-                        text, &row_data.style_runs, &font_desc, default_fg,
+                        &shaped_text,
+                        &row_data.style_runs,
+                        &font_desc,
+                        default_fg,
                     );
                     #[cfg(not(feature = "ghostty_vt"))]
                     let runs = vec![TextRun {
-                        len: text.len(),
+                        len: shaped_text.len(),
                         font: font_desc.clone(),
                         color: default_fg,
                         background_color: None,
@@ -694,11 +718,18 @@ impl TerminalPane {
                         strikethrough: None,
                     }];
 
-                    // force_width keeps box-drawing chars grid-aligned.
-                    // Block elements (█▀▄) distorted by force_width are
-                    // overdrawn with exact paint_quad below.
+                    // Wide graphemes such as emoji need their natural advance.
+                    // Single-cell rows still benefit from force_width grid alignment.
+                    let force_width = if text.chars().all(|ch| char_cell_width(ch) <= 1) {
+                        Some(px(cell_w))
+                    } else {
+                        None
+                    };
                     let shaped = text_system.shape_line(
-                        text.clone(), font_size, &runs, Some(px(cell_w)),
+                        SharedString::from(shaped_text),
+                        font_size,
+                        &runs,
+                        force_width,
                     );
                     let _ = shaped.paint(origin, line_height_px, window, cx);
 
@@ -710,11 +741,7 @@ impl TerminalPane {
                         let mut col: usize = 0;
                         for ch in text.chars() {
                             let w = char_cell_width(ch);
-                            if matches!(ch,
-                                '\u{2580}' | '\u{2584}' | '\u{2588}'
-                                | '\u{258C}' | '\u{2590}'
-                                | '\u{2591}' | '\u{2592}' | '\u{2593}'
-                            ) {
+                            if is_geometric_block_char(ch) {
                                 let col_1 = (col + 1) as u16;
                                 let fg = row_data.style_runs.iter()
                                     .find(|r| r.start_col <= col_1 && col_1 <= r.end_col)
@@ -861,7 +888,6 @@ fn build_canvas_text_runs(
         }];
     }
 
-    let chars: Vec<char> = text.chars().collect();
     let char_byte_offsets: Vec<usize> = text
         .char_indices()
         .map(|(i, _)| i)
@@ -872,12 +898,14 @@ fn build_canvas_text_runs(
     let mut covered_to_byte: usize = 0;
 
     for run in style_runs {
-        let start_char = run.start_col.saturating_sub(1) as usize;
-        let end_char = (run.end_col as usize).min(chars.len());
-        if start_char >= chars.len() || start_char >= end_char { continue; }
+        let start_char = col_to_char_index(text, run.start_col.saturating_sub(1) as usize);
+        let end_char = col_to_char_index(text, run.end_col as usize);
+        if start_char >= char_byte_offsets.len().saturating_sub(1) || start_char >= end_char {
+            continue;
+        }
 
         let byte_start = char_byte_offsets[start_char];
-        let byte_end = char_byte_offsets[end_char];
+        let byte_end = char_byte_offsets[end_char.min(char_byte_offsets.len() - 1)];
 
         // Skip if overlapping or already past
         if byte_start < covered_to_byte { continue; }
@@ -1427,5 +1455,41 @@ mod tests {
         assert_eq!(char_cell_width('a'), 1);
         assert_eq!(char_cell_width('あ'), 2);
         assert_eq!(char_cell_width('🔥'), 2);
+        assert_eq!(char_cell_width('\u{FE0F}'), 0);
+    }
+
+    #[::core::prelude::v1::test]
+    fn sanitize_text_for_shaping_replaces_block_glyphs_only() {
+        let shaped = sanitize_text_for_shaping("A█▀B");
+        assert_eq!(shaped, format!("A{BRAILLE_BLANK}{BRAILLE_BLANK}B"));
+    }
+
+    #[::core::prelude::v1::test]
+    fn build_canvas_text_runs_maps_style_runs_by_terminal_columns() {
+        let runs = build_canvas_text_runs(
+            "🔥a",
+            &[ghostty_vt::StyleRun {
+                start_col: 1,
+                end_col: 2,
+                fg: ghostty_vt::Rgb {
+                    r: 0xFF,
+                    g: 0x88,
+                    b: 0x33,
+                },
+                bg: ghostty_vt::Rgb {
+                    r: 0x11,
+                    g: 0x22,
+                    b: 0x33,
+                },
+                flags: GHOSTTY_FLAG_UNDERLINE,
+            }],
+            &font(FONT_FAMILY),
+            Hsla::from(rgb(DEFAULT_FG)),
+        );
+
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].len, "🔥".len());
+        assert!(runs[0].underline.is_some());
+        assert!(runs[1].underline.is_none());
     }
 }
