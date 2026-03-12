@@ -23,6 +23,15 @@ pub const CELL_WIDTH_ESTIMATE: f32 = CELL_WIDTH_FALLBACK;
 pub const CELL_HEIGHT_ESTIMATE: f32 = CELL_HEIGHT_FALLBACK;
 pub const WINDOW_CHROME_HEIGHT: f32 = 60.0;
 
+#[cfg(feature = "ghostty_vt")]
+const GHOSTTY_FLAG_BOLD: u8 = 0x02;
+#[cfg(feature = "ghostty_vt")]
+const GHOSTTY_FLAG_ITALIC: u8 = 0x04;
+#[cfg(feature = "ghostty_vt")]
+const GHOSTTY_FLAG_UNDERLINE: u8 = 0x08;
+#[cfg(feature = "ghostty_vt")]
+const GHOSTTY_FLAG_STRIKETHROUGH: u8 = 0x40;
+
 /// Measure the actual monospace cell dimensions from the font at FONT_SIZE.
 /// Cell width = advance width of 'M'.
 /// Cell height = ascent + descent (no extra leading — required for
@@ -895,22 +904,25 @@ fn build_canvas_text_runs(
         }
 
         let fg_val = ((run.fg.r as u32) << 16) | ((run.fg.g as u32) << 8) | (run.fg.b as u32);
-        let bg_val = ((run.bg.r as u32) << 16) | ((run.bg.g as u32) << 8) | (run.bg.b as u32);
         let fg_color = Hsla::from(rgb(fg_val));
 
         let mut run_font = font_desc.clone();
-        if run.flags & 0x01 != 0 { run_font.weight = FontWeight::BOLD; }
-        if run.flags & 0x02 != 0 { run_font.style = FontStyle::Italic; }
+        if run.flags & GHOSTTY_FLAG_BOLD != 0 {
+            run_font.weight = FontWeight::BOLD;
+        }
+        if run.flags & GHOSTTY_FLAG_ITALIC != 0 {
+            run_font.style = FontStyle::Italic;
+        }
 
         runs.push(TextRun {
             len: byte_end - byte_start,
             font: run_font,
             color: fg_color,
             background_color: None, // painted manually via paint_quad at grid positions
-            underline: if run.flags & 0x04 != 0 {
+            underline: if run.flags & GHOSTTY_FLAG_UNDERLINE != 0 {
                 Some(UnderlineStyle { thickness: px(1.0), color: Some(fg_color), wavy: false })
             } else { None },
-            strikethrough: if run.flags & 0x10 != 0 {
+            strikethrough: if run.flags & GHOSTTY_FLAG_STRIKETHROUGH != 0 {
                 Some(StrikethroughStyle { thickness: px(1.0), color: Some(fg_color) })
             } else { None },
         });
@@ -1359,4 +1371,63 @@ fn slice_text_by_cols(text: &str, start_col: usize, end_col: usize) -> String {
         .skip(start_idx)
         .take(end_idx.saturating_sub(start_idx))
         .collect()
+}
+
+#[cfg(all(test, feature = "ghostty_vt"))]
+mod tests {
+    use super::*;
+
+    fn sample_style_run(flags: u8) -> ghostty_vt::StyleRun {
+        ghostty_vt::StyleRun {
+            start_col: 1,
+            end_col: 3,
+            fg: ghostty_vt::Rgb {
+                r: 0xFF,
+                g: 0x88,
+                b: 0x33,
+            },
+            bg: ghostty_vt::Rgb {
+                r: 0x11,
+                g: 0x22,
+                b: 0x33,
+            },
+            flags,
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn build_canvas_text_runs_uses_ghostty_flag_layout() {
+        let runs = build_canvas_text_runs(
+            "abc",
+            &[sample_style_run(
+                GHOSTTY_FLAG_BOLD
+                    | GHOSTTY_FLAG_ITALIC
+                    | GHOSTTY_FLAG_UNDERLINE
+                    | GHOSTTY_FLAG_STRIKETHROUGH,
+            )],
+            &font(FONT_FAMILY),
+            Hsla::from(rgb(DEFAULT_FG)),
+        );
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].font.weight, FontWeight::BOLD);
+        assert_eq!(runs[0].font.style, FontStyle::Italic);
+        assert!(runs[0].underline.is_some());
+        assert!(runs[0].strikethrough.is_some());
+    }
+
+    #[::core::prelude::v1::test]
+    fn build_canvas_text_runs_does_not_confuse_italic_with_underline() {
+        let runs = build_canvas_text_runs(
+            "abc",
+            &[sample_style_run(GHOSTTY_FLAG_ITALIC)],
+            &font(FONT_FAMILY),
+            Hsla::from(rgb(DEFAULT_FG)),
+        );
+
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].font.style, FontStyle::Italic);
+        assert!(runs[0].underline.is_none());
+        assert!(runs[0].strikethrough.is_none());
+    }
 }
