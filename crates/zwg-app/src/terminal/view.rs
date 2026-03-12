@@ -694,15 +694,106 @@ impl TerminalPane {
                         strikethrough: None,
                     }];
 
-                    // force_width=None: let each glyph use its natural advance.
-                    // Consolas is monospace so glyphs align naturally.
-                    // force_width breaks when font fallback produces
-                    // extra glyphs for block/box-drawing characters.
+                    // force_width keeps box-drawing chars grid-aligned.
+                    // Block elements (█▀▄) distorted by force_width are
+                    // overdrawn with exact paint_quad below.
                     let shaped = text_system.shape_line(
-                        text.clone(), font_size, &runs, None,
+                        text.clone(), font_size, &runs, Some(px(cell_w)),
                     );
-                    // Skip paint_background — backgrounds painted via paint_quad above
                     let _ = shaped.paint(origin, line_height_px, window, cx);
+
+                    // 2c) Overdraw block element chars with geometric quads.
+                    // Font glyphs for ▀▄█ have anti-aliased edges that create
+                    // visible gaps; paint_quad gives pixel-perfect rectangles.
+                    #[cfg(feature = "ghostty_vt")]
+                    {
+                        let mut col: usize = 0;
+                        for ch in text.chars() {
+                            let w = if is_fullwidth(ch) { 2 } else { 1 };
+                            if matches!(ch,
+                                '\u{2580}' | '\u{2584}' | '\u{2588}'
+                                | '\u{258C}' | '\u{2590}'
+                                | '\u{2591}' | '\u{2592}' | '\u{2593}'
+                            ) {
+                                let col_1 = (col + 1) as u16;
+                                let fg = row_data.style_runs.iter()
+                                    .find(|r| r.start_col <= col_1 && col_1 <= r.end_col)
+                                    .map(|r| {
+                                        let v = ((r.fg.r as u32) << 16)
+                                            | ((r.fg.g as u32) << 8)
+                                            | (r.fg.b as u32);
+                                        Hsla::from(rgb(v))
+                                    })
+                                    .unwrap_or(default_fg);
+                                let x = bounds.origin.x
+                                    + px(HORIZONTAL_TEXT_PADDING + col as f32 * cell_w);
+                                let y = bounds.origin.y + px(row_y);
+                                let cw = px(cell_w * w as f32);
+                                match ch {
+                                    '\u{2588}' => {
+                                        window.paint_quad(fill(
+                                            Bounds::new(point(x, y), size(cw, line_height_px)),
+                                            fg,
+                                        ));
+                                    }
+                                    '\u{2580}' => {
+                                        let h = px(cell_h * 0.5);
+                                        window.paint_quad(fill(
+                                            Bounds::new(point(x, y), size(cw, h)),
+                                            fg,
+                                        ));
+                                    }
+                                    '\u{2584}' => {
+                                        let h = px(cell_h * 0.5);
+                                        window.paint_quad(fill(
+                                            Bounds::new(
+                                                point(x, y + h),
+                                                size(cw, h),
+                                            ),
+                                            fg,
+                                        ));
+                                    }
+                                    '\u{258C}' => {
+                                        let hw = px(cell_w * 0.5);
+                                        window.paint_quad(fill(
+                                            Bounds::new(point(x, y), size(hw, line_height_px)),
+                                            fg,
+                                        ));
+                                    }
+                                    '\u{2590}' => {
+                                        let hw = px(cell_w * 0.5);
+                                        window.paint_quad(fill(
+                                            Bounds::new(
+                                                point(x + hw, y),
+                                                size(hw, line_height_px),
+                                            ),
+                                            fg,
+                                        ));
+                                    }
+                                    '\u{2591}' => {
+                                        window.paint_quad(fill(
+                                            Bounds::new(point(x, y), size(cw, line_height_px)),
+                                            fg.opacity(0.25),
+                                        ));
+                                    }
+                                    '\u{2592}' => {
+                                        window.paint_quad(fill(
+                                            Bounds::new(point(x, y), size(cw, line_height_px)),
+                                            fg.opacity(0.5),
+                                        ));
+                                    }
+                                    '\u{2593}' => {
+                                        window.paint_quad(fill(
+                                            Bounds::new(point(x, y), size(cw, line_height_px)),
+                                            fg.opacity(0.75),
+                                        ));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            col += w;
+                        }
+                    }
                 }
 
                 // 3) Paint cursor
