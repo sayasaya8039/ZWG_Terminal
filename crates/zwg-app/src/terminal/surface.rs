@@ -219,28 +219,13 @@ impl TerminalSurface {
                         }
                     };
 
-                    // Perf: drain loop — coalesce rapid successive writes into
-                    // a single backend.feed() + render notification.
-                    let mut total = n;
-                    loop {
-                        if total >= buf.len() - 4096 {
-                            break; // buffer nearly full
-                        }
-                        let extra = {
-                            let mut guard = reader.lock();
-                            match guard.read(&mut buf[total..]) {
-                                Ok(0) => break,
-                                Ok(extra_n) => extra_n,
-                                Err(_) => break,
-                            }
-                        };
-                        total += extra;
-                    }
-
-                    // Feed entire batch into terminal backend under single lock
+                    // Deliver the first burst immediately. Blocking for an
+                    // additional read here stalls interactive shells at startup
+                    // because the prompt often arrives as a short burst followed
+                    // by idle time.
                     {
                         let mut b = backend.lock();
-                        b.feed(&buf[..total]);
+                        b.feed(&buf[..n]);
                     }
 
                     // H1: try_send on bounded channel — drop if full (already notified)
@@ -302,25 +287,9 @@ impl TerminalSurface {
                             Err(_) => break,
                         }
                     };
-                    // Perf: drain coalescing
-                    let mut total = n;
-                    loop {
-                        if total >= buf.len() - 4096 {
-                            break;
-                        }
-                        let extra = {
-                            let mut guard = reader.lock();
-                            match guard.read(&mut buf[total..]) {
-                                Ok(0) => break,
-                                Ok(extra_n) => extra_n,
-                                Err(_) => break,
-                            }
-                        };
-                        total += extra;
-                    }
                     {
                         let mut b = backend.lock();
-                        b.feed(&buf[..total]);
+                        b.feed(&buf[..n]);
                     }
                     let _ = event_tx.try_send(TerminalEvent::OutputReceived);
                 }
