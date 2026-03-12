@@ -8,6 +8,7 @@ use std::sync::{
 
 use gpui::*;
 use gpui::ElementInputHandler;
+use unicode_width::UnicodeWidthChar;
 
 use super::pty::{ConPtyConfig, spawn_pty};
 use super::surface::TerminalSurface;
@@ -33,7 +34,7 @@ const GHOSTTY_FLAG_UNDERLINE: u8 = 0x08;
 const GHOSTTY_FLAG_STRIKETHROUGH: u8 = 0x40;
 
 /// Measure the actual monospace cell dimensions from the font at FONT_SIZE.
-/// Cell width = advance width of 'M'.
+/// Cell width = max advance width of representative monospace glyphs.
 /// Cell height = ascent + descent (no extra leading — required for
 /// box-drawing characters │─┌┐└┘ to connect between adjacent rows).
 fn measure_cell_dimensions(cx: &App) -> (f32, f32) {
@@ -42,13 +43,15 @@ fn measure_cell_dimensions(cx: &App) -> (f32, f32) {
     let font_id = text_system.resolve_font(&font_desc);
     let font_size = px(FONT_SIZE);
 
-    let cell_width = text_system
-        .advance(font_id, font_size, 'M')
+    let cell_width = ['M', 'W', '@', '0', '█', '│']
+        .into_iter()
+        .filter_map(|ch| text_system.advance(font_id, font_size, ch).ok())
         .map(|size| {
             let w: f32 = size.width.into();
             if w > 1.0 { w } else { CELL_WIDTH_FALLBACK }
         })
-        .unwrap_or(CELL_WIDTH_FALLBACK);
+        .fold(CELL_WIDTH_FALLBACK, f32::max)
+        .ceil();
 
     let ascent: f32 = text_system.ascent(font_id, font_size).into();
     let descent: f32 = text_system.descent(font_id, font_size).into();
@@ -126,25 +129,8 @@ fn install_ime_hook() {
 #[cfg(not(target_os = "windows"))]
 fn install_ime_hook() {}
 
-/// Check if a character is fullwidth (CJK, etc.) — occupies 2 terminal columns
-fn is_fullwidth(ch: char) -> bool {
-    matches!(ch,
-        '\u{1100}'..='\u{115F}'    // Hangul Jamo
-        | '\u{2E80}'..='\u{303E}'  // CJK Radicals, Kangxi, Ideographic
-        | '\u{3040}'..='\u{33BF}'  // Hiragana, Katakana, Bopomofo, CJK Compat
-        | '\u{3400}'..='\u{4DBF}'  // CJK Unified Ideographs Extension A
-        | '\u{4E00}'..='\u{9FFF}'  // CJK Unified Ideographs
-        | '\u{A000}'..='\u{A4CF}'  // Yi
-        | '\u{AC00}'..='\u{D7AF}'  // Hangul Syllables
-        | '\u{F900}'..='\u{FAFF}'  // CJK Compatibility Ideographs
-        | '\u{FE30}'..='\u{FE6F}'  // CJK Compatibility Forms
-        | '\u{FF01}'..='\u{FF60}'  // Fullwidth Forms
-        | '\u{FFE0}'..='\u{FFE6}'  // Fullwidth Signs
-        | '\u{20000}'..='\u{2A6DF}' // CJK Extension B
-        | '\u{2A700}'..='\u{2CEAF}' // CJK Extensions C-F
-        | '\u{2CEB0}'..='\u{2EBEF}' // CJK Extension F
-        | '\u{30000}'..='\u{3134F}' // CJK Extension G
-    )
+fn char_cell_width(ch: char) -> usize {
+    UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
 }
 
 /// Convert terminal column position to character index in a string
@@ -154,7 +140,7 @@ fn col_to_char_index(text: &str, target_col: usize) -> usize {
         if col >= target_col {
             return i;
         }
-        col += if is_fullwidth(ch) { 2 } else { 1 };
+        col += char_cell_width(ch);
     }
     text.chars().count()
 }
@@ -394,7 +380,8 @@ impl TerminalPane {
         self.last_width = width_px;
         self.last_height = height_px;
 
-        let new_cols = (width_px / self.cell_width).floor().max(1.0) as u16;
+        let content_width = (width_px - HORIZONTAL_TEXT_PADDING * 2.0).max(self.cell_width);
+        let new_cols = (content_width / self.cell_width).floor().max(1.0) as u16;
         let new_rows = (height_px / self.cell_height).floor().max(1.0) as u16;
 
         if new_cols != self.term_cols || new_rows != self.term_rows {
@@ -627,6 +614,10 @@ impl TerminalPane {
                 let line_height_px = px(cell_h);
                 let default_fg = Hsla::from(rgb(DEFAULT_FG));
 
+                // Clear the canvas every frame so shorter updates do not leave
+                // stale glyphs behind on rows that previously contained longer text.
+                window.paint_quad(fill(bounds, Hsla::from(rgb(DEFAULT_BG))));
+
                 // 1) Paint selection background (behind text)
                 if let Some((sel_start, sel_end)) = selection {
                     let max_row = sel_end.row.min(num_rows.saturating_sub(1) as u16);
@@ -718,7 +709,7 @@ impl TerminalPane {
                     {
                         let mut col: usize = 0;
                         for ch in text.chars() {
-                            let w = if is_fullwidth(ch) { 2 } else { 1 };
+                            let w = char_cell_width(ch);
                             if matches!(ch,
                                 '\u{2580}' | '\u{2584}' | '\u{2588}'
                                 | '\u{258C}' | '\u{2590}'
@@ -1429,5 +1420,12 @@ mod tests {
         assert_eq!(runs[0].font.style, FontStyle::Italic);
         assert!(runs[0].underline.is_none());
         assert!(runs[0].strikethrough.is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn char_cell_width_treats_wide_glyphs_as_two_cells() {
+        assert_eq!(char_cell_width('a'), 1);
+        assert_eq!(char_cell_width('あ'), 2);
+        assert_eq!(char_cell_width('🔥'), 2);
     }
 }
