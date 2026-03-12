@@ -127,7 +127,8 @@ enum TerminalState {
 
 #[derive(Clone, Default)]
 struct CachedTerminalRow {
-    text: String,
+    /// SharedString: O(1) clone (Arc-backed) — avoids per-frame String allocation
+    text: SharedString,
     #[cfg(feature = "ghostty_vt")]
     style_runs: Vec<ghostty_vt::StyleRun>,
 }
@@ -381,7 +382,7 @@ impl TerminalPane {
             }
 
             let cached_row = &mut self.snapshot.rows[index];
-            cached_row.text = backend.row_text(row);
+            cached_row.text = SharedString::from(backend.row_text(row));
             #[cfg(feature = "ghostty_vt")]
             {
                 cached_row.style_runs = backend.row_style_runs(row);
@@ -515,33 +516,29 @@ impl TerminalPane {
         let cursor_x = self.snapshot.cursor_x;
         let cursor_y = self.snapshot.cursor_y;
 
+        // Perf: pre-allocate with exact capacity
         let mut line_elements: Vec<AnyElement> = Vec::with_capacity(rows as usize);
+
+        let cell_h = self.cell_height;
+        let cell_w = self.cell_width;
 
         for row in 0..rows {
             let ri = row as usize;
-            let text = self.snapshot.rows[ri].text.clone();
             let is_cursor_row = row == cursor_y;
 
             #[cfg(feature = "ghostty_vt")]
             let style_runs = &self.snapshot.rows[ri].style_runs;
 
-            let row_el = div()
-                .h(px(self.cell_height))
-                .w_full()
-                .flex()
-                .items_center()
-                .text_size(px(FONT_SIZE))
-                .font_family(FONT_FAMILY)
-                .text_color(rgb(DEFAULT_FG));
+            // Perf: SharedString clone is O(1) — Arc reference count bump only
+            let text = &self.snapshot.rows[ri].text;
 
             if is_cursor_row {
                 let cursor_col = cursor_x as usize;
-                // Pad text so cursor position is always within the string
+                // Cursor row needs mutable String for padding
                 let display_text = if text.is_empty() {
                     " ".repeat(cursor_col + 1)
                 } else {
-                    let mut t = text;
-                    // Pad using column width, not character count
+                    let mut t = text.to_string();
                     let mut col_count = t.chars().map(|c| if is_fullwidth(c) { 2 } else { 1 }).sum::<usize>();
                     while col_count <= cursor_col {
                         t.push(' ');
@@ -550,73 +547,86 @@ impl TerminalPane {
                     t
                 };
 
-                // Convert column position to character index for cursor placement
                 let char_idx = col_to_char_index(&display_text, cursor_col);
                 let chars: Vec<char> = display_text.chars().collect();
                 let before_cursor: String = chars[..char_idx.min(chars.len())].iter().collect();
 
                 #[cfg(feature = "ghostty_vt")]
-                let text_child = render_styled_text(&display_text, style_runs, self.cell_width);
+                let text_child = render_styled_text(&display_text, style_runs, cell_w);
                 #[cfg(not(feature = "ghostty_vt"))]
                 let text_child = div().pl(px(4.0)).child(display_text);
 
-                let row_with_text = row_el.child(text_child);
-
-                // Cursor block width: 2 cells for fullwidth (CJK) chars, 1 cell otherwise
                 let cursor_char = chars.get(char_idx).copied().unwrap_or(' ');
-                let cursor_w = if is_fullwidth(cursor_char) {
-                    self.cell_width * 2.0
-                } else {
-                    self.cell_width
-                };
-
-                let cursor_overlay = div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .h(px(self.cell_height))
-                    .w_full()
-                    .flex()
-                    .items_center()
-                    .text_size(px(FONT_SIZE))
-                    .font_family(FONT_FAMILY)
-                    .overflow_hidden()
-                    .child(
-                        div()
-                            .pl(px(4.0))
-                            .text_color(rgba(0x00000000))
-                            .child(before_cursor),
-                    )
-                    .child(
-                        div()
-                            .w(px(cursor_w))
-                            .h(px(self.cell_height))
-                            .bg(rgba(0xF5F5F780))
-                            .rounded(px(1.0)),
-                    );
+                let cursor_w = if is_fullwidth(cursor_char) { cell_w * 2.0 } else { cell_w };
 
                 line_elements.push(
                     div()
-                        .h(px(self.cell_height))
+                        .h(px(cell_h))
                         .w_full()
                         .relative()
-                        .child(row_with_text)
-                        .child(cursor_overlay)
+                        .child(
+                            div()
+                                .h(px(cell_h))
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .text_size(px(FONT_SIZE))
+                                .font_family(FONT_FAMILY)
+                                .text_color(rgb(DEFAULT_FG))
+                                .child(text_child),
+                        )
+                        .child(
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .h(px(cell_h))
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .text_size(px(FONT_SIZE))
+                                .font_family(FONT_FAMILY)
+                                .overflow_hidden()
+                                .child(
+                                    div()
+                                        .pl(px(4.0))
+                                        .text_color(rgba(0x00000000))
+                                        .child(before_cursor),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(cursor_w))
+                                        .h(px(cell_h))
+                                        .bg(rgba(0xF5F5F780))
+                                        .rounded(px(1.0)),
+                                ),
+                        )
                         .into_any_element(),
                 );
+            } else if text.is_empty() {
+                // Perf: empty rows — lightweight div, no text child
+                line_elements.push(
+                    div().h(px(cell_h)).w_full().into_any_element(),
+                );
             } else {
-                let display = if text.is_empty() {
-                    " ".to_string()
-                } else {
-                    text
-                };
-
+                // Perf: non-cursor row — use SharedString directly (zero-copy)
                 #[cfg(feature = "ghostty_vt")]
-                let text_child = render_styled_text(&display, style_runs, self.cell_width);
+                let text_child = render_styled_text(text, style_runs, cell_w);
                 #[cfg(not(feature = "ghostty_vt"))]
-                let text_child = div().pl(px(4.0)).child(display);
+                let text_child = div().pl(px(4.0)).child(text.clone());
 
-                line_elements.push(row_el.child(text_child).into_any_element());
+                line_elements.push(
+                    div()
+                        .h(px(cell_h))
+                        .w_full()
+                        .flex()
+                        .items_center()
+                        .text_size(px(FONT_SIZE))
+                        .font_family(FONT_FAMILY)
+                        .text_color(rgb(DEFAULT_FG))
+                        .child(text_child)
+                        .into_any_element(),
+                );
             }
         }
 

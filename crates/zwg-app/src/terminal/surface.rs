@@ -155,8 +155,8 @@ pub struct TerminalSurface {
 
 impl TerminalSurface {
     pub fn new(cols: u16, rows: u16, scrollback_lines: usize) -> Self {
-        // H1: bounded(1) — reader only needs to signal "data available"
-        let (event_tx, event_rx) = flume::bounded(4);
+        // Perf: bounded(8) — enough headroom for burst; reader coalesces anyway
+        let (event_tx, event_rx) = flume::bounded(8);
         Self {
             backend: Arc::new(Mutex::new(TerminalBackend::new(
                 cols,
@@ -202,7 +202,8 @@ impl TerminalSurface {
         let handle = std::thread::Builder::new()
             .name("zwg-pty-reader".into())
             .spawn(move || {
-                let mut buf = [0u8; 65536];
+                // Perf: 128KB read buffer — fewer syscalls, better batch coalescing
+                let mut buf = [0u8; 131_072];
                 loop {
                     // H2: check stop flag before blocking read
                     if stop_flag.load(Ordering::Relaxed) {
@@ -218,10 +219,28 @@ impl TerminalSurface {
                         }
                     };
 
-                    // Feed PTY output into terminal backend
+                    // Perf: drain loop — coalesce rapid successive writes into
+                    // a single backend.feed() + render notification.
+                    let mut total = n;
+                    loop {
+                        if total >= buf.len() - 4096 {
+                            break; // buffer nearly full
+                        }
+                        let extra = {
+                            let mut guard = reader.lock();
+                            match guard.read(&mut buf[total..]) {
+                                Ok(0) => break,
+                                Ok(extra_n) => extra_n,
+                                Err(_) => break,
+                            }
+                        };
+                        total += extra;
+                    }
+
+                    // Feed entire batch into terminal backend under single lock
                     {
                         let mut b = backend.lock();
-                        b.feed(&buf[..n]);
+                        b.feed(&buf[..total]);
                     }
 
                     // H1: try_send on bounded channel — drop if full (already notified)
@@ -270,7 +289,7 @@ impl TerminalSurface {
         let handle = std::thread::Builder::new()
             .name("zwg-pty-reader".into())
             .spawn(move || {
-                let mut buf = [0u8; 65536];
+                let mut buf = [0u8; 131_072];
                 loop {
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
@@ -283,9 +302,25 @@ impl TerminalSurface {
                             Err(_) => break,
                         }
                     };
+                    // Perf: drain coalescing
+                    let mut total = n;
+                    loop {
+                        if total >= buf.len() - 4096 {
+                            break;
+                        }
+                        let extra = {
+                            let mut guard = reader.lock();
+                            match guard.read(&mut buf[total..]) {
+                                Ok(0) => break,
+                                Ok(extra_n) => extra_n,
+                                Err(_) => break,
+                            }
+                        };
+                        total += extra;
+                    }
                     {
                         let mut b = backend.lock();
-                        b.feed(&buf[..n]);
+                        b.feed(&buf[..total]);
                     }
                     let _ = event_tx.try_send(TerminalEvent::OutputReceived);
                 }

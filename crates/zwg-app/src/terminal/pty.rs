@@ -324,13 +324,13 @@ mod windows_impl {
             let mut pty_output_read = HANDLE::default();
             let mut pty_output_write = HANDLE::default();
 
-            CreatePipe(&mut pty_input_read, &mut pty_input_write, None, 65536)
+            CreatePipe(&mut pty_input_read, &mut pty_input_write, None, 131_072)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             // H7: wrap in RAII immediately to prevent leak if second CreatePipe fails
             let pty_input_read = PipeHandle(pty_input_read);
             let pty_input_write = PipeHandle(pty_input_write);
 
-            CreatePipe(&mut pty_output_read, &mut pty_output_write, None, 65536)
+            CreatePipe(&mut pty_output_read, &mut pty_output_write, None, 131_072)
                 .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
             let pty_output_read = PipeHandle(pty_output_read);
             let pty_output_write = PipeHandle(pty_output_write);

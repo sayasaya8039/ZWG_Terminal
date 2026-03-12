@@ -65,7 +65,8 @@ pub struct TerminalLine {
 impl TerminalLine {
     pub fn new() -> Self {
         Self {
-            text: String::new(),
+            // Perf: pre-allocate typical line capacity (80 cols)
+            text: String::with_capacity(80),
             styles: vec![StyleSpan {
                 len: 0,
                 fg_color: DEFAULT_FG,
