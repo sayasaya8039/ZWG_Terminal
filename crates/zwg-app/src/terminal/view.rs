@@ -17,9 +17,28 @@ const FONT_FAMILY: &str = "Consolas";
 const FONT_SIZE: f32 = 13.0;
 const LINE_HEIGHT_FACTOR: f32 = 1.5;
 const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
-pub const CELL_WIDTH_ESTIMATE: f32 = 8.4;
+/// Fallback only — replaced at runtime by measured font advance width
+const CELL_WIDTH_FALLBACK: f32 = 8.4;
+pub const CELL_WIDTH_ESTIMATE: f32 = CELL_WIDTH_FALLBACK;
 pub const CELL_HEIGHT_ESTIMATE: f32 = FONT_SIZE * LINE_HEIGHT_FACTOR;
 pub const WINDOW_CHROME_HEIGHT: f32 = 60.0;
+
+/// Measure the actual monospace cell width from the font at FONT_SIZE.
+/// Falls back to CELL_WIDTH_FALLBACK if measurement fails.
+fn measure_cell_width(cx: &App) -> f32 {
+    let text_system = cx.text_system();
+    let font_desc = font(FONT_FAMILY);
+    let font_id = text_system.resolve_font(&font_desc);
+    let font_size = px(FONT_SIZE);
+    // Use advance of 'M' — monospace fonts have uniform advance for all ASCII
+    text_system
+        .advance(font_id, font_size, 'M')
+        .map(|size| {
+            let w: f32 = size.width.into();
+            if w > 1.0 { w } else { CELL_WIDTH_FALLBACK }
+        })
+        .unwrap_or(CELL_WIDTH_FALLBACK)
+}
 
 // Figma-aligned chrome colors for status text
 const SUBTEXT0: u32 = 0x8E8E93;
@@ -316,13 +335,20 @@ impl TerminalPane {
         )
         .detach();
 
+        let measured_cell_width = measure_cell_width(cx);
+        log::info!(
+            "Terminal cell width: measured={:.2}px (fallback={:.1}px)",
+            measured_cell_width,
+            CELL_WIDTH_FALLBACK,
+        );
+
         Self {
             surface,
             focus_handle,
             input_suppressed: settings.input_suppressed.clone(),
             state: TerminalState::Pending,
             snapshot: TerminalSnapshot::new(settings.rows),
-            cell_width: CELL_WIDTH_ESTIMATE,
+            cell_width: measured_cell_width,
             cell_height: CELL_HEIGHT_ESTIMATE,
             term_cols: settings.cols,
             term_rows: settings.rows,
@@ -597,7 +623,7 @@ impl TerminalPane {
                 let before_cursor: String = chars[..char_idx.min(chars.len())].iter().collect();
 
                 #[cfg(feature = "ghostty_vt")]
-                let text_child = render_styled_text(&display_text, style_runs, cell_w);
+                let text_child = render_styled_line(&display_text, style_runs);
                 #[cfg(not(feature = "ghostty_vt"))]
                 let text_child = div().pl(px(4.0)).child(display_text);
 
@@ -659,7 +685,7 @@ impl TerminalPane {
             } else {
                 // Perf: non-cursor row — use SharedString directly (zero-copy)
                 #[cfg(feature = "ghostty_vt")]
-                let text_child = render_styled_text(text, style_runs, cell_w);
+                let text_child = render_styled_line(text, style_runs);
                 #[cfg(not(feature = "ghostty_vt"))]
                 let text_child = div().pl(px(4.0)).child(text.clone());
 
@@ -709,66 +735,77 @@ impl Render for TerminalPane {
     }
 }
 
-/// Render a row of text with Ghostty style runs applied
+/// Render a row of text with Ghostty style runs applied.
+/// Uses gpui StyledText (single text element with highlight ranges)
+/// instead of flex-row divs, eliminating subpixel drift between segments.
 #[cfg(feature = "ghostty_vt")]
-fn render_styled_text(text: &str, style_runs: &[ghostty_vt::StyleRun], _cell_width: f32) -> Div {
-    let container = div().pl(px(4.0)).flex().flex_row();
+fn render_styled_line(text: &str, style_runs: &[ghostty_vt::StyleRun]) -> Div {
+    let container = div().pl(px(HORIZONTAL_TEXT_PADDING));
 
-    if style_runs.is_empty() || text.is_empty() {
+    if text.is_empty() {
+        return container;
+    }
+
+    if style_runs.is_empty() {
         return container.child(text.to_string());
     }
 
+    // Build byte-offset index for char boundaries
     let chars: Vec<char> = text.chars().collect();
-    let mut children: Vec<AnyElement> = Vec::new();
-    let mut covered_to: usize = 0;
+    let char_byte_offsets: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+
+    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::with_capacity(style_runs.len());
 
     for run in style_runs {
-        let start = (run.start_col.saturating_sub(1)) as usize;
-        let end = run.end_col as usize;
-        if start >= chars.len() {
-            break;
-        }
-        let end = end.min(chars.len());
+        let start_char = run.start_col.saturating_sub(1) as usize;
+        let end_char = (run.end_col as usize).min(chars.len());
 
-        if covered_to < start {
-            let gap: String = chars[covered_to..start].iter().collect();
-            children.push(
-                div()
-                    .child(gap)
-                    .text_color(rgb(DEFAULT_FG))
-                    .into_any_element(),
-            );
+        if start_char >= chars.len() || start_char >= end_char {
+            continue;
         }
 
-        let segment: String = chars[start..end].iter().collect();
-        let fg = rgb(((run.fg.r as u32) << 16) | ((run.fg.g as u32) << 8) | (run.fg.b as u32));
+        let byte_start = char_byte_offsets[start_char];
+        let byte_end = char_byte_offsets[end_char];
+
+        let fg_val = ((run.fg.r as u32) << 16) | ((run.fg.g as u32) << 8) | (run.fg.b as u32);
         let bg_val = ((run.bg.r as u32) << 16) | ((run.bg.g as u32) << 8) | (run.bg.b as u32);
 
-        let mut span = div().child(segment).text_color(fg);
-
+        let mut hl = HighlightStyle::default();
+        hl.color = Some(Hsla::from(rgb(fg_val)));
         if bg_val != DEFAULT_BG {
-            span = span.bg(rgb(bg_val));
+            hl.background_color = Some(Hsla::from(rgb(bg_val)));
         }
-
         if run.flags & 0x01 != 0 {
-            span = span.font_weight(FontWeight::BOLD);
+            hl.font_weight = Some(FontWeight::BOLD);
+        }
+        if run.flags & 0x02 != 0 {
+            hl.font_style = Some(FontStyle::Italic);
+        }
+        if run.flags & 0x04 != 0 {
+            hl.underline = Some(UnderlineStyle {
+                thickness: px(1.0),
+                color: Some(Hsla::from(rgb(fg_val))),
+                wavy: false,
+            });
+        }
+        if run.flags & 0x10 != 0 {
+            hl.strikethrough = Some(StrikethroughStyle {
+                thickness: px(1.0),
+                color: Some(Hsla::from(rgb(fg_val))),
+            });
         }
 
-        children.push(span.into_any_element());
-        covered_to = end;
+        highlights.push((byte_start..byte_end, hl));
     }
 
-    if covered_to < chars.len() {
-        let tail: String = chars[covered_to..].iter().collect();
-        children.push(
-            div()
-                .child(tail)
-                .text_color(rgb(DEFAULT_FG))
-                .into_any_element(),
-        );
-    }
+    let styled = StyledText::new(SharedString::from(text.to_string()))
+        .with_highlights(highlights);
 
-    container.children(children)
+    container.child(styled)
 }
 
 impl TerminalPane {
