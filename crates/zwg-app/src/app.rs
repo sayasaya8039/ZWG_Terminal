@@ -760,62 +760,69 @@ impl RootView {
         }
     }
 
-    fn on_new_tab(&mut self, _action: &NewTab, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_new_tab(&mut self, _action: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
         self.show_shell_menu = false;
         self.show_settings = false;
         self.state.update(cx, |state, cx| {
             state.add_tab(cx);
             cx.notify();
         });
+        self.focus_active_terminal(window, cx);
     }
 
-    fn on_close_tab(&mut self, _action: &CloseTab, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_close_tab(&mut self, _action: &CloseTab, window: &mut Window, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             state.close_tab(state.active_tab);
             cx.notify();
         });
+        self.focus_active_terminal(window, cx);
     }
 
     fn on_split_right(
         &mut self,
         _action: &SplitRight,
-        _window: &mut Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.split(SplitDirection::Horizontal, cx));
         }
+        self.focus_active_terminal(window, cx);
     }
 
-    fn on_split_down(&mut self, _action: &SplitDown, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_split_down(&mut self, _action: &SplitDown, window: &mut Window, cx: &mut Context<Self>) {
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.split(SplitDirection::Vertical, cx));
         }
+        self.focus_active_terminal(window, cx);
     }
 
-    fn on_close_pane(&mut self, _action: &ClosePane, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_close_pane(&mut self, _action: &ClosePane, window: &mut Window, cx: &mut Context<Self>) {
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             split.update(cx, |sc, cx| {
                 sc.close_focused(cx);
             });
         }
+        self.focus_active_terminal(window, cx);
     }
 
-    fn on_focus_next(&mut self, _action: &FocusNext, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_focus_next(&mut self, _action: &FocusNext, window: &mut Window, cx: &mut Context<Self>) {
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.focus_direction(FocusDir::Next, cx));
         }
+        self.focus_active_terminal(window, cx);
     }
 
-    fn on_focus_prev(&mut self, _action: &FocusPrev, _window: &mut Window, cx: &mut Context<Self>) {
+    fn on_focus_prev(&mut self, _action: &FocusPrev, window: &mut Window, cx: &mut Context<Self>) {
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.focus_direction(FocusDir::Prev, cx));
         }
+        self.focus_active_terminal(window, cx);
     }
 
     fn on_toggle_snippet_palette(
@@ -1899,12 +1906,13 @@ impl RootView {
                     .hover(|style| style.bg(rgba(0xffffff12)))
                     .on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                        cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                             this.show_shell_menu = false;
                             this.state.update(cx, |state, cx| {
                                 state.add_tab_with_shell(&command, cx);
                                 cx.notify();
                             });
+                            this.focus_active_terminal(window, cx);
                         }),
                     )
                     .child(
@@ -5704,10 +5712,11 @@ impl Render for RootView {
                 .text_size(px(12.0))
                 .on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                    cx.listener(move |this, _: &MouseDownEvent, window, cx| {
                         this.state.update(cx, |state, _cx| {
                             state.active_tab = idx;
                         });
+                        this.focus_active_terminal(window, cx);
                         cx.notify();
                     }),
                 );
