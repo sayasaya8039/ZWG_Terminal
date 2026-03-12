@@ -2534,6 +2534,39 @@ impl RootView {
                                         .p(px(10.0))
                                         .border_t_1()
                                         .border_color(rgba(0xE5E7EBFF))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(4.0))
+                                        .child(
+                                            div()
+                                                .id("snippet-add-group-btn")
+                                                .w_full()
+                                                .px(px(6.0))
+                                                .py(px(8.0))
+                                                .rounded(px(7.0))
+                                                .cursor_pointer()
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(6.0))
+                                                .font_family(UI_FONT)
+                                                .text_size(px(12.0))
+                                                .text_color(rgba(0x2F80EDFF))
+                                                .hover(|style| style.bg(rgba(0xE5E7EBFF)))
+                                                .child(
+                                                    div()
+                                                        .text_size(px(14.0))
+                                                        .font_weight(FontWeight::BOLD)
+                                                        .child("+"),
+                                                )
+                                                .child("グループ追加")
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                                        this.open_new_snippet_group_editor();
+                                                        cx.notify();
+                                                    }),
+                                                ),
+                                        )
                                         .child(
                                             div()
                                                 .w_full()
