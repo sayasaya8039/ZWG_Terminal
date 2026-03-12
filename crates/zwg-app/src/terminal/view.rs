@@ -580,7 +580,7 @@ impl TerminalPane {
             )
     }
 
-    /// Render the running terminal
+    /// Render the running terminal using canvas paint API for pixel-perfect grid.
     fn render_running(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Detect resize from viewport
         let vp = window.viewport_size();
@@ -591,127 +591,97 @@ impl TerminalPane {
             self.refresh_snapshot(true);
         }
 
-        let rows = self.snapshot.rows.len() as u16;
+        let num_rows = self.snapshot.rows.len();
         let cursor_x = self.snapshot.cursor_x;
         let cursor_y = self.snapshot.cursor_y;
-
-        // Perf: pre-allocate with exact capacity
-        let mut line_elements: Vec<AnyElement> = Vec::with_capacity(rows as usize);
-
         let cell_h = self.cell_height;
         let cell_w = self.cell_width;
+        let term_cols = self.term_cols;
 
-        for row in 0..rows {
-            let ri = row as usize;
-            let is_cursor_row = row == cursor_y;
-            let selection_overlay = self.selection_overlay(row, cell_w, cell_h);
-
-            #[cfg(feature = "ghostty_vt")]
-            let style_runs = &self.snapshot.rows[ri].style_runs;
-
-            // Perf: SharedString clone is O(1) — Arc reference count bump only
-            let text = &self.snapshot.rows[ri].text;
-
-            if is_cursor_row {
-                let cursor_col = cursor_x as usize;
-                // Cursor row needs mutable String for padding
-                let display_text = if text.is_empty() {
-                    " ".repeat(cursor_col + 1)
-                } else {
-                    let mut t = text.to_string();
-                    let mut col_count = t.chars().map(|c| if is_fullwidth(c) { 2 } else { 1 }).sum::<usize>();
-                    while col_count <= cursor_col {
-                        t.push(' ');
-                        col_count += 1;
-                    }
-                    t
-                };
-
-                let char_idx = col_to_char_index(&display_text, cursor_col);
-                let chars: Vec<char> = display_text.chars().collect();
-                let before_cursor: String = chars[..char_idx.min(chars.len())].iter().collect();
-
-                #[cfg(feature = "ghostty_vt")]
-                let text_child = render_styled_line(&display_text, style_runs);
-                #[cfg(not(feature = "ghostty_vt"))]
-                let text_child = div().pl(px(4.0)).child(display_text);
-
-                let cursor_char = chars.get(char_idx).copied().unwrap_or(' ');
-                let cursor_w = if is_fullwidth(cursor_char) { cell_w * 2.0 } else { cell_w };
-
-                let mut row_el = div().h(px(cell_h)).w_full().relative();
-                if let Some(selection_overlay) = selection_overlay {
-                    row_el = row_el.child(selection_overlay);
-                }
-                line_elements.push(
-                    row_el
-                        .child(
-                            div()
-                                .h(px(cell_h))
-                                .w_full()
-                                .text_size(px(FONT_SIZE))
-                                .line_height(px(cell_h))
-                                .font_family(FONT_FAMILY)
-                                .text_color(rgb(DEFAULT_FG))
-                                .child(text_child),
-                        )
-                        .child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .h(px(cell_h))
-                                .w_full()
-                                .text_size(px(FONT_SIZE))
-                                .line_height(px(cell_h))
-                                .font_family(FONT_FAMILY)
-                                .overflow_hidden()
-                                .child(
-                                    div()
-                                        .pl(px(HORIZONTAL_TEXT_PADDING))
-                                        .text_color(rgba(0x00000000))
-                                        .child(before_cursor),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(cursor_w))
-                                        .h(px(cell_h))
-                                        .bg(rgba(0xF5F5F780))
-                                        .rounded(px(1.0)),
-                                ),
-                        )
-                        .into_any_element(),
-                );
-            } else if text.is_empty() {
-                // Perf: empty rows — lightweight div, no text child
-                let mut row_el = div().h(px(cell_h)).w_full().relative();
-                if let Some(selection_overlay) = selection_overlay {
-                    row_el = row_el.child(selection_overlay);
-                }
-                line_elements.push(row_el.into_any_element());
-            } else {
-                // Perf: non-cursor row — use SharedString directly (zero-copy)
-                #[cfg(feature = "ghostty_vt")]
-                let text_child = render_styled_line(text, style_runs);
-                #[cfg(not(feature = "ghostty_vt"))]
-                let text_child = div().pl(px(4.0)).child(text.clone());
-
-                let mut row_el = div()
-                    .h(px(cell_h))
-                    .w_full()
-                    .relative()
-                    .text_size(px(FONT_SIZE))
-                    .line_height(px(cell_h))
-                    .font_family(FONT_FAMILY)
-                    .text_color(rgb(DEFAULT_FG));
-                if let Some(selection_overlay) = selection_overlay {
-                    row_el = row_el.child(selection_overlay);
-                }
-                line_elements.push(row_el.child(text_child).into_any_element());
-            }
-        }
+        // Clone snapshot data for canvas closure (SharedString clone is O(1))
+        let rows_snapshot: Vec<CachedTerminalRow> = self.snapshot.rows.clone();
+        let selection = self.selection_range();
 
         let ime = self.ime_canvas(cx);
+
+        // Canvas-based terminal rendering — ShapedLine::paint at exact grid positions
+        let terminal_canvas = canvas(
+            |_, _, _| (),
+            move |bounds: Bounds<Pixels>, _, window: &mut Window, cx: &mut App| {
+                let text_system = window.text_system().clone();
+                let font_desc = font(FONT_FAMILY);
+                let font_size = px(FONT_SIZE);
+                let line_height_px = px(cell_h);
+                let default_fg = Hsla::from(rgb(DEFAULT_FG));
+
+                // 1) Paint selection background (behind text)
+                if let Some((sel_start, sel_end)) = selection {
+                    let max_row = sel_end.row.min(num_rows.saturating_sub(1) as u16);
+                    for row in sel_start.row..=max_row {
+                        let sc = if row == sel_start.row { sel_start.col } else { 0 };
+                        let ec = if row == sel_end.row { sel_end.col } else { term_cols };
+                        if sc >= ec { continue; }
+                        window.paint_quad(fill(
+                            Bounds::new(
+                                point(
+                                    bounds.origin.x + px(HORIZONTAL_TEXT_PADDING + sc as f32 * cell_w),
+                                    bounds.origin.y + px(row as f32 * cell_h),
+                                ),
+                                size(px((ec - sc) as f32 * cell_w), line_height_px),
+                            ),
+                            rgba(0x2F6FED55),
+                        ));
+                    }
+                }
+
+                // 2) Paint text rows
+                for (row_idx, row_data) in rows_snapshot.iter().enumerate() {
+                    let text = &row_data.text;
+                    if text.is_empty() { continue; }
+
+                    let origin = point(
+                        bounds.origin.x + px(HORIZONTAL_TEXT_PADDING),
+                        bounds.origin.y + px(row_idx as f32 * cell_h),
+                    );
+
+                    #[cfg(feature = "ghostty_vt")]
+                    let runs = build_canvas_text_runs(
+                        text, &row_data.style_runs, &font_desc, default_fg,
+                    );
+                    #[cfg(not(feature = "ghostty_vt"))]
+                    let runs = vec![TextRun {
+                        len: text.len(),
+                        font: font_desc.clone(),
+                        color: default_fg,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }];
+
+                    let shaped = text_system.shape_line(
+                        text.clone(), font_size, &runs, None,
+                    );
+                    let _ = shaped.paint_background(origin, line_height_px, window, cx);
+                    let _ = shaped.paint(origin, line_height_px, window, cx);
+                }
+
+                // 3) Paint cursor
+                if (cursor_y as usize) < num_rows {
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(
+                                bounds.origin.x + px(HORIZONTAL_TEXT_PADDING + cursor_x as f32 * cell_w),
+                                bounds.origin.y + px(cursor_y as f32 * cell_h),
+                            ),
+                            size(px(cell_w), line_height_px),
+                        ),
+                        rgba(0xF5F5F780),
+                    ));
+                }
+            },
+        )
+        .size_full();
+
         div()
             .id("terminal-pane")
             .size_full()
@@ -723,7 +693,7 @@ impl TerminalPane {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_drop(cx.listener(Self::on_external_paths_drop))
-            .children(line_elements)
+            .child(terminal_canvas)
             .child(ime)
     }
 }
@@ -741,22 +711,25 @@ impl Render for TerminalPane {
     }
 }
 
-/// Render a row of text with Ghostty style runs applied.
-/// Uses gpui StyledText (single text element with highlight ranges)
-/// instead of flex-row divs, eliminating subpixel drift between segments.
+/// Build TextRun[] from Ghostty style runs for ShapedLine-based canvas rendering.
 #[cfg(feature = "ghostty_vt")]
-fn render_styled_line(text: &str, style_runs: &[ghostty_vt::StyleRun]) -> Div {
-    let container = div().pl(px(HORIZONTAL_TEXT_PADDING));
-
-    if text.is_empty() {
-        return container;
+fn build_canvas_text_runs(
+    text: &str,
+    style_runs: &[ghostty_vt::StyleRun],
+    font_desc: &Font,
+    default_fg: Hsla,
+) -> Vec<TextRun> {
+    if style_runs.is_empty() || text.is_empty() {
+        return vec![TextRun {
+            len: text.len(),
+            font: font_desc.clone(),
+            color: default_fg,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        }];
     }
 
-    if style_runs.is_empty() {
-        return container.child(text.to_string());
-    }
-
-    // Build byte-offset index for char boundaries
     let chars: Vec<char> = text.chars().collect();
     let char_byte_offsets: Vec<usize> = text
         .char_indices()
@@ -764,54 +737,68 @@ fn render_styled_line(text: &str, style_runs: &[ghostty_vt::StyleRun]) -> Div {
         .chain(std::iter::once(text.len()))
         .collect();
 
-    let mut highlights: Vec<(Range<usize>, HighlightStyle)> = Vec::with_capacity(style_runs.len());
+    let mut runs: Vec<TextRun> = Vec::new();
+    let mut covered_to_byte: usize = 0;
 
     for run in style_runs {
         let start_char = run.start_col.saturating_sub(1) as usize;
         let end_char = (run.end_col as usize).min(chars.len());
-
-        if start_char >= chars.len() || start_char >= end_char {
-            continue;
-        }
+        if start_char >= chars.len() || start_char >= end_char { continue; }
 
         let byte_start = char_byte_offsets[start_char];
         let byte_end = char_byte_offsets[end_char];
 
+        // Skip if overlapping or already past
+        if byte_start < covered_to_byte { continue; }
+
+        // Gap before this run — fill with default style
+        if covered_to_byte < byte_start {
+            runs.push(TextRun {
+                len: byte_start - covered_to_byte,
+                font: font_desc.clone(),
+                color: default_fg,
+                background_color: None,
+                underline: None,
+                strikethrough: None,
+            });
+        }
+
         let fg_val = ((run.fg.r as u32) << 16) | ((run.fg.g as u32) << 8) | (run.fg.b as u32);
         let bg_val = ((run.bg.r as u32) << 16) | ((run.bg.g as u32) << 8) | (run.bg.b as u32);
+        let fg_color = Hsla::from(rgb(fg_val));
 
-        let mut hl = HighlightStyle::default();
-        hl.color = Some(Hsla::from(rgb(fg_val)));
-        if bg_val != DEFAULT_BG {
-            hl.background_color = Some(Hsla::from(rgb(bg_val)));
-        }
-        if run.flags & 0x01 != 0 {
-            hl.font_weight = Some(FontWeight::BOLD);
-        }
-        if run.flags & 0x02 != 0 {
-            hl.font_style = Some(FontStyle::Italic);
-        }
-        if run.flags & 0x04 != 0 {
-            hl.underline = Some(UnderlineStyle {
-                thickness: px(1.0),
-                color: Some(Hsla::from(rgb(fg_val))),
-                wavy: false,
-            });
-        }
-        if run.flags & 0x10 != 0 {
-            hl.strikethrough = Some(StrikethroughStyle {
-                thickness: px(1.0),
-                color: Some(Hsla::from(rgb(fg_val))),
-            });
-        }
+        let mut run_font = font_desc.clone();
+        if run.flags & 0x01 != 0 { run_font.weight = FontWeight::BOLD; }
+        if run.flags & 0x02 != 0 { run_font.style = FontStyle::Italic; }
 
-        highlights.push((byte_start..byte_end, hl));
+        runs.push(TextRun {
+            len: byte_end - byte_start,
+            font: run_font,
+            color: fg_color,
+            background_color: if bg_val != DEFAULT_BG { Some(Hsla::from(rgb(bg_val))) } else { None },
+            underline: if run.flags & 0x04 != 0 {
+                Some(UnderlineStyle { thickness: px(1.0), color: Some(fg_color), wavy: false })
+            } else { None },
+            strikethrough: if run.flags & 0x10 != 0 {
+                Some(StrikethroughStyle { thickness: px(1.0), color: Some(fg_color) })
+            } else { None },
+        });
+        covered_to_byte = byte_end;
     }
 
-    let styled = StyledText::new(SharedString::from(text.to_string()))
-        .with_highlights(highlights);
+    // Tail text with default style
+    if covered_to_byte < text.len() {
+        runs.push(TextRun {
+            len: text.len() - covered_to_byte,
+            font: font_desc.clone(),
+            color: default_fg,
+            background_color: None,
+            underline: None,
+            strikethrough: None,
+        });
+    }
 
-    container.child(styled)
+    runs
 }
 
 impl TerminalPane {
