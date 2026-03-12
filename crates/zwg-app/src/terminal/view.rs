@@ -47,9 +47,11 @@ fn measure_cell_dimensions(cx: &App) -> (f32, f32) {
     let cell_height = ascent + descent.abs();
     let cell_height = if cell_height > FONT_SIZE { cell_height } else { CELL_HEIGHT_FALLBACK };
 
-    // Snap to integer pixels — prevents sub-pixel gaps between rows and
-    // accumulated horizontal drift. Essential for box-drawing characters.
-    (cell_width.ceil(), cell_height.ceil())
+    // cell_width: use exact advance — ceil would widen cells and create gaps
+    // in block/pixel-art characters (▄█▀).
+    // cell_height: ceil to integer pixels — prevents sub-pixel gaps between
+    // rows where box-drawing characters (│) must connect seamlessly.
+    (cell_width, cell_height.ceil())
 }
 
 // Figma-aligned chrome colors for status text
