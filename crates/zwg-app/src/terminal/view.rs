@@ -10,7 +10,8 @@ use gpui::*;
 use gpui::ElementInputHandler;
 
 use super::grid_renderer::{
-    GridRendererConfig, SelectionPoint, TerminalSnapshot, col_to_char_index, terminal_canvas,
+    GlyphCache, GridRendererConfig, SelectionPoint, TerminalSnapshot, col_to_char_index,
+    grid_cells_from_parts, terminal_canvas,
 };
 use super::pty::{ConPtyConfig, spawn_pty};
 use super::surface::TerminalSurface;
@@ -175,6 +176,8 @@ pub struct TerminalPane {
     is_selecting: bool,
     /// Keystrokes buffered while PTY is still connecting (Pending state)
     pending_input: Vec<u8>,
+    /// Cross-frame glyph layout cache — avoids reshaping unchanged glyphs every paint
+    glyph_cache: GlyphCache,
     #[cfg(not(feature = "ghostty_vt"))]
     row_generations: Vec<u64>,
 }
@@ -242,10 +245,12 @@ impl TerminalPane {
         )
         .detach();
 
-        // Wait for PTY output, then coalesce updates to one present every ~16.7ms.
+        // Wait for PTY output, then coalesce updates with 4ms batching window.
+        // GPUI's display-rate vsync limits actual repaints to ~60fps; the 4ms window
+        // reduces input-to-snapshot latency from ~17ms to ~5ms for interactive use.
         cx.spawn(
             async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
-                let frame_budget = std::time::Duration::from_micros(16_667);
+                let frame_budget = std::time::Duration::from_micros(4_000);
                 let mut last_presented: Option<std::time::Instant> = None;
 
                 loop {
@@ -308,6 +313,7 @@ impl TerminalPane {
             selection_head: None,
             is_selecting: false,
             pending_input: Vec::new(),
+            glyph_cache: Default::default(),
             #[cfg(not(feature = "ghostty_vt"))]
             row_generations: vec![0; settings.rows as usize],
         }
@@ -330,6 +336,9 @@ impl TerminalPane {
             self.term_rows = new_rows;
             self.surface.resize(new_cols, new_rows);
             self.snapshot.resize(new_rows);
+            // Clear glyph cache on resize — grid geometry changed
+            #[cfg(feature = "ghostty_vt")]
+            self.glyph_cache.lock().clear();
             #[cfg(not(feature = "ghostty_vt"))]
             self.row_generations.resize(new_rows as usize, 0);
             return true;
@@ -396,13 +405,18 @@ impl TerminalPane {
             }
 
             let cached_row = &mut self.snapshot.rows[index];
-            cached_row.text = SharedString::from(backend.row_text(row));
             #[cfg(feature = "ghostty_vt")]
             {
-                cached_row.style_runs = backend.row_style_runs(row);
+                let text = backend.row_text(row);
+                let style_runs = backend.row_style_runs(row);
+                let cells = grid_cells_from_parts(&text, &style_runs, self.term_cols);
+                cached_row.text = SharedString::from(text);
+                cached_row.style_runs = style_runs;
+                cached_row.cells = cells;
             }
             #[cfg(not(feature = "ghostty_vt"))]
             {
+                cached_row.text = SharedString::from(backend.row_text(row));
                 self.row_generations[index] = backend
                     .screen
                     .row_generations
@@ -547,6 +561,7 @@ impl TerminalPane {
                 horizontal_text_padding: HORIZONTAL_TEXT_PADDING,
                 term_cols: self.term_cols,
             },
+            self.glyph_cache.clone(),
         );
 
         div()

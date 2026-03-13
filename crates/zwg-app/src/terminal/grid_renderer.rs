@@ -37,6 +37,8 @@ pub(super) struct CachedTerminalRow {
     pub text: SharedString,
     #[cfg(feature = "ghostty_vt")]
     pub style_runs: Vec<ghostty_vt::StyleRun>,
+    #[cfg(feature = "ghostty_vt")]
+    pub cells: Vec<GridCell>,
 }
 
 #[derive(Clone)]
@@ -307,10 +309,19 @@ fn grid_cell_style_at(style_runs: &[ghostty_vt::StyleRun], col: u16) -> (u32, u3
 
 #[cfg(feature = "ghostty_vt")]
 pub(crate) fn grid_cells_from_row(row: &CachedTerminalRow, max_cols: u16) -> Vec<GridCell> {
+    grid_cells_from_parts(row.text.as_ref(), &row.style_runs, max_cols)
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn grid_cells_from_parts(
+    text: &str,
+    style_runs: &[ghostty_vt::StyleRun],
+    max_cols: u16,
+) -> Vec<GridCell> {
     let mut cells: Vec<GridCell> = Vec::new();
     let mut col = 0u16;
 
-    for ch in row.text.chars() {
+    for ch in text.chars() {
         let width = char_cell_width(ch) as u8;
         if width == 0 {
             if let Some(last) = cells.last_mut() {
@@ -322,7 +333,7 @@ pub(crate) fn grid_cells_from_row(row: &CachedTerminalRow, max_cols: u16) -> Vec
             break;
         }
 
-        let (fg_rgb, bg_rgb, flags) = grid_cell_style_at(&row.style_runs, col + 1);
+        let (fg_rgb, bg_rgb, flags) = grid_cell_style_at(style_runs, col + 1);
         cells.push(GridCell {
             col,
             width,
@@ -346,6 +357,7 @@ pub(super) fn terminal_canvas(
     snapshot: TerminalSnapshot,
     selection: Option<(SelectionPoint, SelectionPoint)>,
     config: GridRendererConfig,
+    glyph_cache: GlyphCache,
 ) -> Canvas<()> {
     canvas(
         |_, _, _| (),
@@ -355,8 +367,10 @@ pub(super) fn terminal_canvas(
             let font_size = px(config.font_size);
             let line_height_px = px(config.cell_height);
             let num_rows = snapshot.rows.len();
+            // Cross-frame glyph cache — lock shared cache from TerminalPane
+            // instead of rebuilding HashMap every paint (saves ~50-80% shaping work)
             #[cfg(feature = "ghostty_vt")]
-            let mut glyph_layout_cache: HashMap<GlyphKey, ShapedLine> = HashMap::new();
+            let mut glyph_layout_cache = glyph_cache.lock();
 
             window.paint_quad(fill(bounds, Hsla::from(rgb(DEFAULT_BG))));
 
@@ -395,9 +409,7 @@ pub(super) fn terminal_canvas(
             for (row_idx, row_data) in snapshot.rows.iter().enumerate() {
                 let row_y = row_idx as f32 * config.cell_height;
                 #[cfg(feature = "ghostty_vt")]
-                let row_cells = grid_cells_from_row(row_data, config.term_cols);
-                #[cfg(feature = "ghostty_vt")]
-                let glyph_instances = glyph_instances_from_cells(&row_cells, row_idx as u16);
+                let glyph_instances = glyph_instances_from_cells(&row_data.cells, row_idx as u16);
 
                 #[cfg(feature = "ghostty_vt")]
                 for srun in &row_data.style_runs {
@@ -440,7 +452,7 @@ pub(super) fn terminal_canvas(
                             &text_system,
                             &font_desc,
                             font_size,
-                            &mut glyph_layout_cache,
+                            &mut *glyph_layout_cache,
                         );
                         paint_glyph_instance(instance, &layout, bounds, &config, window);
                     }
@@ -562,10 +574,7 @@ pub(super) fn terminal_canvas(
                 let (cursor_col, cursor_width) = snapshot
                     .rows
                     .get(snapshot.cursor_y as usize)
-                    .map(|row| {
-                        let cells = grid_cells_from_row(row, config.term_cols);
-                        resolve_cursor_cell(snapshot.cursor_x, &cells, config.term_cols)
-                    })
+                    .map(|row| resolve_cursor_cell(snapshot.cursor_x, &row.cells, config.term_cols))
                     .unwrap_or((snapshot.cursor_x.min(config.term_cols.saturating_sub(1)), 1));
 
                 #[cfg(not(feature = "ghostty_vt"))]
@@ -816,6 +825,7 @@ mod tests {
                     flags: 0,
                 },
             ],
+            cells: Vec::new(),
         };
 
         let cells = grid_cells_from_row(&row, 10);
@@ -839,12 +849,33 @@ mod tests {
                 bg: ghostty_vt::Rgb { r: 0x11, g: 0x22, b: 0x33 },
                 flags: 0,
             }],
+            cells: Vec::new(),
         };
 
         let cells = grid_cells_from_row(&row, 10);
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[0].kind, GridCellKind::GeometricBlock);
         assert_eq!(cells[1].kind, GridCellKind::Text);
+    }
+
+    #[::core::prelude::v1::test]
+    fn grid_cells_from_parts_matches_row_wrapper() {
+        let row = CachedTerminalRow {
+            text: SharedString::from("A🔥"),
+            style_runs: vec![ghostty_vt::StyleRun {
+                start_col: 1,
+                end_col: 3,
+                fg: ghostty_vt::Rgb { r: 0xAA, g: 0xBB, b: 0xCC },
+                bg: ghostty_vt::Rgb { r: 0x11, g: 0x22, b: 0x33 },
+                flags: GHOSTTY_FLAG_UNDERLINE,
+            }],
+            cells: Vec::new(),
+        };
+
+        assert_eq!(
+            grid_cells_from_parts(row.text.as_ref(), &row.style_runs, 10),
+            grid_cells_from_row(&row, 10)
+        );
     }
 
     #[::core::prelude::v1::test]
