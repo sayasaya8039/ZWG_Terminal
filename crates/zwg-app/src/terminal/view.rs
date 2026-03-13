@@ -33,6 +33,70 @@ pub const CELL_WIDTH_ESTIMATE: f32 = CELL_WIDTH_FALLBACK;
 pub const CELL_HEIGHT_ESTIMATE: f32 = CELL_HEIGHT_FALLBACK;
 pub const WINDOW_CHROME_HEIGHT: f32 = 60.0;
 
+#[cfg(feature = "ghostty_vt")]
+#[derive(Clone)]
+struct GhosttyRowUpdate {
+    row: u16,
+    text: String,
+    style_runs: Vec<ghostty_vt::StyleRun>,
+}
+
+#[cfg(not(feature = "ghostty_vt"))]
+#[derive(Clone)]
+struct FallbackRowUpdate {
+    row: u16,
+    text: String,
+    generation: u64,
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn apply_ghostty_row_update(
+    cached_row: &mut super::grid_renderer::CachedTerminalRow,
+    row_update: GhosttyRowUpdate,
+    term_cols: u16,
+    force_full: bool,
+) -> bool {
+    let next_cells = grid_cells_from_parts(&row_update.text, &row_update.style_runs, term_cols);
+    let damage_spans = if force_full {
+        full_row_damage(term_cols)
+    } else {
+        damage_spans_from_terminal_row(
+            &cached_row.cells,
+            &cached_row.style_runs,
+            &next_cells,
+            &row_update.style_runs,
+            term_cols,
+        )
+    };
+    let cells = if force_full {
+        next_cells.clone()
+    } else {
+        patch_cells_in_damage(&cached_row.cells, &next_cells, &damage_spans)
+    };
+    let glyph_instances = if force_full {
+        super::grid_renderer::glyph_instances_from_cells(&cells, row_update.row)
+    } else {
+        patch_glyph_instances_in_damage(
+            &cached_row.glyph_instances,
+            &next_cells,
+            row_update.row,
+            &damage_spans,
+        )
+    };
+    let damaged_glyph_instances = glyph_instances_in_damage(&cells, row_update.row, &damage_spans);
+    let row_changed = !damage_spans.is_empty()
+        || cached_row.text.as_ref() != row_update.text.as_str()
+        || cached_row.style_runs != row_update.style_runs;
+
+    cached_row.text = SharedString::from(row_update.text);
+    cached_row.style_runs = row_update.style_runs;
+    cached_row.cells = cells;
+    cached_row.glyph_instances = glyph_instances;
+    cached_row.damage_spans = damage_spans;
+    cached_row.damaged_glyph_instances = damaged_glyph_instances;
+    row_changed
+}
+
 /// Measure the actual monospace cell dimensions from the font at FONT_SIZE.
 /// Cell width = max advance width of representative monospace glyphs.
 /// Cell height = ascent + descent (no extra leading — required for
@@ -375,17 +439,78 @@ impl TerminalPane {
     }
 
     fn refresh_snapshot(&mut self, force_full: bool) -> bool {
-        let mut backend = self.surface.backend.lock();
-        let rows = backend.rows;
-
         #[cfg(feature = "ghostty_vt")]
-        let (cursor_x, cursor_y) = {
+        let (rows, cursor_x, cursor_y, row_updates) = {
+            let mut backend = self.surface.backend.lock();
+            let rows = backend.rows;
             let pos = backend.cursor_position();
-            (pos.0.saturating_sub(1), pos.1.saturating_sub(1))
+            let dirty_rows: Vec<u16> = if force_full {
+                (0..rows).collect()
+            } else {
+                match backend.terminal.take_dirty_viewport_rows(rows) {
+                    Ok(dirty_rows) => dirty_rows,
+                    Err(err) => {
+                        log::debug!("Failed to collect dirty terminal rows: {}", err);
+                        (0..rows).collect()
+                    }
+                }
+            };
+            let row_updates = dirty_rows
+                .into_iter()
+                .map(|row| GhosttyRowUpdate {
+                    row,
+                    text: backend.row_text(row),
+                    style_runs: backend.row_style_runs(row),
+                })
+                .collect::<Vec<_>>();
+            (
+                rows,
+                pos.0.saturating_sub(1),
+                pos.1.saturating_sub(1),
+                row_updates,
+            )
         };
 
         #[cfg(not(feature = "ghostty_vt"))]
-        let (cursor_x, cursor_y) = backend.cursor_position();
+        let (rows, cursor_x, cursor_y, row_updates) = {
+            let backend = self.surface.backend.lock();
+            let rows = backend.rows;
+            let (cursor_x, cursor_y) = backend.cursor_position();
+            let dirty_rows: Vec<u16> = if force_full {
+                (0..rows).collect()
+            } else {
+                let mut dirty_rows = Vec::new();
+                for row in 0..rows as usize {
+                    let next_generation = backend
+                        .screen
+                        .row_generations
+                        .get(row)
+                        .copied()
+                        .unwrap_or(0);
+                    if self.row_generations.get(row).copied().unwrap_or(0) != next_generation {
+                        dirty_rows.push(row as u16);
+                    }
+                }
+                dirty_rows
+            };
+            let row_updates = dirty_rows
+                .into_iter()
+                .map(|row| {
+                    let index = row as usize;
+                    FallbackRowUpdate {
+                        row,
+                        text: backend.row_text(row),
+                        generation: backend
+                            .screen
+                            .row_generations
+                            .get(index)
+                            .copied()
+                            .unwrap_or(0),
+                    }
+                })
+                .collect::<Vec<_>>();
+            (rows, cursor_x, cursor_y, row_updates)
+        };
 
         let mut changed = self.snapshot.cursor_x != cursor_x || self.snapshot.cursor_y != cursor_y;
 
@@ -395,114 +520,29 @@ impl TerminalPane {
         }
 
         #[cfg(feature = "ghostty_vt")]
-        let dirty_rows: Vec<u16> = if force_full {
-            (0..rows).collect()
-        } else {
-            match backend.terminal.take_dirty_viewport_rows(rows) {
-                Ok(dirty_rows) => dirty_rows,
-                Err(err) => {
-                    log::debug!("Failed to collect dirty terminal rows: {}", err);
-                    (0..rows).collect()
-                }
-            }
-        };
-
-        #[cfg(not(feature = "ghostty_vt"))]
-        let dirty_rows: Vec<u16> = if force_full {
-            (0..rows).collect()
-        } else {
-            let mut dirty_rows = Vec::new();
-            for row in 0..rows as usize {
-                let next_generation = backend
-                    .screen
-                    .row_generations
-                    .get(row)
-                    .copied()
-                    .unwrap_or(0);
-                if self.row_generations.get(row).copied().unwrap_or(0) != next_generation {
-                    dirty_rows.push(row as u16);
-                }
-            }
-            dirty_rows
-        };
-
-        for row in dirty_rows {
-            let index = row as usize;
+        for row_update in row_updates {
+            let index = row_update.row as usize;
             if index >= self.snapshot.rows.len() {
                 continue;
             }
 
             let cached_row = &mut self.snapshot.rows[index];
-            #[cfg(feature = "ghostty_vt")]
-            {
-                let text = backend.row_text(row);
-                let style_runs = backend.row_style_runs(row);
-                let next_cells = grid_cells_from_parts(&text, &style_runs, self.term_cols);
-                let damage_spans = if force_full {
-                    full_row_damage(self.term_cols)
-                } else {
-                    damage_spans_from_terminal_row(
-                        &cached_row.cells,
-                        &cached_row.style_runs,
-                        &next_cells,
-                        &style_runs,
-                        self.term_cols,
-                    )
-                };
-                let cells = if force_full {
-                    next_cells.clone()
-                } else {
-                    patch_cells_in_damage(&cached_row.cells, &next_cells, &damage_spans)
-                };
-                let glyph_instances = if force_full {
-                    super::grid_renderer::glyph_instances_from_cells(&cells, row)
-                } else {
-                    patch_glyph_instances_in_damage(
-                        &cached_row.glyph_instances,
-                        &next_cells,
-                        row,
-                        &damage_spans,
-                    )
-                };
-                let damaged_glyph_instances = glyph_instances_in_damage(&cells, row, &damage_spans);
-
-                cached_row.text = SharedString::from(text);
-                cached_row.style_runs = style_runs;
-                cached_row.cells = cells;
-                cached_row.glyph_instances = glyph_instances;
-                cached_row.damage_spans = damage_spans;
-                cached_row.damaged_glyph_instances = damaged_glyph_instances;
-            }
-            #[cfg(not(feature = "ghostty_vt"))]
-            {
-                cached_row.text = SharedString::from(backend.row_text(row));
-                self.row_generations[index] = backend
-                    .screen
-                    .row_generations
-                    .get(index)
-                    .copied()
-                    .unwrap_or(0);
-            }
-            #[cfg(feature = "ghostty_vt")]
-            {
-                changed |= !cached_row.damage_spans.is_empty();
-            }
-            #[cfg(not(feature = "ghostty_vt"))]
-            {
-                changed = true;
-            }
+            changed |= apply_ghostty_row_update(cached_row, row_update, self.term_cols, force_full);
         }
 
         #[cfg(not(feature = "ghostty_vt"))]
-        if force_full {
-            for row in 0..self.snapshot.rows.len() {
-                self.row_generations[row] = backend
-                    .screen
-                    .row_generations
-                    .get(row)
-                    .copied()
-                    .unwrap_or(0);
+        for row_update in row_updates {
+            let index = row_update.row as usize;
+            if index >= self.snapshot.rows.len() {
+                continue;
             }
+
+            let cached_row = &mut self.snapshot.rows[index];
+            let row_changed = cached_row.text.as_ref() != row_update.text.as_str()
+                || self.row_generations.get(index).copied().unwrap_or(0) != row_update.generation;
+            cached_row.text = SharedString::from(row_update.text);
+            self.row_generations[index] = row_update.generation;
+            changed |= row_changed;
         }
 
         self.snapshot.cursor_x = cursor_x;
@@ -682,10 +722,29 @@ impl TerminalPane {
         }
     }
 
-    fn clear_selection(&mut self) {
+    fn clear_selection(&mut self) -> bool {
+        let had_selection = self.selection_anchor.is_some()
+            || self.selection_head.is_some()
+            || self.is_selecting;
         self.selection_anchor = None;
         self.selection_head = None;
         self.is_selecting = false;
+        had_selection
+    }
+
+    fn set_selection_state(
+        &mut self,
+        selection_anchor: Option<SelectionPoint>,
+        selection_head: Option<SelectionPoint>,
+        is_selecting: bool,
+    ) -> bool {
+        let changed = self.selection_anchor != selection_anchor
+            || self.selection_head != selection_head
+            || self.is_selecting != is_selecting;
+        self.selection_anchor = selection_anchor;
+        self.selection_head = selection_head;
+        self.is_selecting = is_selecting;
+        changed
     }
 
     fn mouse_to_selection_point(&self, position: Point<Pixels>) -> Option<SelectionPoint> {
@@ -804,9 +863,9 @@ impl TerminalPane {
             return false;
         }
 
-        self.clear_selection();
+        let selection_changed = self.clear_selection();
         self.write_terminal_bytes(&bytes);
-        true
+        selection_changed
     }
 
     fn on_external_paths_drop(
@@ -821,9 +880,11 @@ impl TerminalPane {
         }
 
         window.focus(&self.focus_handle);
-        self.clear_selection();
+        let selection_changed = self.clear_selection();
         self.write_terminal_bytes(text.as_bytes());
-        cx.notify();
+        if selection_changed {
+            cx.notify();
+        }
     }
 
     /// Convert a keystroke to bytes for PTY. Returns None if the key should not
@@ -930,14 +991,20 @@ impl TerminalPane {
 
         match self.state {
             TerminalState::Running => {
-                self.clear_selection();
+                let selection_changed = self.clear_selection();
                 let _ = self.surface.write_input(&bytes);
+                if selection_changed {
+                    cx.notify();
+                }
                 cx.stop_propagation();
             }
             TerminalState::Pending => {
                 // Buffer input while PTY is connecting
-                self.clear_selection();
+                let selection_changed = self.clear_selection();
                 self.pending_input.extend_from_slice(&bytes);
+                if selection_changed {
+                    cx.notify();
+                }
                 cx.stop_propagation();
             }
             TerminalState::Failed(_) => {}
@@ -955,12 +1022,13 @@ impl TerminalPane {
             return;
         }
         if let Some(point) = self.mouse_to_selection_point(event.position) {
-            self.selection_anchor = Some(point);
-            self.selection_head = Some(point);
-            self.is_selecting = true;
-            cx.notify();
+            if self.set_selection_state(Some(point), Some(point), true) {
+                cx.notify();
+            }
         } else {
-            self.clear_selection();
+            if self.clear_selection() {
+                cx.notify();
+            }
         }
     }
 
@@ -974,8 +1042,10 @@ impl TerminalPane {
             return;
         }
         if let Some(point) = self.mouse_to_selection_point(event.position) {
-            self.selection_head = Some(point);
-            cx.notify();
+            if self.selection_head != Some(point) {
+                self.selection_head = Some(point);
+                cx.notify();
+            }
         }
     }
 
@@ -988,14 +1058,23 @@ impl TerminalPane {
         if !self.is_selecting {
             return;
         }
+        let prev_anchor = self.selection_anchor;
+        let prev_head = self.selection_head;
+        let was_selecting = self.is_selecting;
         if let Some(point) = self.mouse_to_selection_point(event.position) {
             self.selection_head = Some(point);
         }
         self.is_selecting = false;
-        if self.selection_range().is_none() {
-            self.clear_selection();
+        let should_notify = if self.selection_range().is_none() {
+            self.clear_selection()
+        } else {
+            prev_anchor != self.selection_anchor
+                || prev_head != self.selection_head
+                || was_selecting != self.is_selecting
+        };
+        if should_notify {
+            cx.notify();
         }
-        cx.notify();
     }
 }
 
@@ -1034,7 +1113,7 @@ impl EntityInputHandler for TerminalPane {
     /// Committed text from IME → send to PTY
     fn replace_text_in_range(
         &mut self, _range: Option<Range<usize>>, text: &str,
-        _window: &mut Window, cx: &mut Context<Self>,
+        _window: &mut Window, _cx: &mut Context<Self>,
     ) {
         if text.is_empty() {
             return;
@@ -1048,17 +1127,14 @@ impl EntityInputHandler for TerminalPane {
             }
             TerminalState::Failed(_) => {}
         }
-        cx.notify();
     }
 
     /// Preedit (composing) text from IME — currently not displayed,
     /// but accepting the call prevents gpui from dropping the composition.
     fn replace_and_mark_text_in_range(
         &mut self, _range: Option<Range<usize>>, _new_text: &str,
-        _new_selected: Option<Range<usize>>, _window: &mut Window, cx: &mut Context<Self>,
-    ) {
-        cx.notify();
-    }
+        _new_selected: Option<Range<usize>>, _window: &mut Window, _cx: &mut Context<Self>,
+    ) {}
 
     fn bounds_for_range(
         &mut self, _range: Range<usize>, element_bounds: Bounds<Pixels>,
@@ -1096,4 +1172,89 @@ fn slice_text_by_cols(text: &str, start_col: usize, end_col: usize) -> String {
         .skip(start_idx)
         .take(end_idx.saturating_sub(start_idx))
         .collect()
+}
+
+#[cfg(all(test, feature = "ghostty_vt"))]
+mod tests {
+    use super::*;
+    use crate::terminal::grid_renderer::CachedTerminalRow;
+    use crate::terminal::DEFAULT_FG;
+
+    fn style_run(start_col: u16, end_col: u16, bg_rgb: u32) -> ghostty_vt::StyleRun {
+        ghostty_vt::StyleRun {
+            start_col,
+            end_col,
+            fg: ghostty_vt::Rgb {
+                r: ((DEFAULT_FG >> 16) & 0xFF) as u8,
+                g: ((DEFAULT_FG >> 8) & 0xFF) as u8,
+                b: (DEFAULT_FG & 0xFF) as u8,
+            },
+            bg: ghostty_vt::Rgb {
+                r: ((bg_rgb >> 16) & 0xFF) as u8,
+                g: ((bg_rgb >> 8) & 0xFF) as u8,
+                b: (bg_rgb & 0xFF) as u8,
+            },
+            flags: 0,
+        }
+    }
+
+    #[::core::prelude::v1::test]
+    fn apply_ghostty_row_update_skips_redraw_for_identical_row() {
+        let style_runs = vec![style_run(1, 2, DEFAULT_BG)];
+        let cells = grid_cells_from_parts("ab", &style_runs, 4);
+        let mut row = CachedTerminalRow {
+            text: SharedString::from("ab"),
+            style_runs: style_runs.clone(),
+            cells: cells.clone(),
+            glyph_instances: super::super::grid_renderer::glyph_instances_from_cells(&cells, 0),
+            damage_spans: Vec::new(),
+            damaged_glyph_instances: Vec::new(),
+        };
+
+        let changed = apply_ghostty_row_update(
+            &mut row,
+            GhosttyRowUpdate {
+                row: 0,
+                text: "ab".into(),
+                style_runs,
+            },
+            4,
+            false,
+        );
+
+        assert!(!changed);
+        assert!(row.damage_spans.is_empty());
+        assert!(row.damaged_glyph_instances.is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn apply_ghostty_row_update_marks_style_only_changes_as_damage() {
+        let previous_style_runs = vec![style_run(2, 2, DEFAULT_BG)];
+        let cells = grid_cells_from_parts("ab", &previous_style_runs, 4);
+        let mut row = CachedTerminalRow {
+            text: SharedString::from("ab"),
+            style_runs: previous_style_runs,
+            cells: cells.clone(),
+            glyph_instances: super::super::grid_renderer::glyph_instances_from_cells(&cells, 0),
+            damage_spans: Vec::new(),
+            damaged_glyph_instances: Vec::new(),
+        };
+
+        let changed = apply_ghostty_row_update(
+            &mut row,
+            GhosttyRowUpdate {
+                row: 0,
+                text: "ab".into(),
+                style_runs: vec![style_run(2, 2, 0x224466)],
+            },
+            4,
+            false,
+        );
+
+        assert!(changed);
+        assert_eq!(row.damage_spans, vec![super::super::grid_renderer::DamageSpan {
+            start_col: 1,
+            end_col: 2,
+        }]);
+    }
 }

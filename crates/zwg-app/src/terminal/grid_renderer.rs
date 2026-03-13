@@ -515,6 +515,30 @@ pub(crate) fn collect_damaged_glyph_keys(snapshot: &TerminalSnapshot) -> HashSet
 }
 
 #[cfg(feature = "ghostty_vt")]
+fn borrow_active_glyph_plans(
+    cache: &HashMap<GlyphKey, PreparedGlyphPlan>,
+    active_keys: &HashSet<GlyphKey>,
+) -> HashMap<GlyphKey, PreparedGlyphPlan> {
+    active_keys
+        .iter()
+        .filter_map(|key| cache.get(key).cloned().map(|plan| (key.clone(), plan)))
+        .collect()
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn persist_active_glyph_plans(
+    cache: &mut HashMap<GlyphKey, PreparedGlyphPlan>,
+    local_plans: &HashMap<GlyphKey, PreparedGlyphPlan>,
+    active_keys: &HashSet<GlyphKey>,
+) {
+    for key in active_keys {
+        if let Some(plan) = local_plans.get(key) {
+            cache.insert(key.clone(), plan.clone());
+        }
+    }
+}
+
+#[cfg(feature = "ghostty_vt")]
 fn prune_glyph_cache(cache: &mut HashMap<GlyphKey, PreparedGlyphPlan>, active_keys: &HashSet<GlyphKey>) {
     cache.retain(|key, _| active_keys.contains(key));
 }
@@ -738,7 +762,7 @@ pub(super) fn terminal_canvas(
             let mut glyph_layout_cache = {
                 let mut cache = glyph_cache.lock();
                 prune_glyph_cache(&mut cache, &active_glyph_keys);
-                cache
+                borrow_active_glyph_plans(&cache, &active_glyph_keys)
             };
             #[cfg(feature = "ghostty_vt")]
             for key in &damaged_glyph_keys {
@@ -748,7 +772,7 @@ pub(super) fn terminal_canvas(
                     &font_desc,
                     font_size,
                     config.cell_height,
-                    &mut *glyph_layout_cache,
+                    &mut glyph_layout_cache,
                 );
             }
 
@@ -833,7 +857,7 @@ pub(super) fn terminal_canvas(
                             &font_desc,
                             font_size,
                             config.cell_height,
-                            &mut *glyph_layout_cache,
+                            &mut glyph_layout_cache,
                         );
                         paint_glyph_instance(instance, &layout, bounds, &config, window);
                     }
@@ -976,6 +1000,13 @@ pub(super) fn terminal_canvas(
                     ),
                     rgba(0xF5F5F780),
                 ));
+            }
+
+            #[cfg(feature = "ghostty_vt")]
+            {
+                let mut cache = glyph_cache.lock();
+                prune_glyph_cache(&mut cache, &active_glyph_keys);
+                persist_active_glyph_plans(&mut cache, &glyph_layout_cache, &active_glyph_keys);
             }
         },
     )
@@ -1471,6 +1502,44 @@ mod tests {
 
         let keys = collect_damaged_glyph_keys(&snapshot);
         assert_eq!(keys, HashSet::from([damaged_key]));
+    }
+
+    #[::core::prelude::v1::test]
+    fn borrow_and_persist_active_glyph_plans_touch_only_active_keys() {
+        let active_key = GlyphKey {
+            glyph: "A".into(),
+            width: 1,
+            flags: 0,
+            render_path: GlyphRenderPath::AtlasMonochrome,
+        };
+        let stale_key = GlyphKey {
+            glyph: "B".into(),
+            width: 1,
+            flags: 0,
+            render_path: GlyphRenderPath::AtlasMonochrome,
+        };
+        let mut shared = HashMap::from([
+            (active_key.clone(), PreparedGlyphPlan::default()),
+            (stale_key.clone(), PreparedGlyphPlan::default()),
+        ]);
+        let active_keys = HashSet::from([active_key.clone()]);
+
+        let mut local = borrow_active_glyph_plans(&shared, &active_keys);
+        local.insert(
+            GlyphKey {
+                glyph: "X".into(),
+                width: 1,
+                flags: GHOSTTY_FLAG_BOLD,
+                render_path: GlyphRenderPath::AtlasMonochrome,
+            },
+            PreparedGlyphPlan::default(),
+        );
+        prune_glyph_cache(&mut shared, &active_keys);
+        persist_active_glyph_plans(&mut shared, &local, &active_keys);
+
+        assert_eq!(shared.len(), 1);
+        assert!(shared.contains_key(&active_key));
+        assert!(!shared.contains_key(&stale_key));
     }
 
     #[::core::prelude::v1::test]
