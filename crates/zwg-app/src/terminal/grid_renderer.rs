@@ -58,6 +58,23 @@ pub(super) struct GridRendererConfig {
     pub term_cols: u16,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GridCellKind {
+    Text,
+    GeometricBlock,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GridCell {
+    pub col: u16,
+    pub width: u8,
+    pub glyph: String,
+    pub fg_rgb: u32,
+    pub bg_rgb: u32,
+    pub flags: u8,
+    pub kind: GridCellKind,
+}
+
 pub(super) fn char_cell_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)
 }
@@ -91,6 +108,61 @@ pub(crate) fn sanitize_text_for_shaping(text: &str) -> String {
     text.chars()
         .map(|ch| if is_geometric_block_char(ch) { BRAILLE_BLANK } else { ch })
         .collect()
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn default_grid_cell_style() -> (u32, u32, u8) {
+    (DEFAULT_FG, DEFAULT_BG, 0)
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn grid_cell_style_at(style_runs: &[ghostty_vt::StyleRun], col: u16) -> (u32, u32, u8) {
+    style_runs
+        .iter()
+        .find(|run| run.start_col <= col && col <= run.end_col)
+        .map(|run| {
+            let fg = ((run.fg.r as u32) << 16) | ((run.fg.g as u32) << 8) | (run.fg.b as u32);
+            let bg = ((run.bg.r as u32) << 16) | ((run.bg.g as u32) << 8) | (run.bg.b as u32);
+            (fg, bg, run.flags)
+        })
+        .unwrap_or_else(default_grid_cell_style)
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn grid_cells_from_row(row: &CachedTerminalRow, max_cols: u16) -> Vec<GridCell> {
+    let mut cells: Vec<GridCell> = Vec::new();
+    let mut col = 0u16;
+
+    for ch in row.text.chars() {
+        let width = char_cell_width(ch) as u8;
+        if width == 0 {
+            if let Some(last) = cells.last_mut() {
+                last.glyph.push(ch);
+            }
+            continue;
+        }
+        if col >= max_cols {
+            break;
+        }
+
+        let (fg_rgb, bg_rgb, flags) = grid_cell_style_at(&row.style_runs, col + 1);
+        cells.push(GridCell {
+            col,
+            width,
+            glyph: ch.to_string(),
+            fg_rgb,
+            bg_rgb,
+            flags,
+            kind: if is_geometric_block_char(ch) {
+                GridCellKind::GeometricBlock
+            } else {
+                GridCellKind::Text
+            },
+        });
+        col = col.saturating_add(width as u16);
+    }
+
+    cells
 }
 
 pub(super) fn terminal_canvas(
@@ -144,6 +216,8 @@ pub(super) fn terminal_canvas(
 
             for (row_idx, row_data) in snapshot.rows.iter().enumerate() {
                 let row_y = row_idx as f32 * config.cell_height;
+                #[cfg(feature = "ghostty_vt")]
+                let row_cells = grid_cells_from_row(row_data, config.term_cols);
 
                 #[cfg(feature = "ghostty_vt")]
                 for srun in &row_data.style_runs {
@@ -179,6 +253,10 @@ pub(super) fn terminal_canvas(
                 if text.is_empty() {
                     continue;
                 }
+                #[cfg(feature = "ghostty_vt")]
+                let shaped_text: String =
+                    row_cells.iter().map(|cell| sanitize_text_for_shaping(&cell.glyph)).collect();
+                #[cfg(not(feature = "ghostty_vt"))]
                 let shaped_text = sanitize_text_for_shaping(text);
                 let origin = point(
                     bounds.origin.x + px(config.horizontal_text_padding),
@@ -198,7 +276,12 @@ pub(super) fn terminal_canvas(
                     strikethrough: None,
                 }];
 
-                let force_width = if text.chars().all(|ch| char_cell_width(ch) <= 1) {
+                #[cfg(feature = "ghostty_vt")]
+                let has_wide_cells = row_cells.iter().any(|cell| cell.width > 1);
+                #[cfg(not(feature = "ghostty_vt"))]
+                let has_wide_cells = text.chars().any(|ch| char_cell_width(ch) > 1);
+                let force_width = if !has_wide_cells && text.chars().all(|ch| char_cell_width(ch) <= 1)
+                {
                     Some(px(config.cell_width))
                 } else {
                     None
@@ -213,29 +296,17 @@ pub(super) fn terminal_canvas(
 
                 #[cfg(feature = "ghostty_vt")]
                 {
-                    let mut col: usize = 0;
-                    for ch in text.chars() {
-                        let w = char_cell_width(ch);
-                        if is_geometric_block_char(ch) {
-                            let col_1 = (col + 1) as u16;
-                            let fg = row_data
-                                .style_runs
-                                .iter()
-                                .find(|r| r.start_col <= col_1 && col_1 <= r.end_col)
-                                .map(|r| {
-                                    let v = ((r.fg.r as u32) << 16)
-                                        | ((r.fg.g as u32) << 8)
-                                        | (r.fg.b as u32);
-                                    Hsla::from(rgb(v))
-                                })
-                                .unwrap_or(default_fg);
+                    for cell in &row_cells {
+                        if cell.kind == GridCellKind::GeometricBlock {
+                            let fg = Hsla::from(rgb(cell.fg_rgb));
                             let x = bounds.origin.x
                                 + px(
                                     config.horizontal_text_padding
-                                        + col as f32 * config.cell_width,
+                                        + cell.col as f32 * config.cell_width,
                                 );
                             let y = bounds.origin.y + px(row_y);
-                            let cw = px(config.cell_width * w as f32);
+                            let cw = px(config.cell_width * cell.width as f32);
+                            let ch = cell.glyph.chars().next().unwrap_or(' ');
                             match ch {
                                 '\u{2588}' => {
                                     window.paint_quad(fill(
@@ -292,7 +363,6 @@ pub(super) fn terminal_canvas(
                                 _ => {}
                             }
                         }
-                        col += w;
                     }
                 }
             }
@@ -520,5 +590,56 @@ mod tests {
         assert_eq!(runs[0].len, "🔥".len());
         assert!(runs[0].underline.is_some());
         assert!(runs[1].underline.is_none());
+    }
+
+    #[::core::prelude::v1::test]
+    fn grid_cells_from_row_merges_zero_width_with_previous_cell() {
+        let row = CachedTerminalRow {
+            text: SharedString::from("🔥\u{FE0F}a"),
+            style_runs: vec![
+                ghostty_vt::StyleRun {
+                    start_col: 1,
+                    end_col: 2,
+                    fg: ghostty_vt::Rgb { r: 0xAA, g: 0x00, b: 0x00 },
+                    bg: ghostty_vt::Rgb { r: 0x00, g: 0x00, b: 0x00 },
+                    flags: GHOSTTY_FLAG_BOLD,
+                },
+                ghostty_vt::StyleRun {
+                    start_col: 3,
+                    end_col: 3,
+                    fg: ghostty_vt::Rgb { r: 0x00, g: 0xAA, b: 0x00 },
+                    bg: ghostty_vt::Rgb { r: 0x00, g: 0x00, b: 0x00 },
+                    flags: 0,
+                },
+            ],
+        };
+
+        let cells = grid_cells_from_row(&row, 10);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].glyph, "🔥\u{FE0F}");
+        assert_eq!(cells[0].width, 2);
+        assert_eq!(cells[0].col, 0);
+        assert_eq!(cells[0].flags, GHOSTTY_FLAG_BOLD);
+        assert_eq!(cells[1].glyph, "a");
+        assert_eq!(cells[1].col, 2);
+    }
+
+    #[::core::prelude::v1::test]
+    fn grid_cells_from_row_marks_geometric_blocks() {
+        let row = CachedTerminalRow {
+            text: SharedString::from("█a"),
+            style_runs: vec![ghostty_vt::StyleRun {
+                start_col: 1,
+                end_col: 2,
+                fg: ghostty_vt::Rgb { r: 0xFF, g: 0x88, b: 0x33 },
+                bg: ghostty_vt::Rgb { r: 0x11, g: 0x22, b: 0x33 },
+                flags: 0,
+            }],
+        };
+
+        let cells = grid_cells_from_row(&row, 10);
+        assert_eq!(cells.len(), 2);
+        assert_eq!(cells[0].kind, GridCellKind::GeometricBlock);
+        assert_eq!(cells[1].kind, GridCellKind::Text);
     }
 }
