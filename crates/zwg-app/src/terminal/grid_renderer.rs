@@ -10,7 +10,7 @@ use super::{DEFAULT_BG, DEFAULT_FG};
 /// Cross-frame glyph layout cache type.
 /// Persists shaped glyphs across render frames to avoid redundant text shaping.
 #[cfg(feature = "ghostty_vt")]
-pub(super) type GlyphCache = Arc<Mutex<HashMap<GlyphKey, ShapedLine>>>;
+pub(super) type GlyphCache = Arc<Mutex<HashMap<GlyphKey, PreparedGlyphPlan>>>;
 
 #[cfg(not(feature = "ghostty_vt"))]
 pub(super) type GlyphCache = ();
@@ -115,6 +115,34 @@ pub(crate) struct GlyphInstance {
     pub key: GlyphKey,
 }
 
+#[cfg(feature = "ghostty_vt")]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PreparedGlyph {
+    pub font_id: FontId,
+    pub glyph_id: GlyphId,
+    pub position: Point<Pixels>,
+    pub is_emoji: bool,
+}
+
+#[cfg(feature = "ghostty_vt")]
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PreparedGlyphPlan {
+    pub font_size: Pixels,
+    pub baseline_y: Pixels,
+    pub glyphs: Vec<PreparedGlyph>,
+}
+
+#[cfg(feature = "ghostty_vt")]
+impl Default for PreparedGlyphPlan {
+    fn default() -> Self {
+        Self {
+            font_size: px(0.0),
+            baseline_y: px(0.0),
+            glyphs: Vec::new(),
+        }
+    }
+}
+
 pub(super) fn char_cell_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)
 }
@@ -205,7 +233,7 @@ pub(crate) fn collect_active_glyph_keys(snapshot: &TerminalSnapshot) -> HashSet<
 }
 
 #[cfg(feature = "ghostty_vt")]
-fn prune_glyph_cache(cache: &mut HashMap<GlyphKey, ShapedLine>, active_keys: &HashSet<GlyphKey>) {
+fn prune_glyph_cache(cache: &mut HashMap<GlyphKey, PreparedGlyphPlan>, active_keys: &HashSet<GlyphKey>) {
     cache.retain(|key, _| active_keys.contains(key));
 }
 
@@ -249,13 +277,15 @@ fn glyph_layout_for_key(
     text_system: &WindowTextSystem,
     font_desc: &Font,
     font_size: Pixels,
-    cache: &mut HashMap<GlyphKey, ShapedLine>,
-) -> ShapedLine {
+    cell_height: f32,
+    cache: &mut HashMap<GlyphKey, PreparedGlyphPlan>,
+) -> PreparedGlyphPlan {
     cache
         .entry(key.clone())
         .or_insert_with(|| {
             let run = text_run_for_glyph_key(key, font_desc, Hsla::default());
-            text_system.shape_line(SharedString::from(key.glyph.clone()), font_size, &[run], None)
+            let shaped = text_system.shape_line(SharedString::from(key.glyph.clone()), font_size, &[run], None);
+            glyph_plan_from_layout(&shaped, cell_height)
         })
         .clone()
 }
@@ -267,9 +297,31 @@ fn glyph_baseline_y(layout: &LineLayout, cell_height: f32) -> Pixels {
 }
 
 #[cfg(feature = "ghostty_vt")]
+fn glyph_plan_from_layout(layout: &LineLayout, cell_height: f32) -> PreparedGlyphPlan {
+    let glyphs = layout
+        .runs
+        .iter()
+        .flat_map(|run| {
+            run.glyphs.iter().map(move |glyph| PreparedGlyph {
+                font_id: run.font_id,
+                glyph_id: glyph.id,
+                position: glyph.position,
+                is_emoji: glyph.is_emoji,
+            })
+        })
+        .collect();
+
+    PreparedGlyphPlan {
+        font_size: layout.font_size,
+        baseline_y: glyph_baseline_y(layout, cell_height),
+        glyphs,
+    }
+}
+
+#[cfg(feature = "ghostty_vt")]
 fn paint_glyph_instance(
     instance: &GlyphInstance,
-    layout: &LineLayout,
+    plan: &PreparedGlyphPlan,
     bounds: Bounds<Pixels>,
     config: &GridRendererConfig,
     window: &mut Window,
@@ -279,19 +331,23 @@ fn paint_glyph_instance(
         bounds.origin.x + px(config.horizontal_text_padding + instance.col as f32 * config.cell_width),
         bounds.origin.y + px(instance.row as f32 * config.cell_height),
     );
-    let baseline_origin = point(cell_origin.x, cell_origin.y + glyph_baseline_y(layout, config.cell_height));
+    let baseline_origin = point(cell_origin.x, cell_origin.y + plan.baseline_y);
 
-    for run in &layout.runs {
-        for glyph in &run.glyphs {
-            let glyph_origin = point(
-                baseline_origin.x + glyph.position.x,
-                baseline_origin.y + glyph.position.y,
+    for glyph in &plan.glyphs {
+        let glyph_origin = point(
+            baseline_origin.x + glyph.position.x,
+            baseline_origin.y + glyph.position.y,
+        );
+        if glyph.is_emoji {
+            let _ = window.paint_emoji(glyph_origin, glyph.font_id, glyph.glyph_id, plan.font_size);
+        } else {
+            let _ = window.paint_glyph(
+                glyph_origin,
+                glyph.font_id,
+                glyph.glyph_id,
+                plan.font_size,
+                glyph_color,
             );
-            if glyph.is_emoji {
-                let _ = window.paint_emoji(glyph_origin, run.font_id, glyph.id, layout.font_size);
-            } else {
-                let _ = window.paint_glyph(glyph_origin, run.font_id, glyph.id, layout.font_size, glyph_color);
-            }
         }
     }
 
@@ -481,6 +537,7 @@ pub(super) fn terminal_canvas(
                             &text_system,
                             &font_desc,
                             font_size,
+                            config.cell_height,
                             &mut *glyph_layout_cache,
                         );
                         paint_glyph_instance(instance, &layout, bounds, &config, window);
@@ -1081,8 +1138,8 @@ mod tests {
         };
 
         let mut cache = HashMap::from([
-            (active_key.clone(), ShapedLine::default()),
-            (stale_key.clone(), ShapedLine::default()),
+            (active_key.clone(), PreparedGlyphPlan::default()),
+            (stale_key.clone(), PreparedGlyphPlan::default()),
         ]);
         let active = HashSet::from([active_key.clone()]);
 
@@ -1165,4 +1222,5 @@ mod tests {
 
         assert_eq!(glyph_baseline_y(&layout, 16.0), px(11.0));
     }
+
 }
