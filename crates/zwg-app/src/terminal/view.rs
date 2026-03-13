@@ -8,31 +8,23 @@ use std::sync::{
 
 use gpui::*;
 use gpui::ElementInputHandler;
-use unicode_width::UnicodeWidthChar;
 
+use super::grid_renderer::{
+    GridRendererConfig, SelectionPoint, TerminalSnapshot, col_to_char_index, terminal_canvas,
+};
 use super::pty::{ConPtyConfig, spawn_pty};
 use super::surface::TerminalSurface;
-use super::{DEFAULT_BG, DEFAULT_FG, TerminalSettings};
+use super::{DEFAULT_BG, TerminalSettings};
 
 const FONT_FAMILY: &str = "Consolas";
 const FONT_SIZE: f32 = 13.0;
 const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
-const BRAILLE_BLANK: char = '\u{2800}';
 /// Fallback values — replaced at runtime by measured font metrics
 const CELL_WIDTH_FALLBACK: f32 = 8.4;
 const CELL_HEIGHT_FALLBACK: f32 = 19.5;
 pub const CELL_WIDTH_ESTIMATE: f32 = CELL_WIDTH_FALLBACK;
 pub const CELL_HEIGHT_ESTIMATE: f32 = CELL_HEIGHT_FALLBACK;
 pub const WINDOW_CHROME_HEIGHT: f32 = 60.0;
-
-#[cfg(feature = "ghostty_vt")]
-const GHOSTTY_FLAG_BOLD: u8 = 0x02;
-#[cfg(feature = "ghostty_vt")]
-const GHOSTTY_FLAG_ITALIC: u8 = 0x04;
-#[cfg(feature = "ghostty_vt")]
-const GHOSTTY_FLAG_UNDERLINE: u8 = 0x08;
-#[cfg(feature = "ghostty_vt")]
-const GHOSTTY_FLAG_STRIKETHROUGH: u8 = 0x40;
 
 /// Measure the actual monospace cell dimensions from the font at FONT_SIZE.
 /// Cell width = max advance width of representative monospace glyphs.
@@ -129,42 +121,6 @@ fn install_ime_hook() {
 #[cfg(not(target_os = "windows"))]
 fn install_ime_hook() {}
 
-fn char_cell_width(ch: char) -> usize {
-    UnicodeWidthChar::width(ch).unwrap_or(0)
-}
-
-fn is_geometric_block_char(ch: char) -> bool {
-    matches!(
-        ch,
-        '\u{2580}'
-            | '\u{2584}'
-            | '\u{2588}'
-            | '\u{258C}'
-            | '\u{2590}'
-            | '\u{2591}'
-            | '\u{2592}'
-            | '\u{2593}'
-    )
-}
-
-fn sanitize_text_for_shaping(text: &str) -> String {
-    text.chars()
-        .map(|ch| if is_geometric_block_char(ch) { BRAILLE_BLANK } else { ch })
-        .collect()
-}
-
-/// Convert terminal column position to character index in a string
-fn col_to_char_index(text: &str, target_col: usize) -> usize {
-    let mut col = 0;
-    for (i, ch) in text.chars().enumerate() {
-        if col >= target_col {
-            return i;
-        }
-        col += char_cell_width(ch);
-    }
-    text.chars().count()
-}
-
 fn normalize_terminal_newlines(text: &str) -> Vec<u8> {
     let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
     normalized.into_bytes()
@@ -187,12 +143,6 @@ fn format_dropped_paths(paths: &ExternalPaths) -> String {
         .join(" ")
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-struct SelectionPoint {
-    row: u16,
-    col: u16,
-}
-
 /// Terminal connection state — two-phase init pattern
 enum TerminalState {
     /// PTY is being spawned in background
@@ -201,35 +151,6 @@ enum TerminalState {
     Running,
     /// PTY spawn failed
     Failed(String),
-}
-
-#[derive(Clone, Default)]
-struct CachedTerminalRow {
-    /// SharedString: O(1) clone (Arc-backed) — avoids per-frame String allocation
-    text: SharedString,
-    #[cfg(feature = "ghostty_vt")]
-    style_runs: Vec<ghostty_vt::StyleRun>,
-}
-
-struct TerminalSnapshot {
-    rows: Vec<CachedTerminalRow>,
-    cursor_x: u16,
-    cursor_y: u16,
-}
-
-impl TerminalSnapshot {
-    fn new(rows: u16) -> Self {
-        Self {
-            rows: vec![CachedTerminalRow::default(); rows as usize],
-            cursor_x: 0,
-            cursor_y: 0,
-        }
-    }
-
-    fn resize(&mut self, rows: u16) {
-        self.rows
-            .resize(rows as usize, CachedTerminalRow::default());
-    }
 }
 
 /// Terminal pane: GPUI component that wraps a TerminalSurface
@@ -611,234 +532,22 @@ impl TerminalPane {
             self.refresh_snapshot(true);
         }
 
-        let num_rows = self.snapshot.rows.len();
-        let cursor_x = self.snapshot.cursor_x;
-        let cursor_y = self.snapshot.cursor_y;
-        let cell_h = self.cell_height;
-        let cell_w = self.cell_width;
-        let term_cols = self.term_cols;
-
-        // Clone snapshot data for canvas closure (SharedString clone is O(1))
-        let rows_snapshot: Vec<CachedTerminalRow> = self.snapshot.rows.clone();
+        let snapshot = self.snapshot.clone();
         let selection = self.selection_range();
 
         let ime = self.ime_canvas(cx);
-
-        // Canvas-based terminal rendering — ShapedLine::paint at exact grid positions
-        let terminal_canvas = canvas(
-            |_, _, _| (),
-            move |bounds: Bounds<Pixels>, _, window: &mut Window, cx: &mut App| {
-                let text_system = window.text_system().clone();
-                let font_desc = font(FONT_FAMILY);
-                let font_size = px(FONT_SIZE);
-                let line_height_px = px(cell_h);
-                let default_fg = Hsla::from(rgb(DEFAULT_FG));
-
-                // Clear the canvas every frame so shorter updates do not leave
-                // stale glyphs behind on rows that previously contained longer text.
-                window.paint_quad(fill(bounds, Hsla::from(rgb(DEFAULT_BG))));
-
-                // 1) Paint selection background (behind text)
-                if let Some((sel_start, sel_end)) = selection {
-                    let max_row = sel_end.row.min(num_rows.saturating_sub(1) as u16);
-                    for row in sel_start.row..=max_row {
-                        let sc = if row == sel_start.row { sel_start.col } else { 0 };
-                        let ec = if row == sel_end.row { sel_end.col } else { term_cols };
-                        if sc >= ec { continue; }
-                        window.paint_quad(fill(
-                            Bounds::new(
-                                point(
-                                    bounds.origin.x + px(HORIZONTAL_TEXT_PADDING + sc as f32 * cell_w),
-                                    bounds.origin.y + px(row as f32 * cell_h),
-                                ),
-                                size(px((ec - sc) as f32 * cell_w), line_height_px),
-                            ),
-                            rgba(0x2F6FED55),
-                        ));
-                    }
-                }
-
-                // 2) Paint text rows
-                for (row_idx, row_data) in rows_snapshot.iter().enumerate() {
-                    let row_y = row_idx as f32 * cell_h;
-
-                    // 2a) Paint cell backgrounds at exact grid positions.
-                    // Manual paint_quad avoids sub-pixel tiling gaps that
-                    // shaped.paint_background() produces at fractional coords.
-                    #[cfg(feature = "ghostty_vt")]
-                    for srun in &row_data.style_runs {
-                        let bg_val = ((srun.bg.r as u32) << 16)
-                            | ((srun.bg.g as u32) << 8)
-                            | (srun.bg.b as u32);
-                        if bg_val != DEFAULT_BG {
-                            let sc = srun.start_col.saturating_sub(1) as f32;
-                            let ec = srun.end_col as f32;
-                            if ec > sc {
-                                window.paint_quad(fill(
-                                    Bounds::new(
-                                        point(
-                                            bounds.origin.x
-                                                + px(HORIZONTAL_TEXT_PADDING + sc * cell_w),
-                                            bounds.origin.y + px(row_y),
-                                        ),
-                                        size(px((ec - sc) * cell_w), line_height_px),
-                                    ),
-                                    Hsla::from(rgb(bg_val)),
-                                ));
-                            }
-                        }
-                    }
-
-                    // 2b) Shape and paint text glyphs
-                    let text = &row_data.text;
-                    if text.is_empty() {
-                        continue;
-                    }
-                    let shaped_text = sanitize_text_for_shaping(text);
-
-                    let origin = point(
-                        bounds.origin.x + px(HORIZONTAL_TEXT_PADDING),
-                        bounds.origin.y + px(row_y),
-                    );
-
-                    #[cfg(feature = "ghostty_vt")]
-                    let runs = build_canvas_text_runs(
-                        &shaped_text,
-                        &row_data.style_runs,
-                        &font_desc,
-                        default_fg,
-                    );
-                    #[cfg(not(feature = "ghostty_vt"))]
-                    let runs = vec![TextRun {
-                        len: shaped_text.len(),
-                        font: font_desc.clone(),
-                        color: default_fg,
-                        background_color: None,
-                        underline: None,
-                        strikethrough: None,
-                    }];
-
-                    // Wide graphemes such as emoji need their natural advance.
-                    // Single-cell rows still benefit from force_width grid alignment.
-                    let force_width = if text.chars().all(|ch| char_cell_width(ch) <= 1) {
-                        Some(px(cell_w))
-                    } else {
-                        None
-                    };
-                    let shaped = text_system.shape_line(
-                        SharedString::from(shaped_text),
-                        font_size,
-                        &runs,
-                        force_width,
-                    );
-                    let _ = shaped.paint(origin, line_height_px, window, cx);
-
-                    // 2c) Overdraw block element chars with geometric quads.
-                    // Font glyphs for ▀▄█ have anti-aliased edges that create
-                    // visible gaps; paint_quad gives pixel-perfect rectangles.
-                    #[cfg(feature = "ghostty_vt")]
-                    {
-                        let mut col: usize = 0;
-                        for ch in text.chars() {
-                            let w = char_cell_width(ch);
-                            if is_geometric_block_char(ch) {
-                                let col_1 = (col + 1) as u16;
-                                let fg = row_data.style_runs.iter()
-                                    .find(|r| r.start_col <= col_1 && col_1 <= r.end_col)
-                                    .map(|r| {
-                                        let v = ((r.fg.r as u32) << 16)
-                                            | ((r.fg.g as u32) << 8)
-                                            | (r.fg.b as u32);
-                                        Hsla::from(rgb(v))
-                                    })
-                                    .unwrap_or(default_fg);
-                                let x = bounds.origin.x
-                                    + px(HORIZONTAL_TEXT_PADDING + col as f32 * cell_w);
-                                let y = bounds.origin.y + px(row_y);
-                                let cw = px(cell_w * w as f32);
-                                match ch {
-                                    '\u{2588}' => {
-                                        window.paint_quad(fill(
-                                            Bounds::new(point(x, y), size(cw, line_height_px)),
-                                            fg,
-                                        ));
-                                    }
-                                    '\u{2580}' => {
-                                        let h = px(cell_h * 0.5);
-                                        window.paint_quad(fill(
-                                            Bounds::new(point(x, y), size(cw, h)),
-                                            fg,
-                                        ));
-                                    }
-                                    '\u{2584}' => {
-                                        let h = px(cell_h * 0.5);
-                                        window.paint_quad(fill(
-                                            Bounds::new(
-                                                point(x, y + h),
-                                                size(cw, h),
-                                            ),
-                                            fg,
-                                        ));
-                                    }
-                                    '\u{258C}' => {
-                                        let hw = px(cell_w * 0.5);
-                                        window.paint_quad(fill(
-                                            Bounds::new(point(x, y), size(hw, line_height_px)),
-                                            fg,
-                                        ));
-                                    }
-                                    '\u{2590}' => {
-                                        let hw = px(cell_w * 0.5);
-                                        window.paint_quad(fill(
-                                            Bounds::new(
-                                                point(x + hw, y),
-                                                size(hw, line_height_px),
-                                            ),
-                                            fg,
-                                        ));
-                                    }
-                                    '\u{2591}' => {
-                                        window.paint_quad(fill(
-                                            Bounds::new(point(x, y), size(cw, line_height_px)),
-                                            fg.opacity(0.25),
-                                        ));
-                                    }
-                                    '\u{2592}' => {
-                                        window.paint_quad(fill(
-                                            Bounds::new(point(x, y), size(cw, line_height_px)),
-                                            fg.opacity(0.5),
-                                        ));
-                                    }
-                                    '\u{2593}' => {
-                                        window.paint_quad(fill(
-                                            Bounds::new(point(x, y), size(cw, line_height_px)),
-                                            fg.opacity(0.75),
-                                        ));
-                                    }
-                                    _ => {}
-                                }
-                            }
-                            col += w;
-                        }
-                    }
-                }
-
-                // 3) Paint cursor
-                if (cursor_y as usize) < num_rows {
-                    window.paint_quad(fill(
-                        Bounds::new(
-                            point(
-                                bounds.origin.x + px(HORIZONTAL_TEXT_PADDING + cursor_x as f32 * cell_w),
-                                bounds.origin.y + px(cursor_y as f32 * cell_h),
-                            ),
-                            size(px(cell_w), line_height_px),
-                        ),
-                        rgba(0xF5F5F780),
-                    ));
-                }
+        let terminal_canvas = terminal_canvas(
+            snapshot,
+            selection,
+            GridRendererConfig {
+                cell_width: self.cell_width,
+                cell_height: self.cell_height,
+                font_family: FONT_FAMILY,
+                font_size: FONT_SIZE,
+                horizontal_text_padding: HORIZONTAL_TEXT_PADDING,
+                term_cols: self.term_cols,
             },
-        )
-        .size_full();
+        );
 
         div()
             .id("terminal-pane")
@@ -867,100 +576,6 @@ impl Render for TerminalPane {
             TerminalState::Running => self.render_running(window, cx).into_any_element(),
         }
     }
-}
-
-/// Build TextRun[] from Ghostty style runs for ShapedLine-based canvas rendering.
-#[cfg(feature = "ghostty_vt")]
-fn build_canvas_text_runs(
-    text: &str,
-    style_runs: &[ghostty_vt::StyleRun],
-    font_desc: &Font,
-    default_fg: Hsla,
-) -> Vec<TextRun> {
-    if style_runs.is_empty() || text.is_empty() {
-        return vec![TextRun {
-            len: text.len(),
-            font: font_desc.clone(),
-            color: default_fg,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        }];
-    }
-
-    let char_byte_offsets: Vec<usize> = text
-        .char_indices()
-        .map(|(i, _)| i)
-        .chain(std::iter::once(text.len()))
-        .collect();
-
-    let mut runs: Vec<TextRun> = Vec::new();
-    let mut covered_to_byte: usize = 0;
-
-    for run in style_runs {
-        let start_char = col_to_char_index(text, run.start_col.saturating_sub(1) as usize);
-        let end_char = col_to_char_index(text, run.end_col as usize);
-        if start_char >= char_byte_offsets.len().saturating_sub(1) || start_char >= end_char {
-            continue;
-        }
-
-        let byte_start = char_byte_offsets[start_char];
-        let byte_end = char_byte_offsets[end_char.min(char_byte_offsets.len() - 1)];
-
-        // Skip if overlapping or already past
-        if byte_start < covered_to_byte { continue; }
-
-        // Gap before this run — fill with default style
-        if covered_to_byte < byte_start {
-            runs.push(TextRun {
-                len: byte_start - covered_to_byte,
-                font: font_desc.clone(),
-                color: default_fg,
-                background_color: None,
-                underline: None,
-                strikethrough: None,
-            });
-        }
-
-        let fg_val = ((run.fg.r as u32) << 16) | ((run.fg.g as u32) << 8) | (run.fg.b as u32);
-        let fg_color = Hsla::from(rgb(fg_val));
-
-        let mut run_font = font_desc.clone();
-        if run.flags & GHOSTTY_FLAG_BOLD != 0 {
-            run_font.weight = FontWeight::BOLD;
-        }
-        if run.flags & GHOSTTY_FLAG_ITALIC != 0 {
-            run_font.style = FontStyle::Italic;
-        }
-
-        runs.push(TextRun {
-            len: byte_end - byte_start,
-            font: run_font,
-            color: fg_color,
-            background_color: None, // painted manually via paint_quad at grid positions
-            underline: if run.flags & GHOSTTY_FLAG_UNDERLINE != 0 {
-                Some(UnderlineStyle { thickness: px(1.0), color: Some(fg_color), wavy: false })
-            } else { None },
-            strikethrough: if run.flags & GHOSTTY_FLAG_STRIKETHROUGH != 0 {
-                Some(StrikethroughStyle { thickness: px(1.0), color: Some(fg_color) })
-            } else { None },
-        });
-        covered_to_byte = byte_end;
-    }
-
-    // Tail text with default style
-    if covered_to_byte < text.len() {
-        runs.push(TextRun {
-            len: text.len() - covered_to_byte,
-            font: font_desc.clone(),
-            color: default_fg,
-            background_color: None,
-            underline: None,
-            strikethrough: None,
-        });
-    }
-
-    runs
 }
 
 impl TerminalPane {
@@ -1390,106 +1005,4 @@ fn slice_text_by_cols(text: &str, start_col: usize, end_col: usize) -> String {
         .skip(start_idx)
         .take(end_idx.saturating_sub(start_idx))
         .collect()
-}
-
-#[cfg(all(test, feature = "ghostty_vt"))]
-mod tests {
-    use super::*;
-
-    fn sample_style_run(flags: u8) -> ghostty_vt::StyleRun {
-        ghostty_vt::StyleRun {
-            start_col: 1,
-            end_col: 3,
-            fg: ghostty_vt::Rgb {
-                r: 0xFF,
-                g: 0x88,
-                b: 0x33,
-            },
-            bg: ghostty_vt::Rgb {
-                r: 0x11,
-                g: 0x22,
-                b: 0x33,
-            },
-            flags,
-        }
-    }
-
-    #[::core::prelude::v1::test]
-    fn build_canvas_text_runs_uses_ghostty_flag_layout() {
-        let runs = build_canvas_text_runs(
-            "abc",
-            &[sample_style_run(
-                GHOSTTY_FLAG_BOLD
-                    | GHOSTTY_FLAG_ITALIC
-                    | GHOSTTY_FLAG_UNDERLINE
-                    | GHOSTTY_FLAG_STRIKETHROUGH,
-            )],
-            &font(FONT_FAMILY),
-            Hsla::from(rgb(DEFAULT_FG)),
-        );
-
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].font.weight, FontWeight::BOLD);
-        assert_eq!(runs[0].font.style, FontStyle::Italic);
-        assert!(runs[0].underline.is_some());
-        assert!(runs[0].strikethrough.is_some());
-    }
-
-    #[::core::prelude::v1::test]
-    fn build_canvas_text_runs_does_not_confuse_italic_with_underline() {
-        let runs = build_canvas_text_runs(
-            "abc",
-            &[sample_style_run(GHOSTTY_FLAG_ITALIC)],
-            &font(FONT_FAMILY),
-            Hsla::from(rgb(DEFAULT_FG)),
-        );
-
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].font.style, FontStyle::Italic);
-        assert!(runs[0].underline.is_none());
-        assert!(runs[0].strikethrough.is_none());
-    }
-
-    #[::core::prelude::v1::test]
-    fn char_cell_width_treats_wide_glyphs_as_two_cells() {
-        assert_eq!(char_cell_width('a'), 1);
-        assert_eq!(char_cell_width('あ'), 2);
-        assert_eq!(char_cell_width('🔥'), 2);
-        assert_eq!(char_cell_width('\u{FE0F}'), 0);
-    }
-
-    #[::core::prelude::v1::test]
-    fn sanitize_text_for_shaping_replaces_block_glyphs_only() {
-        let shaped = sanitize_text_for_shaping("A█▀B");
-        assert_eq!(shaped, format!("A{BRAILLE_BLANK}{BRAILLE_BLANK}B"));
-    }
-
-    #[::core::prelude::v1::test]
-    fn build_canvas_text_runs_maps_style_runs_by_terminal_columns() {
-        let runs = build_canvas_text_runs(
-            "🔥a",
-            &[ghostty_vt::StyleRun {
-                start_col: 1,
-                end_col: 2,
-                fg: ghostty_vt::Rgb {
-                    r: 0xFF,
-                    g: 0x88,
-                    b: 0x33,
-                },
-                bg: ghostty_vt::Rgb {
-                    r: 0x11,
-                    g: 0x22,
-                    b: 0x33,
-                },
-                flags: GHOSTTY_FLAG_UNDERLINE,
-            }],
-            &font(FONT_FAMILY),
-            Hsla::from(rgb(DEFAULT_FG)),
-        );
-
-        assert_eq!(runs.len(), 2);
-        assert_eq!(runs[0].len, "🔥".len());
-        assert!(runs[0].underline.is_some());
-        assert!(runs[1].underline.is_none());
-    }
 }
