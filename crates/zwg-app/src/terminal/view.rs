@@ -11,7 +11,9 @@ use gpui::ElementInputHandler;
 
 use super::grid_renderer::{
     GlyphCache, GridRendererConfig, SelectionPoint, TerminalSnapshot, col_to_char_index,
-    grid_cells_from_parts, terminal_canvas,
+    damage_spans_from_terminal_row, full_row_damage, glyph_instances_in_damage,
+    grid_cells_from_parts, patch_cells_in_damage, patch_glyph_instances_in_damage,
+    terminal_canvas,
 };
 #[cfg(feature = "ghostty_vt")]
 use super::gpu_view::{GpuTerminalState, gpu_terminal_canvas};
@@ -435,12 +437,41 @@ impl TerminalPane {
             {
                 let text = backend.row_text(row);
                 let style_runs = backend.row_style_runs(row);
-                let cells = grid_cells_from_parts(&text, &style_runs, self.term_cols);
-                let glyph_instances = super::grid_renderer::glyph_instances_from_cells(&cells, row);
+                let next_cells = grid_cells_from_parts(&text, &style_runs, self.term_cols);
+                let damage_spans = if force_full {
+                    full_row_damage(self.term_cols)
+                } else {
+                    damage_spans_from_terminal_row(
+                        &cached_row.cells,
+                        &cached_row.style_runs,
+                        &next_cells,
+                        &style_runs,
+                        self.term_cols,
+                    )
+                };
+                let cells = if force_full {
+                    next_cells.clone()
+                } else {
+                    patch_cells_in_damage(&cached_row.cells, &next_cells, &damage_spans)
+                };
+                let glyph_instances = if force_full {
+                    super::grid_renderer::glyph_instances_from_cells(&cells, row)
+                } else {
+                    patch_glyph_instances_in_damage(
+                        &cached_row.glyph_instances,
+                        &next_cells,
+                        row,
+                        &damage_spans,
+                    )
+                };
+                let damaged_glyph_instances = glyph_instances_in_damage(&cells, row, &damage_spans);
+
                 cached_row.text = SharedString::from(text);
                 cached_row.style_runs = style_runs;
                 cached_row.cells = cells;
                 cached_row.glyph_instances = glyph_instances;
+                cached_row.damage_spans = damage_spans;
+                cached_row.damaged_glyph_instances = damaged_glyph_instances;
             }
             #[cfg(not(feature = "ghostty_vt"))]
             {
@@ -452,7 +483,14 @@ impl TerminalPane {
                     .copied()
                     .unwrap_or(0);
             }
-            changed = true;
+            #[cfg(feature = "ghostty_vt")]
+            {
+                changed |= !cached_row.damage_spans.is_empty();
+            }
+            #[cfg(not(feature = "ghostty_vt"))]
+            {
+                changed = true;
+            }
         }
 
         #[cfg(not(feature = "ghostty_vt"))]

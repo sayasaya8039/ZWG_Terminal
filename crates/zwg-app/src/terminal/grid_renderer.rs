@@ -41,6 +41,10 @@ pub(super) struct CachedTerminalRow {
     pub cells: Vec<GridCell>,
     #[cfg(feature = "ghostty_vt")]
     pub glyph_instances: Vec<GlyphInstance>,
+    #[cfg(feature = "ghostty_vt")]
+    pub damage_spans: Vec<DamageSpan>,
+    #[cfg(feature = "ghostty_vt")]
+    pub damaged_glyph_instances: Vec<GlyphInstance>,
 }
 
 #[derive(Clone)]
@@ -113,6 +117,12 @@ pub(crate) struct GlyphInstance {
     pub fg_rgb: u32,
     pub bg_rgb: u32,
     pub key: GlyphKey,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DamageSpan {
+    pub start_col: u16,
+    pub end_col: u16,
 }
 
 #[cfg(feature = "ghostty_vt")]
@@ -217,6 +227,267 @@ pub(crate) fn glyph_instances_from_cells(cells: &[GridCell], row: u16) -> Vec<Gl
 }
 
 #[cfg(feature = "ghostty_vt")]
+fn spans_overlap(start: u16, end: u16, span: DamageSpan) -> bool {
+    start < span.end_col && span.start_col < end
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn cell_overlaps_damage(cell: &GridCell, spans: &[DamageSpan]) -> bool {
+    let start = cell.col;
+    let end = cell.col.saturating_add(cell.width as u16);
+    spans.iter().copied().any(|span| spans_overlap(start, end, span))
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn instance_overlaps_damage(instance: &GlyphInstance, spans: &[DamageSpan]) -> bool {
+    let start = instance.col;
+    let end = instance.col.saturating_add(instance.key.width as u16);
+    spans.iter().copied().any(|span| spans_overlap(start, end, span))
+}
+
+#[cfg(feature = "ghostty_vt")]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ColumnDamageSignature {
+    head_col: u16,
+    width: u8,
+    glyph: String,
+    fg_rgb: u32,
+    bg_rgb: u32,
+    flags: u8,
+    kind: GridCellKind,
+}
+
+#[cfg(feature = "ghostty_vt")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StyleDamageSignature {
+    fg_rgb: u32,
+    bg_rgb: u32,
+    flags: u8,
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn column_damage_signatures(cells: &[GridCell], max_cols: u16) -> Vec<Option<ColumnDamageSignature>> {
+    let mut columns = vec![None; max_cols as usize];
+    for cell in cells {
+        let signature = ColumnDamageSignature {
+            head_col: cell.col,
+            width: cell.width,
+            glyph: cell.glyph.clone(),
+            fg_rgb: cell.fg_rgb,
+            bg_rgb: cell.bg_rgb,
+            flags: cell.flags,
+            kind: cell.kind,
+        };
+
+        let start = cell.col.min(max_cols);
+        let end = cell.col.saturating_add(cell.width as u16).min(max_cols);
+        for col in start..end {
+            columns[col as usize] = Some(signature.clone());
+        }
+    }
+
+    columns
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn style_damage_signatures(
+    style_runs: &[ghostty_vt::StyleRun],
+    term_cols: u16,
+) -> Vec<StyleDamageSignature> {
+    (0..term_cols)
+        .map(|col| {
+            let (fg_rgb, bg_rgb, flags) = grid_cell_style_at(style_runs, col + 1);
+            StyleDamageSignature {
+                fg_rgb,
+                bg_rgb,
+                flags,
+            }
+        })
+        .collect()
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn merge_damage_spans(mut spans: Vec<DamageSpan>) -> Vec<DamageSpan> {
+    if spans.is_empty() {
+        return spans;
+    }
+
+    spans.sort_unstable_by_key(|span| (span.start_col, span.end_col));
+    let mut merged = vec![spans[0]];
+    for span in spans.into_iter().skip(1) {
+        let last = merged.last_mut().expect("merged spans always has a head");
+        if span.start_col <= last.end_col {
+            last.end_col = last.end_col.max(span.end_col);
+        } else {
+            merged.push(span);
+        }
+    }
+
+    merged
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn full_row_damage(term_cols: u16) -> Vec<DamageSpan> {
+    merge_damage_spans(if term_cols == 0 {
+        Vec::new()
+    } else {
+        vec![DamageSpan {
+            start_col: 0,
+            end_col: term_cols,
+        }]
+    })
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn damage_spans_from_cells(
+    previous: &[GridCell],
+    next: &[GridCell],
+    term_cols: u16,
+) -> Vec<DamageSpan> {
+    let previous_columns = column_damage_signatures(previous, term_cols);
+    let next_columns = column_damage_signatures(next, term_cols);
+    let mut spans = Vec::new();
+    let mut span_start = None;
+
+    for col in 0..term_cols {
+        let changed = previous_columns[col as usize] != next_columns[col as usize];
+        match (span_start, changed) {
+            (None, true) => span_start = Some(col),
+            (Some(start_col), false) => {
+                spans.push(DamageSpan {
+                    start_col,
+                    end_col: col,
+                });
+                span_start = None;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(start_col) = span_start {
+        spans.push(DamageSpan {
+            start_col,
+            end_col: term_cols,
+        });
+    }
+
+    spans
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn damage_spans_from_style_runs(
+    previous: &[ghostty_vt::StyleRun],
+    next: &[ghostty_vt::StyleRun],
+    term_cols: u16,
+) -> Vec<DamageSpan> {
+    let previous_columns = style_damage_signatures(previous, term_cols);
+    let next_columns = style_damage_signatures(next, term_cols);
+    let mut spans = Vec::new();
+    let mut span_start = None;
+
+    for col in 0..term_cols {
+        let changed = previous_columns[col as usize] != next_columns[col as usize];
+        match (span_start, changed) {
+            (None, true) => span_start = Some(col),
+            (Some(start_col), false) => {
+                spans.push(DamageSpan {
+                    start_col,
+                    end_col: col,
+                });
+                span_start = None;
+            }
+            _ => {}
+        }
+    }
+
+    if let Some(start_col) = span_start {
+        spans.push(DamageSpan {
+            start_col,
+            end_col: term_cols,
+        });
+    }
+
+    spans
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn damage_spans_from_terminal_row(
+    previous_cells: &[GridCell],
+    previous_styles: &[ghostty_vt::StyleRun],
+    next_cells: &[GridCell],
+    next_styles: &[ghostty_vt::StyleRun],
+    term_cols: u16,
+) -> Vec<DamageSpan> {
+    merge_damage_spans(
+        damage_spans_from_cells(previous_cells, next_cells, term_cols)
+            .into_iter()
+            .chain(damage_spans_from_style_runs(previous_styles, next_styles, term_cols))
+            .collect(),
+    )
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn patch_cells_in_damage(
+    previous: &[GridCell],
+    next: &[GridCell],
+    damage_spans: &[DamageSpan],
+) -> Vec<GridCell> {
+    if damage_spans.is_empty() {
+        return previous.to_vec();
+    }
+
+    let mut cells: Vec<GridCell> = previous
+        .iter()
+        .filter(|cell| !cell_overlaps_damage(cell, damage_spans))
+        .cloned()
+        .collect();
+    cells.extend(
+        next.iter()
+            .filter(|cell| cell_overlaps_damage(cell, damage_spans))
+            .cloned(),
+    );
+    cells.sort_unstable_by_key(|cell| cell.col);
+    cells
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn glyph_instances_in_damage(
+    cells: &[GridCell],
+    row: u16,
+    damage_spans: &[DamageSpan],
+) -> Vec<GlyphInstance> {
+    if damage_spans.is_empty() {
+        return Vec::new();
+    }
+
+    glyph_instances_from_cells(cells, row)
+        .into_iter()
+        .filter(|instance| instance_overlaps_damage(instance, damage_spans))
+        .collect()
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn patch_glyph_instances_in_damage(
+    previous: &[GlyphInstance],
+    next_cells: &[GridCell],
+    row: u16,
+    damage_spans: &[DamageSpan],
+) -> Vec<GlyphInstance> {
+    if damage_spans.is_empty() {
+        return previous.to_vec();
+    }
+
+    let mut instances: Vec<GlyphInstance> = previous
+        .iter()
+        .filter(|instance| !instance_overlaps_damage(instance, damage_spans))
+        .cloned()
+        .collect();
+    instances.extend(glyph_instances_in_damage(next_cells, row, damage_spans));
+    instances.sort_unstable_by_key(|instance| instance.col);
+    instances
+}
+
+#[cfg(feature = "ghostty_vt")]
 pub(crate) fn glyph_instances_from_row(row: &CachedTerminalRow, row_idx: u16) -> Vec<GlyphInstance> {
     glyph_instances_from_cells(&row.cells, row_idx)
 }
@@ -227,6 +498,17 @@ pub(crate) fn collect_active_glyph_keys(snapshot: &TerminalSnapshot) -> HashSet<
         .rows
         .iter()
         .flat_map(|row| row.glyph_instances.iter())
+        .filter(|instance| instance.key.render_path != GlyphRenderPath::Geometry)
+        .map(|instance| instance.key.clone())
+        .collect()
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn collect_damaged_glyph_keys(snapshot: &TerminalSnapshot) -> HashSet<GlyphKey> {
+    snapshot
+        .rows
+        .iter()
+        .flat_map(|row| row.damaged_glyph_instances.iter())
         .filter(|instance| instance.key.render_path != GlyphRenderPath::Geometry)
         .map(|instance| instance.key.clone())
         .collect()
@@ -448,6 +730,8 @@ pub(super) fn terminal_canvas(
             let num_rows = snapshot.rows.len();
             #[cfg(feature = "ghostty_vt")]
             let active_glyph_keys = collect_active_glyph_keys(&snapshot);
+            #[cfg(feature = "ghostty_vt")]
+            let damaged_glyph_keys = collect_damaged_glyph_keys(&snapshot);
             // Cross-frame glyph cache — lock shared cache from TerminalPane
             // instead of rebuilding HashMap every paint (saves ~50-80% shaping work)
             #[cfg(feature = "ghostty_vt")]
@@ -456,6 +740,17 @@ pub(super) fn terminal_canvas(
                 prune_glyph_cache(&mut cache, &active_glyph_keys);
                 cache
             };
+            #[cfg(feature = "ghostty_vt")]
+            for key in &damaged_glyph_keys {
+                let _ = glyph_layout_for_key(
+                    key,
+                    &text_system,
+                    &font_desc,
+                    font_size,
+                    config.cell_height,
+                    &mut *glyph_layout_cache,
+                );
+            }
 
             window.paint_quad(fill(bounds, Hsla::from(rgb(DEFAULT_BG))));
 
@@ -913,6 +1208,8 @@ mod tests {
             ],
             cells: Vec::new(),
             glyph_instances: Vec::new(),
+            damage_spans: Vec::new(),
+            damaged_glyph_instances: Vec::new(),
         };
 
         let cells = grid_cells_from_row(&row, 10);
@@ -938,6 +1235,8 @@ mod tests {
             }],
             cells: Vec::new(),
             glyph_instances: Vec::new(),
+            damage_spans: Vec::new(),
+            damaged_glyph_instances: Vec::new(),
         };
 
         let cells = grid_cells_from_row(&row, 10);
@@ -959,6 +1258,8 @@ mod tests {
             }],
             cells: Vec::new(),
             glyph_instances: Vec::new(),
+            damage_spans: Vec::new(),
+            damaged_glyph_instances: Vec::new(),
         };
 
         assert_eq!(
@@ -1060,6 +1361,8 @@ mod tests {
                 },
             ],
             glyph_instances: Vec::new(),
+            damage_spans: Vec::new(),
+            damaged_glyph_instances: Vec::new(),
         };
 
         let instances = glyph_instances_from_row(&row, 5);
@@ -1112,6 +1415,8 @@ mod tests {
                         key: geometry_key,
                     },
                 ],
+                damage_spans: Vec::new(),
+                damaged_glyph_instances: Vec::new(),
             }],
             cursor_x: 0,
             cursor_y: 0,
@@ -1120,6 +1425,52 @@ mod tests {
         let keys = collect_active_glyph_keys(&snapshot);
         assert_eq!(keys.len(), 1);
         assert!(keys.contains(&mono_key));
+    }
+
+    #[::core::prelude::v1::test]
+    fn collect_damaged_glyph_keys_uses_only_damage_payload() {
+        let active_key = GlyphKey {
+            glyph: "A".into(),
+            width: 1,
+            flags: 0,
+            render_path: GlyphRenderPath::AtlasMonochrome,
+        };
+        let damaged_key = GlyphKey {
+            glyph: "X".into(),
+            width: 1,
+            flags: GHOSTTY_FLAG_BOLD,
+            render_path: GlyphRenderPath::AtlasMonochrome,
+        };
+        let snapshot = TerminalSnapshot {
+            rows: vec![CachedTerminalRow {
+                text: SharedString::new(""),
+                style_runs: Vec::new(),
+                cells: Vec::new(),
+                glyph_instances: vec![GlyphInstance {
+                    row: 0,
+                    col: 0,
+                    fg_rgb: 0,
+                    bg_rgb: 0,
+                    key: active_key,
+                }],
+                damage_spans: vec![DamageSpan {
+                    start_col: 1,
+                    end_col: 2,
+                }],
+                damaged_glyph_instances: vec![GlyphInstance {
+                    row: 0,
+                    col: 1,
+                    fg_rgb: 0,
+                    bg_rgb: 0,
+                    key: damaged_key.clone(),
+                }],
+            }],
+            cursor_x: 0,
+            cursor_y: 0,
+        };
+
+        let keys = collect_damaged_glyph_keys(&snapshot);
+        assert_eq!(keys, HashSet::from([damaged_key]));
     }
 
     #[::core::prelude::v1::test]
@@ -1148,6 +1499,336 @@ mod tests {
         assert_eq!(cache.len(), 1);
         assert!(cache.contains_key(&active_key));
         assert!(!cache.contains_key(&stale_key));
+    }
+
+    #[::core::prelude::v1::test]
+    fn damage_spans_from_cells_tracks_only_changed_columns() {
+        let previous = vec![
+            GridCell {
+                col: 0,
+                width: 1,
+                glyph: "A".into(),
+                fg_rgb: 0x111111,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 1,
+                width: 1,
+                glyph: "B".into(),
+                fg_rgb: 0x222222,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 2,
+                width: 1,
+                glyph: "C".into(),
+                fg_rgb: 0x333333,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+        ];
+        let next = vec![
+            GridCell {
+                col: 0,
+                width: 1,
+                glyph: "A".into(),
+                fg_rgb: 0x111111,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 1,
+                width: 1,
+                glyph: "X".into(),
+                fg_rgb: 0x777777,
+                bg_rgb: 0,
+                flags: GHOSTTY_FLAG_BOLD,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 2,
+                width: 1,
+                glyph: "C".into(),
+                fg_rgb: 0x333333,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+        ];
+
+        assert_eq!(
+            damage_spans_from_cells(&previous, &next, 4),
+            vec![DamageSpan {
+                start_col: 1,
+                end_col: 2,
+            }]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn damage_spans_from_cells_expands_across_wide_glyph_columns() {
+        let previous = vec![GridCell {
+            col: 0,
+            width: 2,
+            glyph: "🔥\u{FE0F}".into(),
+            fg_rgb: 0,
+            bg_rgb: 0,
+            flags: 0,
+            kind: GridCellKind::Text,
+        }];
+        let next = vec![
+            GridCell {
+                col: 0,
+                width: 1,
+                glyph: "A".into(),
+                fg_rgb: 0,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 1,
+                width: 1,
+                glyph: "B".into(),
+                fg_rgb: 0,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+        ];
+
+        assert_eq!(
+            damage_spans_from_cells(&previous, &next, 4),
+            vec![DamageSpan {
+                start_col: 0,
+                end_col: 2,
+            }]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn damage_spans_from_style_runs_detects_blank_background_changes() {
+        let previous = Vec::new();
+        let next = vec![ghostty_vt::StyleRun {
+            start_col: 3,
+            end_col: 4,
+            fg: ghostty_vt::Rgb { r: 0xAA, g: 0xAA, b: 0xAA },
+            bg: ghostty_vt::Rgb { r: 0x22, g: 0x44, b: 0x66 },
+            flags: 0,
+        }];
+
+        assert_eq!(
+            damage_spans_from_style_runs(&previous, &next, 6),
+            vec![DamageSpan {
+                start_col: 2,
+                end_col: 4,
+            }]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn damage_spans_from_terminal_row_merges_cell_and_style_damage() {
+        let previous_cells = vec![GridCell {
+            col: 0,
+            width: 1,
+            glyph: "A".into(),
+            fg_rgb: 0x111111,
+            bg_rgb: 0,
+            flags: 0,
+            kind: GridCellKind::Text,
+        }];
+        let next_cells = vec![GridCell {
+            col: 0,
+            width: 1,
+            glyph: "X".into(),
+            fg_rgb: 0x111111,
+            bg_rgb: 0,
+            flags: 0,
+            kind: GridCellKind::Text,
+        }];
+        let previous_styles = Vec::new();
+        let next_styles = vec![ghostty_vt::StyleRun {
+            start_col: 4,
+            end_col: 4,
+            fg: ghostty_vt::Rgb { r: 0xAA, g: 0xAA, b: 0xAA },
+            bg: ghostty_vt::Rgb { r: 0x22, g: 0x44, b: 0x66 },
+            flags: 0,
+        }];
+
+        assert_eq!(
+            damage_spans_from_terminal_row(
+                &previous_cells,
+                &previous_styles,
+                &next_cells,
+                &next_styles,
+                6,
+            ),
+            vec![
+                DamageSpan {
+                    start_col: 0,
+                    end_col: 1,
+                },
+                DamageSpan {
+                    start_col: 3,
+                    end_col: 4,
+                },
+            ]
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn patch_cells_in_damage_reuses_unchanged_neighbors() {
+        let previous = vec![
+            GridCell {
+                col: 0,
+                width: 1,
+                glyph: "A".into(),
+                fg_rgb: 0,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 1,
+                width: 1,
+                glyph: "B".into(),
+                fg_rgb: 0,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 2,
+                width: 1,
+                glyph: "C".into(),
+                fg_rgb: 0,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+        ];
+        let next = vec![
+            GridCell {
+                col: 0,
+                width: 1,
+                glyph: "A".into(),
+                fg_rgb: 0,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 1,
+                width: 1,
+                glyph: "X".into(),
+                fg_rgb: 0,
+                bg_rgb: 0,
+                flags: GHOSTTY_FLAG_UNDERLINE,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 2,
+                width: 1,
+                glyph: "C".into(),
+                fg_rgb: 0,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+        ];
+        let damage = vec![DamageSpan {
+            start_col: 1,
+            end_col: 2,
+        }];
+
+        let patched = patch_cells_in_damage(&previous, &next, &damage);
+
+        assert_eq!(patched.len(), 3);
+        assert_eq!(patched[0].glyph, "A");
+        assert_eq!(patched[1].glyph, "X");
+        assert_eq!(patched[2].glyph, "C");
+    }
+
+    #[::core::prelude::v1::test]
+    fn patch_glyph_instances_in_damage_replaces_only_changed_segment() {
+        let previous_cells = vec![
+            GridCell {
+                col: 0,
+                width: 1,
+                glyph: "A".into(),
+                fg_rgb: 0x111111,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 1,
+                width: 1,
+                glyph: "B".into(),
+                fg_rgb: 0x222222,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 2,
+                width: 1,
+                glyph: "C".into(),
+                fg_rgb: 0x333333,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+        ];
+        let next_cells = vec![
+            GridCell {
+                col: 0,
+                width: 1,
+                glyph: "A".into(),
+                fg_rgb: 0x111111,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 1,
+                width: 1,
+                glyph: "X".into(),
+                fg_rgb: 0x999999,
+                bg_rgb: 0,
+                flags: GHOSTTY_FLAG_BOLD,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 2,
+                width: 1,
+                glyph: "C".into(),
+                fg_rgb: 0x333333,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+        ];
+        let previous_instances = glyph_instances_from_cells(&previous_cells, 4);
+        let damage = vec![DamageSpan {
+            start_col: 1,
+            end_col: 2,
+        }];
+
+        let patched = patch_glyph_instances_in_damage(&previous_instances, &next_cells, 4, &damage);
+
+        assert_eq!(patched.len(), 3);
+        assert_eq!(patched[0].col, 0);
+        assert_eq!(patched[1].col, 1);
+        assert_eq!(patched[1].fg_rgb, 0x999999);
+        assert_eq!(patched[1].key.glyph, "X");
+        assert_eq!(patched[2].col, 2);
     }
 
     #[::core::prelude::v1::test]
