@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use gpui::*;
@@ -194,6 +194,22 @@ pub(crate) fn glyph_instances_from_row(row: &CachedTerminalRow, row_idx: u16) ->
 }
 
 #[cfg(feature = "ghostty_vt")]
+pub(crate) fn collect_active_glyph_keys(snapshot: &TerminalSnapshot) -> HashSet<GlyphKey> {
+    snapshot
+        .rows
+        .iter()
+        .flat_map(|row| row.glyph_instances.iter())
+        .filter(|instance| instance.key.render_path != GlyphRenderPath::Geometry)
+        .map(|instance| instance.key.clone())
+        .collect()
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn prune_glyph_cache(cache: &mut HashMap<GlyphKey, ShapedLine>, active_keys: &HashSet<GlyphKey>) {
+    cache.retain(|key, _| active_keys.contains(key));
+}
+
+#[cfg(feature = "ghostty_vt")]
 fn resolve_cursor_cell(cursor_col: u16, row_cells: &[GridCell], term_cols: u16) -> (u16, u8) {
     let clamped = cursor_col.min(term_cols.saturating_sub(1));
     for cell in row_cells {
@@ -374,10 +390,16 @@ pub(super) fn terminal_canvas(
             let font_size = px(config.font_size);
             let line_height_px = px(config.cell_height);
             let num_rows = snapshot.rows.len();
+            #[cfg(feature = "ghostty_vt")]
+            let active_glyph_keys = collect_active_glyph_keys(&snapshot);
             // Cross-frame glyph cache — lock shared cache from TerminalPane
             // instead of rebuilding HashMap every paint (saves ~50-80% shaping work)
             #[cfg(feature = "ghostty_vt")]
-            let mut glyph_layout_cache = glyph_cache.lock();
+            let mut glyph_layout_cache = {
+                let mut cache = glyph_cache.lock();
+                prune_glyph_cache(&mut cache, &active_glyph_keys);
+                cache
+            };
 
             window.paint_quad(fill(bounds, Hsla::from(rgb(DEFAULT_BG))));
 
@@ -989,6 +1011,86 @@ mod tests {
         assert_eq!(instances[0].col, 0);
         assert_eq!(instances[1].col, 2);
         assert_eq!(instances[1].key.render_path, GlyphRenderPath::Geometry);
+    }
+
+    #[::core::prelude::v1::test]
+    fn collect_active_glyph_keys_deduplicates_and_skips_geometry() {
+        let mono_key = GlyphKey {
+            glyph: "A".into(),
+            width: 1,
+            flags: 0,
+            render_path: GlyphRenderPath::AtlasMonochrome,
+        };
+        let geometry_key = GlyphKey {
+            glyph: "█".into(),
+            width: 1,
+            flags: 0,
+            render_path: GlyphRenderPath::Geometry,
+        };
+        let snapshot = TerminalSnapshot {
+            rows: vec![CachedTerminalRow {
+                text: SharedString::new(""),
+                style_runs: Vec::new(),
+                cells: Vec::new(),
+                glyph_instances: vec![
+                    GlyphInstance {
+                        row: 0,
+                        col: 0,
+                        fg_rgb: 0,
+                        bg_rgb: 0,
+                        key: mono_key.clone(),
+                    },
+                    GlyphInstance {
+                        row: 0,
+                        col: 1,
+                        fg_rgb: 0,
+                        bg_rgb: 0,
+                        key: mono_key.clone(),
+                    },
+                    GlyphInstance {
+                        row: 0,
+                        col: 2,
+                        fg_rgb: 0,
+                        bg_rgb: 0,
+                        key: geometry_key,
+                    },
+                ],
+            }],
+            cursor_x: 0,
+            cursor_y: 0,
+        };
+
+        let keys = collect_active_glyph_keys(&snapshot);
+        assert_eq!(keys.len(), 1);
+        assert!(keys.contains(&mono_key));
+    }
+
+    #[::core::prelude::v1::test]
+    fn prune_glyph_cache_keeps_only_active_keys() {
+        let active_key = GlyphKey {
+            glyph: "A".into(),
+            width: 1,
+            flags: 0,
+            render_path: GlyphRenderPath::AtlasMonochrome,
+        };
+        let stale_key = GlyphKey {
+            glyph: "B".into(),
+            width: 1,
+            flags: 0,
+            render_path: GlyphRenderPath::AtlasMonochrome,
+        };
+
+        let mut cache = HashMap::from([
+            (active_key.clone(), ShapedLine::default()),
+            (stale_key.clone(), ShapedLine::default()),
+        ]);
+        let active = HashSet::from([active_key.clone()]);
+
+        prune_glyph_cache(&mut cache, &active);
+
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&active_key));
+        assert!(!cache.contains_key(&stale_key));
     }
 
     #[::core::prelude::v1::test]
