@@ -334,12 +334,58 @@ impl Terminal {
             Err(Error::ScrollFailed(rc))
         }
     }
+
+    /// Raw C pointer for direct async operations.
+    pub fn raw_ptr(&self) -> *mut c_void {
+        self.ptr.as_ptr()
+    }
+
+    /// Start async I/O mode with dedicated parser thread.
+    pub fn start_async(&mut self) -> Result<(), Error> {
+        let rc = unsafe { ghostty_vt_sys::ghostty_vt_terminal_start_async(self.ptr.as_ptr()) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(Error::FeedFailed(rc))
+        }
+    }
+
+    /// Stop async I/O mode.
+    pub fn stop_async(&mut self) {
+        unsafe { ghostty_vt_sys::ghostty_vt_terminal_stop_async(self.ptr.as_ptr()) }
+    }
+
+    /// Feed data asynchronously via ring buffer. Non-blocking.
+    /// Returns number of bytes pushed to the ring buffer.
+    pub fn feed_async(&self, bytes: &[u8]) -> usize {
+        unsafe {
+            ghostty_vt_sys::ghostty_vt_terminal_feed_async(
+                self.ptr.as_ptr(),
+                bytes.as_ptr(),
+                bytes.len(),
+            )
+        }
+    }
+
+    /// Check if new data has been parsed since the last check.
+    pub fn has_new_data(&self) -> bool {
+        unsafe { ghostty_vt_sys::ghostty_vt_terminal_has_new_data(self.ptr.as_ptr()) }
+    }
 }
 
 impl Drop for Terminal {
     fn drop(&mut self) {
         unsafe { ghostty_vt_sys::ghostty_vt_terminal_free(self.ptr.as_ptr()) }
     }
+}
+
+/// Feed data asynchronously using a raw terminal pointer.
+/// Non-blocking, pushes to the internal ring buffer.
+///
+/// # Safety
+/// `raw_ptr` must be a valid terminal pointer from `Terminal::raw_ptr()`.
+pub unsafe fn feed_async_raw(raw_ptr: *mut c_void, bytes: &[u8]) -> usize {
+    unsafe { ghostty_vt_sys::ghostty_vt_terminal_feed_async(raw_ptr, bytes.as_ptr(), bytes.len()) }
 }
 
 // ── DX12 GPU Renderer ──────────────────────────────────────────────────
@@ -423,5 +469,30 @@ mod tests {
         let terminal = Terminal::new_with_scrollback(80, 24, 0)
             .expect("scrollback constructor should succeed");
         drop(terminal);
+    }
+
+    #[test]
+    fn feed_renders_ascii_and_utf8_text() {
+        let mut terminal = Terminal::new(16, 4).expect("constructor should succeed");
+
+        terminal.feed("hello".as_bytes()).expect("ascii feed should succeed");
+        terminal.feed(" 世界".as_bytes()).expect("utf8 feed should succeed");
+
+        let row = terminal.dump_viewport_row(0).expect("row dump should succeed");
+        assert!(row.contains("hello 世界"));
+    }
+
+    #[test]
+    fn feed_stops_text_at_escape_sequence_boundary() {
+        let mut terminal = Terminal::new(16, 4).expect("constructor should succeed");
+
+        terminal
+            .feed(b"abc\x1b[2;5HXY")
+            .expect("feed with escape sequence should succeed");
+
+        let first_row = terminal.dump_viewport_row(0).expect("first row dump should succeed");
+        let second_row = terminal.dump_viewport_row(1).expect("second row dump should succeed");
+        assert!(first_row.contains("abc"));
+        assert!(second_row.contains("XY"));
     }
 }

@@ -86,6 +86,21 @@ mod backend {
         pub fn cursor_position(&self) -> (u16, u16) {
             self.terminal.cursor_position().unwrap_or((0, 0))
         }
+
+        /// Start async I/O mode (dedicated Zig parser thread).
+        pub fn start_async(&mut self) -> bool {
+            self.terminal.start_async().is_ok()
+        }
+
+        /// Stop async I/O mode.
+        pub fn stop_async(&mut self) {
+            self.terminal.stop_async();
+        }
+
+        /// Raw terminal handle as usize (for async feeding without Rust mutex).
+        pub fn terminal_raw_ptr(&self) -> usize {
+            self.terminal.raw_ptr() as usize
+        }
     }
 }
 
@@ -141,6 +156,13 @@ mod backend {
 }
 
 pub use backend::TerminalBackend;
+
+/// Feed data asynchronously using a raw terminal handle pointer.
+/// Non-blocking ring buffer push, bypasses Rust mutex entirely.
+#[cfg(feature = "ghostty_vt")]
+unsafe fn feed_async_raw(raw_ptr: usize, data: &[u8]) {
+    unsafe { ghostty_vt::feed_async_raw(raw_ptr as *mut core::ffi::c_void, data) };
+}
 
 /// Terminal surface: connects PTY ↔ terminal backend
 pub struct TerminalSurface {
@@ -199,6 +221,21 @@ impl TerminalSurface {
         let event_tx = self.event_tx.clone();
         let stop_flag = self.stop_flag.clone();
 
+        // Enable async I/O: PTY reader → ring buffer (lock-free) → Zig parser thread
+        #[cfg(feature = "ghostty_vt")]
+        let async_ptr: Option<usize> = {
+            let mut b = backend.lock();
+            if b.start_async() {
+                log::info!("Async I/O enabled: PTY reader → ring buffer → parser thread");
+                Some(b.terminal_raw_ptr())
+            } else {
+                log::warn!("Async I/O init failed, using sync mode");
+                None
+            }
+        };
+        #[cfg(not(feature = "ghostty_vt"))]
+        let async_ptr: Option<usize> = None;
+
         let handle = std::thread::Builder::new()
             .name("zwg-pty-reader".into())
             .spawn(move || {
@@ -219,11 +256,14 @@ impl TerminalSurface {
                         }
                     };
 
-                    // Deliver the first burst immediately. Blocking for an
-                    // additional read here stalls interactive shells at startup
-                    // because the prompt often arrives as a short burst followed
-                    // by idle time.
-                    {
+                    if let Some(raw_ptr) = async_ptr {
+                        // Async: lock-free push to ring buffer (no Rust mutex contention)
+                        #[cfg(feature = "ghostty_vt")]
+                        unsafe {
+                            feed_async_raw(raw_ptr, &buf[..n]);
+                        }
+                    } else {
+                        // Sync fallback: lock backend, parse under lock
                         let mut b = backend.lock();
                         b.feed(&buf[..n]);
                     }
@@ -271,6 +311,20 @@ impl TerminalSurface {
         let event_tx = self.event_tx.clone();
         let stop_flag = self.stop_flag.clone();
 
+        // Enable async I/O for attach_pty path
+        #[cfg(feature = "ghostty_vt")]
+        let async_ptr: Option<usize> = {
+            let mut b = backend.lock();
+            if b.start_async() {
+                log::info!("Async I/O enabled (attach_pty): PTY reader → ring buffer → parser thread");
+                Some(b.terminal_raw_ptr())
+            } else {
+                None
+            }
+        };
+        #[cfg(not(feature = "ghostty_vt"))]
+        let async_ptr: Option<usize> = None;
+
         let handle = std::thread::Builder::new()
             .name("zwg-pty-reader".into())
             .spawn(move || {
@@ -287,7 +341,12 @@ impl TerminalSurface {
                             Err(_) => break,
                         }
                     };
-                    {
+                    if let Some(raw_ptr) = async_ptr {
+                        #[cfg(feature = "ghostty_vt")]
+                        unsafe {
+                            feed_async_raw(raw_ptr, &buf[..n]);
+                        }
+                    } else {
                         let mut b = backend.lock();
                         b.feed(&buf[..n]);
                     }

@@ -99,6 +99,18 @@ unsafe extern "C" {
 
     pub fn ghostty_vt_bytes_free(bytes: ghostty_vt_bytes_t);
 
+    // Async I/O
+    pub fn ghostty_vt_terminal_start_async(
+        terminal: *mut core::ffi::c_void,
+    ) -> core::ffi::c_int;
+    pub fn ghostty_vt_terminal_stop_async(terminal: *mut core::ffi::c_void);
+    pub fn ghostty_vt_terminal_feed_async(
+        terminal: *mut core::ffi::c_void,
+        bytes: *const u8,
+        len: usize,
+    ) -> usize;
+    pub fn ghostty_vt_terminal_has_new_data(terminal: *mut core::ffi::c_void) -> bool;
+
     // DX12 GPU renderer
     pub fn ghostty_gpu_renderer_new(
         width: u32,

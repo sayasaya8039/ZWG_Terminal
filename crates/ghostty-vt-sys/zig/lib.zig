@@ -1,6 +1,7 @@
 const std = @import("std");
 const terminal = @import("ghostty_src/terminal/main.zig");
 const ghostty_input = @import("ghostty_src/input.zig");
+const async_io = @import("async_io.zig");
 
 // DX12 GPU renderer — force export its C symbols into this static library
 comptime {
@@ -18,6 +19,9 @@ const TerminalHandle = struct {
     default_bg: terminal.color.RGB,
     viewport_top_y_screen: u32,
     has_viewport_top_y_screen: bool,
+    // Async I/O fields
+    terminal_mutex: std.Thread.Mutex = .{},
+    async_feeder: ?*async_io.AsyncFeeder = null,
 
     fn init(alloc: Allocator, cols: u16, rows: u16) !*TerminalHandle {
         return initWithOptions(alloc, cols, rows, null);
@@ -73,6 +77,11 @@ const TerminalHandle = struct {
     }
 
     fn deinit(self: *TerminalHandle) void {
+        // Stop async feeder before destroying terminal
+        if (self.async_feeder) |feeder| {
+            feeder.deinit(self.alloc);
+            self.async_feeder = null;
+        }
         self.stream.deinit();
         self.terminal.deinit(self.alloc);
         self.alloc.destroy(self);
@@ -294,6 +303,8 @@ export fn ghostty_vt_terminal_set_default_colors(
 ) callconv(.c) void {
     if (terminal_ptr == null) return;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
     handle.default_fg = .{ .r = fg_r, .g = fg_g, .b = fg_b };
     handle.default_bg = .{ .r = bg_r, .g = bg_g, .b = bg_b };
 }
@@ -305,6 +316,8 @@ export fn ghostty_vt_terminal_feed(
 ) callconv(.c) c_int {
     if (terminal_ptr == null) return 1;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
 
     handle.stream.nextSlice(bytes[0..len]) catch return 2;
     return 0;
@@ -317,6 +330,8 @@ export fn ghostty_vt_terminal_resize(
 ) callconv(.c) c_int {
     if (terminal_ptr == null) return 1;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
 
     handle.terminal.resize(
         handle.alloc,
@@ -332,6 +347,8 @@ export fn ghostty_vt_terminal_scroll_viewport(
 ) callconv(.c) c_int {
     if (terminal_ptr == null) return 1;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
     handle.terminal.scrollViewport(.{ .delta = @as(isize, delta_lines) });
     return 0;
 }
@@ -339,6 +356,8 @@ export fn ghostty_vt_terminal_scroll_viewport(
 export fn ghostty_vt_terminal_scroll_viewport_top(terminal_ptr: ?*anyopaque) callconv(.c) c_int {
     if (terminal_ptr == null) return 1;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
     handle.terminal.scrollViewport(.top);
     return 0;
 }
@@ -346,6 +365,8 @@ export fn ghostty_vt_terminal_scroll_viewport_top(terminal_ptr: ?*anyopaque) cal
 export fn ghostty_vt_terminal_scroll_viewport_bottom(terminal_ptr: ?*anyopaque) callconv(.c) c_int {
     if (terminal_ptr == null) return 1;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
     handle.terminal.scrollViewport(.bottom);
     return 0;
 }
@@ -358,6 +379,8 @@ export fn ghostty_vt_terminal_cursor_position(
     if (terminal_ptr == null) return false;
     if (col_out == null or row_out == null) return false;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
     const screen = handle.terminal.screens.active;
     col_out.?.* = @intCast(screen.cursor.x + 1);
     row_out.?.* = @intCast(screen.cursor.y + 1);
@@ -367,6 +390,8 @@ export fn ghostty_vt_terminal_cursor_position(
 export fn ghostty_vt_terminal_dump_viewport(terminal_ptr: ?*anyopaque) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
 
     const alloc = std.heap.c_allocator;
     const screen = handle.terminal.screens.active;
@@ -382,6 +407,8 @@ export fn ghostty_vt_terminal_dump_viewport_row(
 ) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
 
     const screen = handle.terminal.screens.active;
     const cols = handle.terminal.cols;
@@ -446,6 +473,8 @@ export fn ghostty_vt_terminal_dump_viewport_row_cell_styles(
 ) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
 
     const screen = handle.terminal.screens.active;
     const pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = row } };
@@ -476,6 +505,8 @@ export fn ghostty_vt_terminal_dump_viewport_row_style_runs(
 ) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
 
     const screen = handle.terminal.screens.active;
     const pt: terminal.point.Point = .{ .viewport = .{ .x = 0, .y = row } };
@@ -566,6 +597,8 @@ export fn ghostty_vt_terminal_take_dirty_viewport_rows(
 ) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null or rows == 0) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
 
     const dirty = handle.terminal.flags.dirty;
     const force_full_redraw = dirty.clear or dirty.palette or dirty.reverse_colors or dirty.preedit;
@@ -627,6 +660,8 @@ export fn ghostty_vt_terminal_take_viewport_scroll_delta(
 ) callconv(.c) i32 {
     if (terminal_ptr == null) return 0;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
 
     const screen = handle.terminal.screens.active;
     const tl = screen.pages.getTopLeft(.viewport);
@@ -654,6 +689,8 @@ export fn ghostty_vt_terminal_hyperlink_at(
 ) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null or col == 0 or row == 0) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
 
     const screen = handle.terminal.screens.active;
     const x: terminal.size.CellCountInt = @intCast(col - 1);
@@ -775,6 +812,67 @@ export fn ghostty_vt_bytes_free(bytes: ghostty_vt_bytes_t) callconv(.c) void {
     std.heap.c_allocator.free(bytes.ptr.?[0..bytes.len]);
 }
 
+// ── Async I/O C exports ───────────────────────────────────────────────
+
+/// Feed callback invoked by the parser thread under terminal_mutex.
+fn asyncFeedCallback(ctx: *anyopaque, data: [*]const u8, len: usize) void {
+    const handle: *TerminalHandle = @ptrCast(@alignCast(ctx));
+    handle.stream.nextSlice(data[0..len]) catch {};
+}
+
+export fn ghostty_vt_terminal_start_async(terminal_ptr: ?*anyopaque) callconv(.c) c_int {
+    if (terminal_ptr == null) return 1;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    if (handle.async_feeder != null) return 2; // already active
+
+    const alloc = std.heap.c_allocator;
+    const feeder = async_io.AsyncFeeder.init(
+        alloc,
+        &asyncFeedCallback,
+        @ptrCast(handle),
+        &handle.terminal_mutex,
+    ) catch return 3;
+
+    feeder.start() catch {
+        feeder.deinit(alloc);
+        return 4;
+    };
+
+    handle.async_feeder = feeder;
+    return 0;
+}
+
+export fn ghostty_vt_terminal_stop_async(terminal_ptr: ?*anyopaque) callconv(.c) void {
+    if (terminal_ptr == null) return;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    if (handle.async_feeder) |feeder| {
+        feeder.deinit(std.heap.c_allocator);
+        handle.async_feeder = null;
+    }
+}
+
+export fn ghostty_vt_terminal_feed_async(
+    terminal_ptr: ?*anyopaque,
+    bytes: [*]const u8,
+    len: usize,
+) callconv(.c) usize {
+    if (terminal_ptr == null or len == 0) return 0;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    if (handle.async_feeder) |feeder| {
+        return feeder.ring.push(bytes[0..len]);
+    }
+    return 0;
+}
+
+export fn ghostty_vt_terminal_has_new_data(terminal_ptr: ?*anyopaque) callconv(.c) bool {
+    if (terminal_ptr == null) return false;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    if (handle.async_feeder) |feeder| {
+        return feeder.takeNewData();
+    }
+    return false;
+}
+
 // ── SIMD-accelerated UTF-8 decoder ────────────────────────────────────
 // Processes 32-byte ASCII chunks via @Vector, falling back to scalar
 // for multi-byte UTF-8 and tail bytes. Typically 2-4x faster for
@@ -793,6 +891,25 @@ inline fn simdHasEsc(chunk: SimdVec) bool {
 inline fn simdHasNonAscii(chunk: SimdVec) bool {
     const cmp: @Vector(32, bool) = chunk >= simd_hi_splat;
     return @reduce(.Or, cmp);
+}
+
+inline fn trimBase64Padding(input: []const u8) []const u8 {
+    var end = input.len;
+    while (end > 0 and input[end - 1] == '=') : (end -= 1) {}
+    return input[0..end];
+}
+
+inline fn scalarBase64MaxLength(input: []const u8) usize {
+    const decoder = std.base64.Base64Decoder.init(std.base64.standard_alphabet_chars, null);
+    return decoder.calcSizeForSlice(trimBase64Padding(input)) catch 0;
+}
+
+inline fn scalarBase64Decode(input: []const u8, output: []u8) ?usize {
+    const trimmed = trimBase64Padding(input);
+    const decoder = std.base64.Base64Decoder.init(std.base64.standard_alphabet_chars, null);
+    const decoded_len = decoder.calcSizeForSlice(trimmed) catch return null;
+    decoder.decode(output[0..decoded_len], trimmed) catch return null;
+    return decoded_len;
 }
 
 /// Scalar: decode one UTF-8 character. Returns (codepoint, bytes_consumed).
@@ -872,4 +989,47 @@ export fn ghostty_simd_decode_utf8_until_control_seq(
 
     output_count.* = out_i;
     return i;
+}
+
+export fn ghostty_simd_index_of(
+    needle: u8,
+    input: [*]const u8,
+    count: usize,
+) callconv(.c) usize {
+    const needle_splat: SimdVec = @splat(needle);
+    var i: usize = 0;
+    while (i + 32 <= count) : (i += 32) {
+        const chunk: SimdVec = @as(*align(1) const [32]u8, @ptrCast(input + i)).*;
+        const matches = chunk == needle_splat;
+        if (@reduce(.Or, matches)) {
+            var j: usize = 0;
+            while (j < 32) : (j += 1) {
+                if (input[i + j] == needle) return i + j;
+            }
+        }
+    }
+
+    while (i < count) : (i += 1) {
+        if (input[i] == needle) return i;
+    }
+
+    return count;
+}
+
+export fn ghostty_simd_base64_max_length(
+    input: [*]const u8,
+    len: usize,
+) callconv(.c) usize {
+    return scalarBase64MaxLength(input[0..len]);
+}
+
+export fn ghostty_simd_base64_decode(
+    input: [*]const u8,
+    len: usize,
+    output: [*]u8,
+) callconv(.c) isize {
+    const input_slice = input[0..len];
+    const output_len = scalarBase64MaxLength(input_slice);
+    const decoded_len = scalarBase64Decode(input_slice, output[0..output_len]) orelse return -1;
+    return @intCast(decoded_len);
 }
