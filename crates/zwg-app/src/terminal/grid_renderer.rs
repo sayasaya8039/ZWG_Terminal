@@ -1,8 +1,19 @@
-use gpui::*;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+use gpui::*;
+use parking_lot::Mutex;
 use unicode_width::UnicodeWidthChar;
 
 use super::{DEFAULT_BG, DEFAULT_FG};
+
+/// Cross-frame glyph layout cache type.
+/// Persists shaped glyphs across render frames to avoid redundant text shaping.
+#[cfg(feature = "ghostty_vt")]
+pub(super) type GlyphCache = Arc<Mutex<HashMap<GlyphKey, ShapedLine>>>;
+
+#[cfg(not(feature = "ghostty_vt"))]
+pub(super) type GlyphCache = ();
 
 const BRAILLE_BLANK: char = '\u{2800}';
 
@@ -171,6 +182,20 @@ pub(crate) fn glyph_instances_from_cells(cells: &[GridCell], row: u16) -> Vec<Gl
             key: glyph_key_from_cell(cell),
         })
         .collect()
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn resolve_cursor_cell(cursor_col: u16, row_cells: &[GridCell], term_cols: u16) -> (u16, u8) {
+    let clamped = cursor_col.min(term_cols.saturating_sub(1));
+    for cell in row_cells {
+        let start = cell.col;
+        let end = cell.col.saturating_add(cell.width as u16);
+        if start <= clamped && clamped < end {
+            return (start, cell.width);
+        }
+    }
+
+    (clamped, 1)
 }
 
 #[cfg(feature = "ghostty_vt")]
@@ -533,17 +558,31 @@ pub(super) fn terminal_canvas(
             }
 
             if (snapshot.cursor_y as usize) < num_rows {
+                #[cfg(feature = "ghostty_vt")]
+                let (cursor_col, cursor_width) = snapshot
+                    .rows
+                    .get(snapshot.cursor_y as usize)
+                    .map(|row| {
+                        let cells = grid_cells_from_row(row, config.term_cols);
+                        resolve_cursor_cell(snapshot.cursor_x, &cells, config.term_cols)
+                    })
+                    .unwrap_or((snapshot.cursor_x.min(config.term_cols.saturating_sub(1)), 1));
+
+                #[cfg(not(feature = "ghostty_vt"))]
+                let (cursor_col, cursor_width) =
+                    (snapshot.cursor_x.min(config.term_cols.saturating_sub(1)), 1);
+
                 window.paint_quad(fill(
                     Bounds::new(
                         point(
                             bounds.origin.x
                                 + px(
                                     config.horizontal_text_padding
-                                        + snapshot.cursor_x as f32 * config.cell_width,
+                                        + cursor_col as f32 * config.cell_width,
                                 ),
                             bounds.origin.y + px(snapshot.cursor_y as f32 * config.cell_height),
                         ),
-                        size(px(config.cell_width), line_height_px),
+                        size(px(config.cell_width * cursor_width as f32), line_height_px),
                     ),
                     rgba(0xF5F5F780),
                 ));
@@ -873,6 +912,50 @@ mod tests {
         assert_eq!(instances[0].key.render_path, GlyphRenderPath::AtlasPolychrome);
         assert_eq!(instances[1].col, 2);
         assert_eq!(instances[1].key.render_path, GlyphRenderPath::Geometry);
+    }
+
+    #[::core::prelude::v1::test]
+    fn resolve_cursor_cell_snaps_wide_tail_to_head() {
+        let cells = vec![
+            GridCell {
+                col: 0,
+                width: 2,
+                glyph: "🔥\u{FE0F}".into(),
+                fg_rgb: 0,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 2,
+                width: 1,
+                glyph: "a".into(),
+                fg_rgb: 0,
+                bg_rgb: 0,
+                flags: 0,
+                kind: GridCellKind::Text,
+            },
+        ];
+
+        assert_eq!(resolve_cursor_cell(0, &cells, 10), (0, 2));
+        assert_eq!(resolve_cursor_cell(1, &cells, 10), (0, 2));
+        assert_eq!(resolve_cursor_cell(2, &cells, 10), (2, 1));
+    }
+
+    #[::core::prelude::v1::test]
+    fn resolve_cursor_cell_falls_back_to_single_blank_cell() {
+        let cells = vec![GridCell {
+            col: 0,
+            width: 1,
+            glyph: "a".into(),
+            fg_rgb: 0,
+            bg_rgb: 0,
+            flags: 0,
+            kind: GridCellKind::Text,
+        }];
+
+        assert_eq!(resolve_cursor_cell(4, &cells, 10), (4, 1));
+        assert_eq!(resolve_cursor_cell(99, &cells, 10), (9, 1));
     }
 
     #[::core::prelude::v1::test]

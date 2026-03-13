@@ -979,7 +979,11 @@ impl EntityInputHandler for TerminalPane {
     ) -> Option<Bounds<Pixels>> {
         // Position IME candidate window near cursor
         Some(Bounds::new(
-            element_bounds.origin,
+            point(
+                element_bounds.origin.x
+                    + px(HORIZONTAL_TEXT_PADDING + self.snapshot.cursor_x as f32 * self.cell_width),
+                element_bounds.origin.y + px(self.snapshot.cursor_y as f32 * self.cell_height),
+            ),
             size(px(self.cell_width), px(self.cell_height)),
         ))
     }
