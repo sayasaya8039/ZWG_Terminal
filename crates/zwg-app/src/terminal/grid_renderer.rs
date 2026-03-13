@@ -39,6 +39,8 @@ pub(super) struct CachedTerminalRow {
     pub style_runs: Vec<ghostty_vt::StyleRun>,
     #[cfg(feature = "ghostty_vt")]
     pub cells: Vec<GridCell>,
+    #[cfg(feature = "ghostty_vt")]
+    pub glyph_instances: Vec<GlyphInstance>,
 }
 
 #[derive(Clone)]
@@ -184,6 +186,11 @@ pub(crate) fn glyph_instances_from_cells(cells: &[GridCell], row: u16) -> Vec<Gl
             key: glyph_key_from_cell(cell),
         })
         .collect()
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn glyph_instances_from_row(row: &CachedTerminalRow, row_idx: u16) -> Vec<GlyphInstance> {
+    glyph_instances_from_cells(&row.cells, row_idx)
 }
 
 #[cfg(feature = "ghostty_vt")]
@@ -409,7 +416,7 @@ pub(super) fn terminal_canvas(
             for (row_idx, row_data) in snapshot.rows.iter().enumerate() {
                 let row_y = row_idx as f32 * config.cell_height;
                 #[cfg(feature = "ghostty_vt")]
-                let glyph_instances = glyph_instances_from_cells(&row_data.cells, row_idx as u16);
+                let glyph_instances = &row_data.glyph_instances;
 
                 #[cfg(feature = "ghostty_vt")]
                 for srun in &row_data.style_runs {
@@ -443,7 +450,7 @@ pub(super) fn terminal_canvas(
 
                 #[cfg(feature = "ghostty_vt")]
                 {
-                    for instance in &glyph_instances {
+                    for instance in glyph_instances {
                         if matches!(instance.key.render_path, GlyphRenderPath::Geometry) {
                             continue;
                         }
@@ -497,7 +504,7 @@ pub(super) fn terminal_canvas(
 
                 #[cfg(feature = "ghostty_vt")]
                 {
-                    for instance in &glyph_instances {
+                    for instance in glyph_instances {
                         if instance.key.render_path == GlyphRenderPath::Geometry {
                             let fg = Hsla::from(rgb(instance.fg_rgb));
                             let x = bounds.origin.x
@@ -826,6 +833,7 @@ mod tests {
                 },
             ],
             cells: Vec::new(),
+            glyph_instances: Vec::new(),
         };
 
         let cells = grid_cells_from_row(&row, 10);
@@ -850,6 +858,7 @@ mod tests {
                 flags: 0,
             }],
             cells: Vec::new(),
+            glyph_instances: Vec::new(),
         };
 
         let cells = grid_cells_from_row(&row, 10);
@@ -870,6 +879,7 @@ mod tests {
                 flags: GHOSTTY_FLAG_UNDERLINE,
             }],
             cells: Vec::new(),
+            glyph_instances: Vec::new(),
         };
 
         assert_eq!(
@@ -941,6 +951,42 @@ mod tests {
         assert_eq!(instances[0].row, 7);
         assert_eq!(instances[0].col, 0);
         assert_eq!(instances[0].key.render_path, GlyphRenderPath::AtlasPolychrome);
+        assert_eq!(instances[1].col, 2);
+        assert_eq!(instances[1].key.render_path, GlyphRenderPath::Geometry);
+    }
+
+    #[::core::prelude::v1::test]
+    fn glyph_instances_from_row_uses_cached_cells() {
+        let row = CachedTerminalRow {
+            text: SharedString::from("ignored"),
+            style_runs: Vec::new(),
+            cells: vec![
+                GridCell {
+                    col: 0,
+                    width: 2,
+                    glyph: "🔥\u{FE0F}".into(),
+                    fg_rgb: 0x112233,
+                    bg_rgb: 0,
+                    flags: 0,
+                    kind: GridCellKind::Text,
+                },
+                GridCell {
+                    col: 2,
+                    width: 1,
+                    glyph: "█".into(),
+                    fg_rgb: 0x445566,
+                    bg_rgb: 0,
+                    flags: 0,
+                    kind: GridCellKind::GeometricBlock,
+                },
+            ],
+            glyph_instances: Vec::new(),
+        };
+
+        let instances = glyph_instances_from_row(&row, 5);
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].row, 5);
+        assert_eq!(instances[0].col, 0);
         assert_eq!(instances[1].col, 2);
         assert_eq!(instances[1].key.render_path, GlyphRenderPath::Geometry);
     }

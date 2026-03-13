@@ -410,9 +410,11 @@ impl TerminalPane {
                 let text = backend.row_text(row);
                 let style_runs = backend.row_style_runs(row);
                 let cells = grid_cells_from_parts(&text, &style_runs, self.term_cols);
+                let glyph_instances = super::grid_renderer::glyph_instances_from_cells(&cells, row);
                 cached_row.text = SharedString::from(text);
                 cached_row.style_runs = style_runs;
                 cached_row.cells = cells;
+                cached_row.glyph_instances = glyph_instances;
             }
             #[cfg(not(feature = "ghostty_vt"))]
             {
