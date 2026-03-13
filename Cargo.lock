@@ -7476,6 +7476,7 @@ dependencies = [
  "flume",
  "ghostty-vt",
  "gpui",
+ "image",
  "libc",
  "log",
  "mimalloc",

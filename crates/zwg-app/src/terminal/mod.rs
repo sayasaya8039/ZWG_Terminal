@@ -6,6 +6,8 @@ pub mod view;
 #[cfg(not(feature = "ghostty_vt"))]
 pub mod vt_parser;
 mod grid_renderer;
+#[cfg(feature = "ghostty_vt")]
+mod gpu_view;
 
 use std::sync::{Arc, atomic::AtomicBool};
 

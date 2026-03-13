@@ -13,6 +13,10 @@ use super::grid_renderer::{
     GlyphCache, GridRendererConfig, SelectionPoint, TerminalSnapshot, col_to_char_index,
     grid_cells_from_parts, terminal_canvas,
 };
+#[cfg(feature = "ghostty_vt")]
+use super::gpu_view::{GpuTerminalState, gpu_terminal_canvas};
+#[cfg(feature = "ghostty_vt")]
+use parking_lot::Mutex;
 use super::pty::{ConPtyConfig, spawn_pty};
 use super::surface::TerminalSurface;
 use super::{DEFAULT_BG, TerminalSettings};
@@ -178,6 +182,9 @@ pub struct TerminalPane {
     pending_input: Vec<u8>,
     /// Cross-frame glyph layout cache — avoids reshaping unchanged glyphs every paint
     glyph_cache: GlyphCache,
+    /// DX12 GPU renderer state — bypasses GPUI text shaping when available
+    #[cfg(feature = "ghostty_vt")]
+    gpu_state: Option<Arc<Mutex<GpuTerminalState>>>,
     #[cfg(not(feature = "ghostty_vt"))]
     row_generations: Vec<u64>,
 }
@@ -296,6 +303,23 @@ impl TerminalPane {
             measured_w, measured_h, CELL_WIDTH_FALLBACK, CELL_HEIGHT_FALLBACK,
         );
 
+        // Try to initialize DX12 GPU renderer for native rendering bypass
+        #[cfg(feature = "ghostty_vt")]
+        let gpu_state = {
+            let initial_w = (settings.cols as f32 * measured_w + HORIZONTAL_TEXT_PADDING * 2.0).ceil() as u32;
+            let initial_h = (settings.rows as f32 * measured_h).ceil() as u32;
+            match GpuTerminalState::new(initial_w.max(64), initial_h.max(64), FONT_SIZE) {
+                Some(state) => {
+                    log::info!("DX12 GPU terminal renderer active — bypassing GPUI text shaping");
+                    Some(Arc::new(Mutex::new(state)))
+                }
+                None => {
+                    log::warn!("DX12 GPU renderer unavailable — falling back to GPUI text shaping");
+                    None
+                }
+            }
+        };
+
         Self {
             surface,
             focus_handle,
@@ -314,6 +338,8 @@ impl TerminalPane {
             is_selecting: false,
             pending_input: Vec::new(),
             glyph_cache: Default::default(),
+            #[cfg(feature = "ghostty_vt")]
+            gpu_state,
             #[cfg(not(feature = "ghostty_vt"))]
             row_generations: vec![0; settings.rows as usize],
         }
@@ -552,19 +578,25 @@ impl TerminalPane {
         let selection = self.selection_range();
 
         let ime = self.ime_canvas(cx);
-        let terminal_canvas = terminal_canvas(
-            snapshot,
-            selection,
-            GridRendererConfig {
-                cell_width: self.cell_width,
-                cell_height: self.cell_height,
-                font_family: FONT_FAMILY,
-                font_size: FONT_SIZE,
-                horizontal_text_padding: HORIZONTAL_TEXT_PADDING,
-                term_cols: self.term_cols,
-            },
-            self.glyph_cache.clone(),
-        );
+        let config = GridRendererConfig {
+            cell_width: self.cell_width,
+            cell_height: self.cell_height,
+            font_family: FONT_FAMILY,
+            font_size: FONT_SIZE,
+            horizontal_text_padding: HORIZONTAL_TEXT_PADDING,
+            term_cols: self.term_cols,
+        };
+
+        // Choose rendering path: DX12 GPU (native) or GPUI text shaping (fallback)
+        #[cfg(feature = "ghostty_vt")]
+        let terminal_element: AnyElement = if let Some(ref gpu) = self.gpu_state {
+            gpu_terminal_canvas(snapshot, selection, config, gpu.clone()).into_any_element()
+        } else {
+            terminal_canvas(snapshot, selection, config, self.glyph_cache.clone()).into_any_element()
+        };
+        #[cfg(not(feature = "ghostty_vt"))]
+        let terminal_element: AnyElement =
+            terminal_canvas(snapshot, selection, config, self.glyph_cache.clone()).into_any_element();
 
         div()
             .id("terminal-pane")
@@ -577,7 +609,7 @@ impl TerminalPane {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_drop(cx.listener(Self::on_external_paths_drop))
-            .child(terminal_canvas)
+            .child(terminal_element)
             .child(ime)
     }
 }
