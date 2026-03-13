@@ -1,4 +1,5 @@
 use gpui::*;
+use std::collections::HashMap;
 use unicode_width::UnicodeWidthChar;
 
 use super::{DEFAULT_BG, DEFAULT_FG};
@@ -75,14 +76,14 @@ pub(crate) struct GridCell {
     pub kind: GridCellKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum GlyphRenderPath {
     AtlasMonochrome,
     AtlasPolychrome,
     Geometry,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct GlyphKey {
     pub glyph: String,
     pub width: u8,
@@ -173,6 +174,95 @@ pub(crate) fn glyph_instances_from_cells(cells: &[GridCell], row: u16) -> Vec<Gl
 }
 
 #[cfg(feature = "ghostty_vt")]
+fn text_run_for_glyph_key(key: &GlyphKey, font_desc: &Font, color: Hsla) -> TextRun {
+    let mut run_font = font_desc.clone();
+    if key.flags & GHOSTTY_FLAG_BOLD != 0 {
+        run_font.weight = FontWeight::BOLD;
+    }
+    if key.flags & GHOSTTY_FLAG_ITALIC != 0 {
+        run_font.style = FontStyle::Italic;
+    }
+
+    TextRun {
+        len: key.glyph.len(),
+        font: run_font,
+        color,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    }
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn glyph_layout_for_key(
+    key: &GlyphKey,
+    text_system: &WindowTextSystem,
+    font_desc: &Font,
+    font_size: Pixels,
+    cache: &mut HashMap<GlyphKey, ShapedLine>,
+) -> ShapedLine {
+    cache
+        .entry(key.clone())
+        .or_insert_with(|| {
+            let run = text_run_for_glyph_key(key, font_desc, Hsla::default());
+            text_system.shape_line(SharedString::from(key.glyph.clone()), font_size, &[run], None)
+        })
+        .clone()
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn glyph_baseline_y(layout: &LineLayout, cell_height: f32) -> Pixels {
+    let padding_top = (px(cell_height) - layout.ascent - layout.descent) / 2.;
+    padding_top + layout.ascent
+}
+
+#[cfg(feature = "ghostty_vt")]
+fn paint_glyph_instance(
+    instance: &GlyphInstance,
+    layout: &LineLayout,
+    bounds: Bounds<Pixels>,
+    config: &GridRendererConfig,
+    window: &mut Window,
+) {
+    let glyph_color = Hsla::from(rgb(instance.fg_rgb));
+    let cell_origin = point(
+        bounds.origin.x + px(config.horizontal_text_padding + instance.col as f32 * config.cell_width),
+        bounds.origin.y + px(instance.row as f32 * config.cell_height),
+    );
+    let baseline_origin = point(cell_origin.x, cell_origin.y + glyph_baseline_y(layout, config.cell_height));
+
+    for run in &layout.runs {
+        for glyph in &run.glyphs {
+            let glyph_origin = point(
+                baseline_origin.x + glyph.position.x,
+                baseline_origin.y + glyph.position.y,
+            );
+            if glyph.is_emoji {
+                let _ = window.paint_emoji(glyph_origin, run.font_id, glyph.id, layout.font_size);
+            } else {
+                let _ = window.paint_glyph(glyph_origin, run.font_id, glyph.id, layout.font_size, glyph_color);
+            }
+        }
+    }
+
+    let deco_width = px(config.cell_width * instance.key.width as f32);
+    if instance.key.flags & GHOSTTY_FLAG_UNDERLINE != 0 {
+        let y = cell_origin.y + px(config.cell_height - 2.0);
+        window.paint_quad(fill(
+            Bounds::new(point(cell_origin.x, y), size(deco_width, px(1.0))),
+            glyph_color,
+        ));
+    }
+    if instance.key.flags & GHOSTTY_FLAG_STRIKETHROUGH != 0 {
+        let y = cell_origin.y + px(config.cell_height * 0.5);
+        window.paint_quad(fill(
+            Bounds::new(point(cell_origin.x, y), size(deco_width, px(1.0))),
+            glyph_color,
+        ));
+    }
+}
+
+#[cfg(feature = "ghostty_vt")]
 fn default_grid_cell_style() -> (u32, u32, u8) {
     (DEFAULT_FG, DEFAULT_BG, 0)
 }
@@ -234,13 +324,14 @@ pub(super) fn terminal_canvas(
 ) -> Canvas<()> {
     canvas(
         |_, _, _| (),
-        move |bounds: Bounds<Pixels>, _, window: &mut Window, cx: &mut App| {
+        move |bounds: Bounds<Pixels>, _, window: &mut Window, _cx: &mut App| {
             let text_system = window.text_system().clone();
             let font_desc = font(config.font_family);
             let font_size = px(config.font_size);
             let line_height_px = px(config.cell_height);
-            let default_fg = Hsla::from(rgb(DEFAULT_FG));
             let num_rows = snapshot.rows.len();
+            #[cfg(feature = "ghostty_vt")]
+            let mut glyph_layout_cache: HashMap<GlyphKey, ShapedLine> = HashMap::new();
 
             window.paint_quad(fill(bounds, Hsla::from(rgb(DEFAULT_BG))));
 
@@ -313,52 +404,59 @@ pub(super) fn terminal_canvas(
                     }
                 }
 
-                let text = &row_data.text;
-                if text.is_empty() {
-                    continue;
-                }
                 #[cfg(feature = "ghostty_vt")]
-                let shaped_text: String = glyph_instances
-                    .iter()
-                    .map(|instance| sanitize_text_for_shaping(&instance.key.glyph))
-                    .collect();
-                #[cfg(not(feature = "ghostty_vt"))]
-                let shaped_text = sanitize_text_for_shaping(text);
-                let origin = point(
-                    bounds.origin.x + px(config.horizontal_text_padding),
-                    bounds.origin.y + px(row_y),
-                );
-
-                #[cfg(feature = "ghostty_vt")]
-                let runs =
-                    build_canvas_text_runs(&shaped_text, &row_data.style_runs, &font_desc, default_fg);
-                #[cfg(not(feature = "ghostty_vt"))]
-                let runs = vec![TextRun {
-                    len: shaped_text.len(),
-                    font: font_desc.clone(),
-                    color: default_fg,
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                }];
-
-                #[cfg(feature = "ghostty_vt")]
-                let has_wide_cells = glyph_instances.iter().any(|instance| instance.key.width > 1);
-                #[cfg(not(feature = "ghostty_vt"))]
-                let has_wide_cells = text.chars().any(|ch| char_cell_width(ch) > 1);
-                let force_width = if !has_wide_cells && text.chars().all(|ch| char_cell_width(ch) <= 1)
                 {
-                    Some(px(config.cell_width))
-                } else {
-                    None
-                };
-                let shaped = text_system.shape_line(
-                    SharedString::from(shaped_text),
-                    font_size,
-                    &runs,
-                    force_width,
-                );
-                let _ = shaped.paint(origin, line_height_px, window, cx);
+                    for instance in &glyph_instances {
+                        if matches!(instance.key.render_path, GlyphRenderPath::Geometry) {
+                            continue;
+                        }
+                        let layout = glyph_layout_for_key(
+                            &instance.key,
+                            &text_system,
+                            &font_desc,
+                            font_size,
+                            &mut glyph_layout_cache,
+                        );
+                        paint_glyph_instance(instance, &layout, bounds, &config, window);
+                    }
+                }
+
+                #[cfg(not(feature = "ghostty_vt"))]
+                {
+                    let text = &row_data.text;
+                    if text.is_empty() {
+                        continue;
+                    }
+                    let shaped_text = sanitize_text_for_shaping(text);
+                    let origin = point(
+                        bounds.origin.x + px(config.horizontal_text_padding),
+                        bounds.origin.y + px(row_y),
+                    );
+                    let default_fg = Hsla::from(rgb(DEFAULT_FG));
+                    let runs = vec![TextRun {
+                        len: shaped_text.len(),
+                        font: font_desc.clone(),
+                        color: default_fg,
+                        background_color: None,
+                        underline: None,
+                        strikethrough: None,
+                    }];
+
+                    let has_wide_cells = text.chars().any(|ch| char_cell_width(ch) > 1);
+                    let force_width = if !has_wide_cells && text.chars().all(|ch| char_cell_width(ch) <= 1)
+                    {
+                        Some(px(config.cell_width))
+                    } else {
+                        None
+                    };
+                    let shaped = text_system.shape_line(
+                        SharedString::from(shaped_text),
+                        font_size,
+                        &runs,
+                        force_width,
+                    );
+                    let _ = shaped.paint(origin, line_height_px, window, _cx);
+                }
 
                 #[cfg(feature = "ghostty_vt")]
                 {
@@ -775,5 +873,34 @@ mod tests {
         assert_eq!(instances[0].key.render_path, GlyphRenderPath::AtlasPolychrome);
         assert_eq!(instances[1].col, 2);
         assert_eq!(instances[1].key.render_path, GlyphRenderPath::Geometry);
+    }
+
+    #[::core::prelude::v1::test]
+    fn text_run_for_glyph_key_applies_font_style_flags() {
+        let key = GlyphKey {
+            glyph: "A".into(),
+            width: 1,
+            flags: GHOSTTY_FLAG_BOLD | GHOSTTY_FLAG_ITALIC,
+            render_path: GlyphRenderPath::AtlasMonochrome,
+        };
+
+        let run = text_run_for_glyph_key(&key, &font("Consolas"), Hsla::from(rgb(DEFAULT_FG)));
+        assert_eq!(run.font.weight, FontWeight::BOLD);
+        assert_eq!(run.font.style, FontStyle::Italic);
+        assert_eq!(run.len, 1);
+    }
+
+    #[::core::prelude::v1::test]
+    fn glyph_baseline_y_centers_layout_within_cell_height() {
+        let layout = LineLayout {
+            font_size: px(14.0),
+            width: px(8.0),
+            ascent: px(9.0),
+            descent: px(3.0),
+            runs: Vec::new(),
+            len: 1,
+        };
+
+        assert_eq!(glyph_baseline_y(&layout, 16.0), px(11.0));
     }
 }
