@@ -98,4 +98,40 @@ unsafe extern "C" {
     ) -> ghostty_vt_bytes_t;
 
     pub fn ghostty_vt_bytes_free(bytes: ghostty_vt_bytes_t);
+
+    // DX12 GPU renderer
+    pub fn ghostty_gpu_renderer_new(
+        width: u32,
+        height: u32,
+        font_size: f32,
+    ) -> *mut core::ffi::c_void;
+    pub fn ghostty_gpu_renderer_free(renderer: *mut core::ffi::c_void);
+    pub fn ghostty_gpu_renderer_resize(
+        renderer: *mut core::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) -> u8;
+    pub fn ghostty_gpu_renderer_render(
+        renderer: *mut core::ffi::c_void,
+        cells: *const GpuCellData,
+        cell_count: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> *const u8;
+    pub fn ghostty_gpu_renderer_pixel_stride(renderer: *const core::ffi::c_void) -> u32;
+    pub fn ghostty_gpu_renderer_width(renderer: *const core::ffi::c_void) -> u32;
+    pub fn ghostty_gpu_renderer_height(renderer: *const core::ffi::c_void) -> u32;
+}
+
+/// Cell data passed to the GPU renderer (20 bytes, C-compatible).
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct GpuCellData {
+    pub col: u16,
+    pub row: u16,
+    pub codepoint: u32,
+    pub fg_rgba: u32,
+    pub bg_rgba: u32,
+    pub flags: u16,
+    pub _pad: u16,
 }

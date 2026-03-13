@@ -342,6 +342,75 @@ impl Drop for Terminal {
     }
 }
 
+// ── DX12 GPU Renderer ──────────────────────────────────────────────────
+
+pub use ghostty_vt_sys::GpuCellData;
+
+pub struct GpuRenderer {
+    ptr: NonNull<c_void>,
+}
+
+unsafe impl Send for GpuRenderer {}
+
+impl GpuRenderer {
+    /// Create a new DX12 GPU renderer with the given viewport size and font size.
+    pub fn new(width: u32, height: u32, font_size: f32) -> Result<Self, Error> {
+        let ptr = unsafe { ghostty_vt_sys::ghostty_gpu_renderer_new(width, height, font_size) };
+        let ptr = NonNull::new(ptr).ok_or(Error::CreateFailed)?;
+        Ok(Self { ptr })
+    }
+
+    /// Resize the offscreen render target. Returns true if resize succeeded.
+    pub fn resize(&mut self, width: u32, height: u32) -> bool {
+        unsafe { ghostty_vt_sys::ghostty_gpu_renderer_resize(self.ptr.as_ptr(), width, height) != 0 }
+    }
+
+    /// Render a frame. Returns a slice of RGBA pixels (row-major, with stride padding).
+    /// The returned slice is valid until the next call to `render` or `drop`.
+    pub fn render(
+        &mut self,
+        cells: &[GpuCellData],
+        cell_width: f32,
+        cell_height: f32,
+    ) -> Option<&[u8]> {
+        let ptr = unsafe {
+            ghostty_vt_sys::ghostty_gpu_renderer_render(
+                self.ptr.as_ptr(),
+                cells.as_ptr(),
+                cells.len() as u32,
+                cell_width,
+                cell_height,
+            )
+        };
+        if ptr.is_null() {
+            return None;
+        }
+        let stride = self.pixel_stride();
+        let height = self.height();
+        let len = (stride * height) as usize;
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Padded row stride in bytes (aligned to 256 for DX12 readback).
+    pub fn pixel_stride(&self) -> u32 {
+        unsafe { ghostty_vt_sys::ghostty_gpu_renderer_pixel_stride(self.ptr.as_ptr() as *const _) }
+    }
+
+    pub fn width(&self) -> u32 {
+        unsafe { ghostty_vt_sys::ghostty_gpu_renderer_width(self.ptr.as_ptr() as *const _) }
+    }
+
+    pub fn height(&self) -> u32 {
+        unsafe { ghostty_vt_sys::ghostty_gpu_renderer_height(self.ptr.as_ptr() as *const _) }
+    }
+}
+
+impl Drop for GpuRenderer {
+    fn drop(&mut self) {
+        unsafe { ghostty_vt_sys::ghostty_gpu_renderer_free(self.ptr.as_ptr()) }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::Terminal;

@@ -6,6 +6,9 @@ fn main() {
     println!("cargo:rerun-if-changed=zig/lib.zig");
     println!("cargo:rerun-if-changed=zig/build.zig");
     println!("cargo:rerun-if-changed=zig/build.zig.zon");
+    println!("cargo:rerun-if-changed=zig/gpu_renderer.zig");
+    println!("cargo:rerun-if-changed=zig/dx12.zig");
+    println!("cargo:rerun-if-changed=zig/shaders.zig");
     println!("cargo:rerun-if-changed=include/ghostty_vt.h");
 
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -74,6 +77,12 @@ fn main() {
     if !target.contains("msvc") {
         println!("cargo:rustc-link-lib=c");
     }
+
+    // DX12 GPU renderer system libraries
+    println!("cargo:rustc-link-lib=d3d12");
+    println!("cargo:rustc-link-lib=dxgi");
+    println!("cargo:rustc-link-lib=d3dcompiler");
+    println!("cargo:rustc-link-lib=gdi32");
 }
 
 fn find_zig() -> PathBuf {

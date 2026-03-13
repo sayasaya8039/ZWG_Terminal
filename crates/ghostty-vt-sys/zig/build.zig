@@ -68,6 +68,12 @@ pub fn build(b: *std.Build) void {
     });
     lib.linkLibC();
 
+    // DX12 GPU renderer system libraries (Windows only)
+    lib.linkSystemLibrary("d3d12");
+    lib.linkSystemLibrary("dxgi");
+    lib.linkSystemLibrary("d3dcompiler");
+    lib.linkSystemLibrary("gdi32");
+
     // terminal_options
     const terminal_opts = b.addOptions();
     terminal_opts.addOption(Artifact, "artifact", .lib);

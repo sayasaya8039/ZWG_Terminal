@@ -2,6 +2,11 @@ const std = @import("std");
 const terminal = @import("ghostty_src/terminal/main.zig");
 const ghostty_input = @import("ghostty_src/input.zig");
 
+// DX12 GPU renderer — force export its C symbols into this static library
+comptime {
+    _ = @import("gpu_renderer.zig");
+}
+
 const Allocator = std.mem.Allocator;
 
 const TerminalHandle = struct {
