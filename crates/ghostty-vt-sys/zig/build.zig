@@ -79,7 +79,7 @@ pub fn build(b: *std.Build) void {
     terminal_opts.addOption(Artifact, "artifact", .lib);
     terminal_opts.addOption(bool, "c_abi", false);
     terminal_opts.addOption(bool, "oniguruma", false);
-    terminal_opts.addOption(bool, "simd", false);
+    terminal_opts.addOption(bool, "simd", true);
     terminal_opts.addOption(bool, "slow_runtime_safety", false);
     terminal_opts.addOption(bool, "kitty_graphics", false);
     terminal_opts.addOption(bool, "tmux_control_mode", false);
@@ -87,7 +87,7 @@ pub fn build(b: *std.Build) void {
 
     // build_options
     const build_opts = b.addOptions();
-    build_opts.addOption(bool, "simd", false);
+    build_opts.addOption(bool, "simd", true);
     lib.root_module.addOptions("build_options", build_opts);
 
     // Unicode tables - copy generated stdout to named .zig files

@@ -116,8 +116,10 @@ fn main() {
             })),
             titlebar: Some(TitlebarOptions {
                 title: Some("ZWG Terminal".into()),
+                appears_transparent: true,
                 ..Default::default()
             }),
+            window_background: WindowBackgroundAppearance::Transparent,
             ..Default::default()
         };
 

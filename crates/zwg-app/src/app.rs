@@ -10,6 +10,14 @@ use std::time::Instant;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+#[cfg(target_os = "windows")]
+use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+#[cfg(target_os = "windows")]
+use windows::Win32::UI::WindowsAndMessaging::{
+    GA_ROOT, GetAncestor, SW_RESTORE, ShowWindowAsync,
+};
 
 use crate::config::{AppConfig, WindowState, set_launch_on_login};
 use crate::shell::{self, ShellType};
@@ -23,7 +31,6 @@ use crate::{
 };
 
 const WINDOW_BG: u32 = 0x1C1C1E;
-const TITLEBAR_BG: u32 = 0x2C2C2E;
 const PANEL_BG: u32 = 0x323234;
 const PANEL_SIDEBAR_BG: u32 = 0x242426;
 const SURFACE1: u32 = 0x48484A;
@@ -41,6 +48,135 @@ const ACCENT_ALT: u32 = 0x34C759;
 const BACKDROP: u32 = 0x00000088;
 const UI_FONT: &str = "Yu Gothic UI";
 const MONO_FONT: &str = "Consolas";
+const WINDOW_CHROME_RADIUS: f32 = 14.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZoomAction {
+    Maximize,
+    Restore,
+}
+
+fn zoom_action_for_window(is_maximized: bool) -> ZoomAction {
+    if is_maximized {
+        ZoomAction::Restore
+    } else {
+        ZoomAction::Maximize
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn try_restore_window(window: &Window) -> bool {
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return false;
+    };
+
+    match handle.as_raw() {
+        RawWindowHandle::Win32(handle) => {
+            let hwnd = HWND(handle.hwnd.get() as *mut core::ffi::c_void);
+            let target = unsafe { GetAncestor(hwnd, GA_ROOT) };
+            let target = if target.is_invalid() { hwnd } else { target };
+            unsafe { ShowWindowAsync(target, SW_RESTORE).ok().is_ok() }
+        }
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn try_restore_window(_window: &Window) -> bool {
+    false
+}
+
+/// Initiate window drag via raw Win32 API.
+/// Calls DefWindowProcW directly to bypass GPUI's window proc entirely,
+/// avoiding callback state issues (input callback is `.take()`'d during dispatch).
+/// After drag ends, constrains window so the title bar stays within the monitor work area.
+#[cfg(target_os = "windows")]
+fn start_window_drag_win32(window: &Window) {
+    use windows::Win32::Foundation::POINT;
+    use windows::Win32::UI::WindowsAndMessaging::{DefWindowProcW, GetCursorPos};
+
+    let Ok(handle) = HasWindowHandle::window_handle(window) else {
+        return;
+    };
+    let RawWindowHandle::Win32(win32) = handle.as_raw() else {
+        return;
+    };
+    let hwnd = HWND(win32.hwnd.get() as *mut core::ffi::c_void);
+
+    unsafe {
+        unsafe extern "system" {
+            fn ReleaseCapture() -> i32;
+        }
+
+        // Get cursor screen position for WM_NCLBUTTONDOWN lParam
+        let mut pt = POINT::default();
+        let _ = GetCursorPos(&mut pt);
+        let lparam = LPARAM((((pt.y & 0xFFFF) << 16) | (pt.x & 0xFFFF)) as isize);
+
+        // Release GPUI's mouse capture so DefWindowProc can set its own
+        ReleaseCapture();
+
+        // Call DefWindowProc DIRECTLY (not SendMessage) to start the
+        // native drag modal loop, bypassing GPUI's window proc handler.
+        const WM_NCLBUTTONDOWN: u32 = 0x00A1;
+        const HTCAPTION: usize = 2;
+        DefWindowProcW(hwnd, WM_NCLBUTTONDOWN, WPARAM(HTCAPTION), lparam);
+
+        // After drag modal loop ends, snap window into the monitor work area
+        snap_window_into_work_area(hwnd);
+    }
+}
+
+/// Ensure the window's top edge does not exceed the monitor work area (taskbar-aware).
+#[cfg(target_os = "windows")]
+fn snap_window_into_work_area(hwnd: HWND) {
+    use windows::Win32::Foundation::RECT;
+    use windows::Win32::Graphics::Gdi::{
+        GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowRect, SWP_NOSIZE, SWP_NOZORDER, SetWindowPos,
+    };
+
+    unsafe {
+        let mut rect = RECT::default();
+        if GetWindowRect(hwnd, &mut rect).is_err() {
+            return;
+        }
+
+        let monitor = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+        let mut info = MONITORINFO {
+            cbSize: size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        if !GetMonitorInfoW(monitor, &mut info).as_bool() {
+            return;
+        }
+        let work = info.rcWork;
+
+        // Clamp: title bar must stay within the work area vertically
+        let clamped_top = rect.top.max(work.top);
+        // Also prevent dragging so far down that the title bar is below the work area bottom
+        let clamped_top = clamped_top.min(work.bottom - 38); // 38px = title bar height
+
+        if clamped_top != rect.top {
+            let _ = SetWindowPos(
+                hwnd,
+                None,
+                rect.left,
+                clamped_top,
+                0,
+                0,
+                SWP_NOSIZE | SWP_NOZORDER,
+            );
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn start_window_drag_win32(_window: &Window) {
+    // Linux/macOS: use GPUI's start_window_move() instead
+}
 
 /// Minimum interval between window state saves.
 const WINDOW_STATE_SAVE_INTERVAL_SECS: u64 = 2;
@@ -890,6 +1026,21 @@ impl RootView {
             cx.notify();
         } else {
             window.remove_window();
+        }
+    }
+
+    fn minimize_window(&mut self, window: &mut Window) {
+        window.minimize_window();
+    }
+
+    fn toggle_zoom_window(&mut self, window: &mut Window) {
+        match zoom_action_for_window(window.is_maximized()) {
+            ZoomAction::Maximize => window.zoom_window(),
+            ZoomAction::Restore => {
+                if !try_restore_window(window) {
+                    window.zoom_window();
+                }
+            }
         }
     }
 
@@ -1820,11 +1971,13 @@ impl RootView {
                     .h(px(12.0))
                     .rounded_full()
                     .bg(rgb(RED))
+                    .window_control_area(WindowControlArea::Close)
                     .cursor_pointer()
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _: &MouseDownEvent, window, cx| {
                             this.request_window_close(window, cx);
+                            cx.stop_propagation();
                         }),
                     ),
             )
@@ -1834,7 +1987,16 @@ impl RootView {
                     .w(px(12.0))
                     .h(px(12.0))
                     .rounded_full()
-                    .bg(rgb(YELLOW)),
+                    .bg(rgb(YELLOW))
+                    .window_control_area(WindowControlArea::Min)
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.minimize_window(window);
+                            cx.stop_propagation();
+                        }),
+                    ),
             )
             .child(
                 div()
@@ -1842,7 +2004,16 @@ impl RootView {
                     .w(px(12.0))
                     .h(px(12.0))
                     .rounded_full()
-                    .bg(rgb(GREEN)),
+                    .bg(rgb(GREEN))
+                    .window_control_area(WindowControlArea::Max)
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                            this.toggle_zoom_window(window);
+                            cx.stop_propagation();
+                        }),
+                    ),
             )
     }
 
@@ -5780,6 +5951,7 @@ impl Render for RootView {
                         cx.defer_in(window, |this, window, cx| {
                             this.focus_active_terminal(window, cx);
                         });
+                        cx.stop_propagation();
                     }),
                 );
 
@@ -5816,6 +5988,7 @@ impl Render for RootView {
                                     state.close_tab(idx);
                                 });
                                 cx.notify();
+                                cx.stop_propagation();
                             }),
                         )
                         .child("x"),
@@ -5838,6 +6011,7 @@ impl Render for RootView {
                     this.snippet_palette.hide();
                     this.show_shell_menu = true;
                     cx.notify();
+                    cx.stop_propagation();
                 }),
             ))
             .child(
@@ -5850,6 +6024,7 @@ impl Render for RootView {
                         this.snippet_palette.hide();
                         this.show_shell_menu = true;
                         cx.notify();
+                        cx.stop_propagation();
                     }),
                 ),
             );
@@ -5873,6 +6048,7 @@ impl Render for RootView {
                                 this.focus_active_terminal(window, cx);
                             }
                             cx.notify();
+                            cx.stop_propagation();
                         }),
                     )
                     .on_mouse_down(
@@ -5885,6 +6061,7 @@ impl Render for RootView {
                             this.snippet_palette.hide();
                             this.show_snippet_context_menu = !this.show_snippet_context_menu;
                             cx.notify();
+                            cx.stop_propagation();
                         }),
                     ),
             );
@@ -5900,18 +6077,35 @@ impl Render for RootView {
                     this.snippet_palette.hide();
                     this.show_settings = true;
                     cx.notify();
+                    cx.stop_propagation();
                 }),
             ),
         );
 
+        let chrome_radius = if new_state.maximized {
+            px(0.0)
+        } else {
+            px(WINDOW_CHROME_RADIUS)
+        };
+
         let title_bar = div()
             .id("title-bar")
+            .window_control_area(WindowControlArea::Drag)
+            .on_mouse_down(MouseButton::Left, |_event, window, _cx| {
+                start_window_drag_win32(window);
+                window.start_window_move(); // Linux/Wayland fallback
+            })
+            .relative()
             .h(px(38.0))
             .w_full()
             .px(px(12.0))
             .border_b_1()
             .border_color(rgba(0xffffff08))
-            .bg(rgb(TITLEBAR_BG))
+            .bg(linear_gradient(
+                180.0,
+                linear_color_stop(rgba(0x4a4a4cd8), 0.0),
+                linear_color_stop(rgba(0x2f2f31f0), 1.0),
+            ))
             .flex()
             .items_center()
             .child(self.render_window_traffic_lights(window, cx))
@@ -5933,7 +6127,17 @@ impl Render for RootView {
                                 .child(active_shell_name.clone())
                                 .into_any_element(),
                         ]
-                    }),
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .window_control_area(WindowControlArea::Drag)
+                            .on_mouse_down(MouseButton::Left, |_event, window, _cx| {
+                                start_window_drag_win32(window);
+                                window.start_window_move(); // Linux/Wayland fallback
+                            }),
+                    ),
             )
             .child(titlebar_actions);
 
@@ -6009,26 +6213,22 @@ impl Render for RootView {
 
         self.sync_terminal_input_suppression(cx);
 
-        div()
-            .id("root")
+        let window_surface = div()
+            .id("window-surface")
             .size_full()
             .flex()
             .flex_col()
             .relative()
             .bg(rgb(WINDOW_BG))
-            .font_family(UI_FONT)
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(Self::on_key_down))
-            .on_action(cx.listener(Self::on_new_tab))
-            .on_action(cx.listener(Self::on_close_tab))
-            .on_action(cx.listener(Self::on_split_right))
-            .on_action(cx.listener(Self::on_split_down))
-            .on_action(cx.listener(Self::on_close_pane))
-            .on_action(cx.listener(Self::on_focus_next))
-            .on_action(cx.listener(Self::on_focus_prev))
-            .on_action(cx.listener(Self::on_toggle_snippet_palette))
-            .on_action(cx.listener(Self::on_snippet_queue_paste))
-            .on_action(cx.listener(Self::on_quit_requested))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .right_0()
+                    .h(px(1.0))
+                    .bg(rgba(0xffffff18)),
+            )
             .child(title_bar)
             .child(
                 div()
@@ -6087,7 +6287,30 @@ impl Render for RootView {
                 &self.snippet_settings.notifications.notification_position,
             ))
             .children(close_confirm_backdrop)
-            .children(self.render_close_confirm_dialog(new_state.width, new_state.height, cx))
+            .children(self.render_close_confirm_dialog(new_state.width, new_state.height, cx));
+
+        div()
+            .id("root")
+            .size_full()
+            .flex()
+            .relative()
+            .rounded(chrome_radius)
+            .overflow_hidden()
+            .bg(transparent_black())
+            .font_family(UI_FONT)
+            .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(Self::on_key_down))
+            .on_action(cx.listener(Self::on_new_tab))
+            .on_action(cx.listener(Self::on_close_tab))
+            .on_action(cx.listener(Self::on_split_right))
+            .on_action(cx.listener(Self::on_split_down))
+            .on_action(cx.listener(Self::on_close_pane))
+            .on_action(cx.listener(Self::on_focus_next))
+            .on_action(cx.listener(Self::on_focus_prev))
+            .on_action(cx.listener(Self::on_toggle_snippet_palette))
+            .on_action(cx.listener(Self::on_snippet_queue_paste))
+            .on_action(cx.listener(Self::on_quit_requested))
+            .child(window_surface)
     }
 }
 
@@ -7639,4 +7862,19 @@ fn theme_card(name: &'static str, preview: u32, selected: bool) -> Div {
 
 fn color_dot(color: u32) -> Div {
     div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(color))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ZoomAction, zoom_action_for_window};
+
+    #[test]
+    fn zoom_action_maximizes_when_windowed() {
+        assert_eq!(zoom_action_for_window(false), ZoomAction::Maximize);
+    }
+
+    #[test]
+    fn zoom_action_restores_when_already_maximized() {
+        assert_eq!(zoom_action_for_window(true), ZoomAction::Restore);
+    }
 }

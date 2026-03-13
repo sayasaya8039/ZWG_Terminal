@@ -7481,6 +7481,7 @@ dependencies = [
  "log",
  "mimalloc",
  "parking_lot",
+ "raw-window-handle",
  "rfd",
  "serde",
  "serde_json",

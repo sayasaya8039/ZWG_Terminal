@@ -26,6 +26,7 @@ mimalloc.workspace = true
 windows.workspace = true
 libc.workspace = true
 unicode-width.workspace = true
+raw-window-handle = "0.6"
 image = "0.25"
 encoding_rs = "0.8"
 rfd = "0.15"

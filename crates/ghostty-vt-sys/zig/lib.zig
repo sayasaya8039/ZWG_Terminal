@@ -2,6 +2,7 @@ const std = @import("std");
 const terminal = @import("ghostty_src/terminal/main.zig");
 const ghostty_input = @import("ghostty_src/input.zig");
 const async_io = @import("async_io.zig");
+const content_scan = @import("content_scan.zig");
 
 // DX12 GPU renderer — force export its C symbols into this static library
 comptime {
@@ -22,6 +23,7 @@ const TerminalHandle = struct {
     // Async I/O fields
     terminal_mutex: std.Thread.Mutex = .{},
     async_feeder: ?*async_io.AsyncFeeder = null,
+    content_kind: u8 = 0,
 
     fn init(alloc: Allocator, cols: u16, rows: u16) !*TerminalHandle {
         return initWithOptions(alloc, cols, rows, null);
@@ -824,6 +826,7 @@ export fn ghostty_vt_terminal_start_async(terminal_ptr: ?*anyopaque) callconv(.c
     if (terminal_ptr == null) return 1;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
     if (handle.async_feeder != null) return 2; // already active
+    @atomicStore(u8, &handle.content_kind, 0, .release);
 
     const alloc = std.heap.c_allocator;
     const feeder = async_io.AsyncFeeder.init(
@@ -858,8 +861,16 @@ export fn ghostty_vt_terminal_feed_async(
 ) callconv(.c) usize {
     if (terminal_ptr == null or len == 0) return 0;
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    const input = bytes[0..len];
+    const current_kind = @atomicLoad(u8, &handle.content_kind, .acquire);
+    if (current_kind == 0 or current_kind == 1) {
+        const stats = content_scan.detectContent(input);
+        if (stats.kind != 0 and stats.kind != current_kind) {
+            @atomicStore(u8, &handle.content_kind, stats.kind, .release);
+        }
+    }
     if (handle.async_feeder) |feeder| {
-        return feeder.ring.push(bytes[0..len]);
+        return feeder.ring.push(input);
     }
     return 0;
 }
@@ -871,6 +882,19 @@ export fn ghostty_vt_terminal_has_new_data(terminal_ptr: ?*anyopaque) callconv(.
         return feeder.takeNewData();
     }
     return false;
+}
+
+export fn ghostty_vt_terminal_content_kind(terminal_ptr: ?*const anyopaque) callconv(.c) u8 {
+    if (terminal_ptr == null) return 0;
+    const handle: *const TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    return @atomicLoad(u8, &handle.content_kind, .acquire);
+}
+
+export fn ghostty_simd_detect_content(
+    bytes: [*]const u8,
+    len: usize,
+) callconv(.c) content_scan.ContentStats {
+    return content_scan.detectContent(bytes[0..len]);
 }
 
 // ── SIMD-accelerated UTF-8 decoder ────────────────────────────────────

@@ -9,6 +9,17 @@ pub struct ghostty_vt_bytes_t {
 pub const PINNED_GHOSTTY_TAG: &str = "v1.3.0";
 pub const PINNED_ZIG_VERSION: &str = "0.15.2";
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ghostty_vt_content_stats_t {
+    pub kind: u8,
+    pub flags: u8,
+    pub reserved0: u8,
+    pub reserved1: u8,
+    pub json_structural_count: u32,
+    pub markdown_marker_count: u32,
+}
+
 unsafe extern "C" {
     pub fn ghostty_vt_terminal_new(cols: u16, rows: u16) -> *mut core::ffi::c_void;
     pub fn ghostty_vt_terminal_new_with_scrollback(
@@ -110,6 +121,11 @@ unsafe extern "C" {
         len: usize,
     ) -> usize;
     pub fn ghostty_vt_terminal_has_new_data(terminal: *mut core::ffi::c_void) -> bool;
+    pub fn ghostty_vt_terminal_content_kind(terminal: *const core::ffi::c_void) -> u8;
+    pub fn ghostty_simd_detect_content(
+        bytes: *const u8,
+        len: usize,
+    ) -> ghostty_vt_content_stats_t;
 
     // DX12 GPU renderer
     pub fn ghostty_gpu_renderer_new(

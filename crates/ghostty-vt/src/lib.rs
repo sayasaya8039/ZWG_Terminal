@@ -54,6 +54,35 @@ pub struct StyleRun {
     pub flags: u8,
 }
 
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum ContentKind {
+    #[default]
+    Unknown = 0,
+    PlainText = 1,
+    Json = 2,
+    Markdown = 3,
+}
+
+impl From<u8> for ContentKind {
+    fn from(value: u8) -> Self {
+        match value {
+            1 => Self::PlainText,
+            2 => Self::Json,
+            3 => Self::Markdown,
+            _ => Self::Unknown,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct ContentStats {
+    pub kind: ContentKind,
+    pub flags: u8,
+    pub json_structural_count: u32,
+    pub markdown_marker_count: u32,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct KeyModifiers {
     pub shift: bool,
@@ -371,6 +400,10 @@ impl Terminal {
     pub fn has_new_data(&self) -> bool {
         unsafe { ghostty_vt_sys::ghostty_vt_terminal_has_new_data(self.ptr.as_ptr()) }
     }
+
+    pub fn content_kind(&self) -> ContentKind {
+        unsafe { ghostty_vt_sys::ghostty_vt_terminal_content_kind(self.ptr.as_ptr()) }.into()
+    }
 }
 
 impl Drop for Terminal {
@@ -386,6 +419,20 @@ impl Drop for Terminal {
 /// `raw_ptr` must be a valid terminal pointer from `Terminal::raw_ptr()`.
 pub unsafe fn feed_async_raw(raw_ptr: *mut c_void, bytes: &[u8]) -> usize {
     unsafe { ghostty_vt_sys::ghostty_vt_terminal_feed_async(raw_ptr, bytes.as_ptr(), bytes.len()) }
+}
+
+pub fn classify_content(bytes: &[u8]) -> ContentStats {
+    if bytes.is_empty() {
+        return ContentStats::default();
+    }
+
+    let raw = unsafe { ghostty_vt_sys::ghostty_simd_detect_content(bytes.as_ptr(), bytes.len()) };
+    ContentStats {
+        kind: raw.kind.into(),
+        flags: raw.flags,
+        json_structural_count: raw.json_structural_count,
+        markdown_marker_count: raw.markdown_marker_count,
+    }
 }
 
 // ── DX12 GPU Renderer ──────────────────────────────────────────────────
@@ -459,7 +506,7 @@ impl Drop for GpuRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::Terminal;
+    use super::{classify_content, ContentKind, Terminal};
 
     #[test]
     fn constructors_create_terminal() {
@@ -494,5 +541,40 @@ mod tests {
         let second_row = terminal.dump_viewport_row(1).expect("second row dump should succeed");
         assert!(first_row.contains("abc"));
         assert!(second_row.contains("XY"));
+    }
+
+    #[test]
+    fn classify_content_detects_json_streams() {
+        let stats = classify_content(br#"{ "type": "message", "items": [1, 2, 3] }"#);
+        assert_eq!(stats.kind, ContentKind::Json);
+        assert!(stats.json_structural_count >= 6);
+    }
+
+    #[test]
+    fn classify_content_detects_markdown_streams() {
+        let stats = classify_content(b"# Title\n\n- item 1\n- item 2\n```json\n{}\n```\n");
+        assert_eq!(stats.kind, ContentKind::Markdown);
+        assert!(stats.markdown_marker_count >= 3);
+    }
+
+    #[test]
+    fn classify_content_keeps_json_strings_from_becoming_markdown() {
+        let stats = classify_content(b"{ \"body\": \"# not a heading\\n- not a list\" }");
+        assert_eq!(stats.kind, ContentKind::Json);
+        assert_eq!(stats.markdown_marker_count, 0);
+    }
+
+    #[test]
+    fn async_feed_tracks_content_kind() {
+        let mut terminal = Terminal::new(32, 8).expect("constructor should succeed");
+        terminal
+            .start_async()
+            .expect("starting async mode should succeed");
+
+        let pushed = terminal.feed_async(br#"{ "type": "message", "ok": true }"#);
+        assert!(pushed > 0);
+        assert_eq!(terminal.content_kind(), ContentKind::Json);
+
+        terminal.stop_async();
     }
 }
