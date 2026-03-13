@@ -150,9 +150,30 @@ const Handler = struct {
             .end_hyperlink => self.terminal.screens.active.endHyperlink(),
             .set_mode => {
                 self.terminal.modes.set(value.mode, true);
+                switch (value.mode) {
+                    .origin => self.terminal.setCursorPos(1, 1),
+                    .enable_left_and_right_margin => {},
+                    .alt_screen_legacy => self.terminal.switchScreenMode(.@"47", true) catch {},
+                    .alt_screen => self.terminal.switchScreenMode(.@"1047", true) catch {},
+                    .alt_screen_save_cursor_clear_enter => self.terminal.switchScreenMode(.@"1049", true) catch {},
+                    .save_cursor => self.terminal.saveCursor(),
+                    else => {},
+                }
             },
             .reset_mode => {
                 self.terminal.modes.set(value.mode, false);
+                switch (value.mode) {
+                    .origin => self.terminal.setCursorPos(1, 1),
+                    .enable_left_and_right_margin => {
+                        self.terminal.scrolling_region.left = 0;
+                        self.terminal.scrolling_region.right = self.terminal.cols - 1;
+                    },
+                    .alt_screen_legacy => self.terminal.switchScreenMode(.@"47", false) catch {},
+                    .alt_screen => self.terminal.switchScreenMode(.@"1047", false) catch {},
+                    .alt_screen_save_cursor_clear_enter => self.terminal.switchScreenMode(.@"1049", false) catch {},
+                    .save_cursor => self.terminal.restoreCursor(),
+                    else => {},
+                }
             },
             .color_operation => {
                 if (value.requests.count() == 0) return;
@@ -181,6 +202,24 @@ const Handler = struct {
                     }
                 }
             },
+            .index => try self.terminal.index(),
+            .next_line => {
+                try self.terminal.index();
+                self.terminal.carriageReturn();
+            },
+            .reverse_index => self.terminal.reverseIndex(),
+            .save_cursor => self.terminal.saveCursor(),
+            .restore_cursor => self.terminal.restoreCursor(),
+            .top_and_bottom_margin => self.terminal.setTopAndBottomMargin(value.top_left, value.bottom_right),
+            .left_and_right_margin => self.terminal.setLeftAndRightMargin(value.top_left, value.bottom_right),
+            .scroll_up => try self.terminal.scrollUp(value),
+            .scroll_down => self.terminal.scrollDown(value),
+            .insert_lines => self.terminal.insertLines(value),
+            .delete_lines => self.terminal.deleteLines(value),
+            .insert_blanks => self.terminal.insertBlanks(value),
+            .delete_chars => self.terminal.deleteChars(value),
+            .erase_chars => self.terminal.eraseChars(value),
+            .full_reset => self.terminal.fullReset(),
             else => {},
         }
     }
