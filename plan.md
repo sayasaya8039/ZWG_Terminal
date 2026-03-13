@@ -83,6 +83,7 @@ ghostty-win/
 ├── resources/                 # アイコン・Fluent Design アセット
 └── packaging/                 # .msi / winget スクリプト
 text- **キー抽象化**:
+
   - `apprt` モジュールに `windows.rs`（GPUI バックエンド）を追加
   - Renderer trait を拡張（Metal → GPUI WebGPU）
   - 設定は TOML（公式互換）＋ GPUI ネイティブ GUI
@@ -150,14 +151,3 @@ text- **キー抽象化**:
 
 ---
 
-## 次の一手（即実行）
-
-1. この Plan.md をリポジトリにコミット
-2. gpui-ghostty をフォークして `ghostty-win` としてリネーム
-3. Discord / GitHub Discussion #2563 で「GPUI + NPU 版 Windows ポート開始します！」と告知
-4. Zig + Rust エンジニアを1名ずつ募集
-
-**この計画で実現すれば、Ghostty は真のクロスプラットフォーム最速端末になります。**
-
-**作成者**: LastExile（あなた）  
-**協力**: Grok チーム（Zig/GPUI 専門家）
