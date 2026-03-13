@@ -75,6 +75,30 @@ pub(crate) struct GridCell {
     pub kind: GridCellKind,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GlyphRenderPath {
+    AtlasMonochrome,
+    AtlasPolychrome,
+    Geometry,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GlyphKey {
+    pub glyph: String,
+    pub width: u8,
+    pub flags: u8,
+    pub render_path: GlyphRenderPath,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GlyphInstance {
+    pub row: u16,
+    pub col: u16,
+    pub fg_rgb: u32,
+    pub bg_rgb: u32,
+    pub key: GlyphKey,
+}
+
 pub(super) fn char_cell_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)
 }
@@ -107,6 +131,44 @@ pub(crate) fn is_geometric_block_char(ch: char) -> bool {
 pub(crate) fn sanitize_text_for_shaping(text: &str) -> String {
     text.chars()
         .map(|ch| if is_geometric_block_char(ch) { BRAILLE_BLANK } else { ch })
+        .collect()
+}
+
+fn looks_like_emoji(glyph: &str) -> bool {
+    glyph.chars().any(|ch| {
+        matches!(
+            ch,
+            '\u{1F300}'..='\u{1FAFF}'
+                | '\u{2600}'..='\u{27BF}'
+                | '\u{FE0F}'
+        )
+    })
+}
+
+pub(crate) fn glyph_key_from_cell(cell: &GridCell) -> GlyphKey {
+    let render_path = match cell.kind {
+        GridCellKind::GeometricBlock => GlyphRenderPath::Geometry,
+        GridCellKind::Text if looks_like_emoji(&cell.glyph) => GlyphRenderPath::AtlasPolychrome,
+        GridCellKind::Text => GlyphRenderPath::AtlasMonochrome,
+    };
+
+    GlyphKey {
+        glyph: cell.glyph.clone(),
+        width: cell.width,
+        flags: cell.flags,
+        render_path,
+    }
+}
+
+pub(crate) fn glyph_instances_from_cells(cells: &[GridCell], row: u16) -> Vec<GlyphInstance> {
+    cells.iter()
+        .map(|cell| GlyphInstance {
+            row,
+            col: cell.col,
+            fg_rgb: cell.fg_rgb,
+            bg_rgb: cell.bg_rgb,
+            key: glyph_key_from_cell(cell),
+        })
         .collect()
 }
 
@@ -218,6 +280,8 @@ pub(super) fn terminal_canvas(
                 let row_y = row_idx as f32 * config.cell_height;
                 #[cfg(feature = "ghostty_vt")]
                 let row_cells = grid_cells_from_row(row_data, config.term_cols);
+                #[cfg(feature = "ghostty_vt")]
+                let glyph_instances = glyph_instances_from_cells(&row_cells, row_idx as u16);
 
                 #[cfg(feature = "ghostty_vt")]
                 for srun in &row_data.style_runs {
@@ -254,8 +318,10 @@ pub(super) fn terminal_canvas(
                     continue;
                 }
                 #[cfg(feature = "ghostty_vt")]
-                let shaped_text: String =
-                    row_cells.iter().map(|cell| sanitize_text_for_shaping(&cell.glyph)).collect();
+                let shaped_text: String = glyph_instances
+                    .iter()
+                    .map(|instance| sanitize_text_for_shaping(&instance.key.glyph))
+                    .collect();
                 #[cfg(not(feature = "ghostty_vt"))]
                 let shaped_text = sanitize_text_for_shaping(text);
                 let origin = point(
@@ -277,7 +343,7 @@ pub(super) fn terminal_canvas(
                 }];
 
                 #[cfg(feature = "ghostty_vt")]
-                let has_wide_cells = row_cells.iter().any(|cell| cell.width > 1);
+                let has_wide_cells = glyph_instances.iter().any(|instance| instance.key.width > 1);
                 #[cfg(not(feature = "ghostty_vt"))]
                 let has_wide_cells = text.chars().any(|ch| char_cell_width(ch) > 1);
                 let force_width = if !has_wide_cells && text.chars().all(|ch| char_cell_width(ch) <= 1)
@@ -296,17 +362,18 @@ pub(super) fn terminal_canvas(
 
                 #[cfg(feature = "ghostty_vt")]
                 {
-                    for cell in &row_cells {
-                        if cell.kind == GridCellKind::GeometricBlock {
-                            let fg = Hsla::from(rgb(cell.fg_rgb));
+                    for instance in &glyph_instances {
+                        if instance.key.render_path == GlyphRenderPath::Geometry {
+                            let fg = Hsla::from(rgb(instance.fg_rgb));
                             let x = bounds.origin.x
                                 + px(
                                     config.horizontal_text_padding
-                                        + cell.col as f32 * config.cell_width,
+                                        + instance.col as f32 * config.cell_width,
                                 );
-                            let y = bounds.origin.y + px(row_y);
-                            let cw = px(config.cell_width * cell.width as f32);
-                            let ch = cell.glyph.chars().next().unwrap_or(' ');
+                            let y = bounds.origin.y
+                                + px(instance.row as f32 * config.cell_height);
+                            let cw = px(config.cell_width * instance.key.width as f32);
+                            let ch = instance.key.glyph.chars().next().unwrap_or(' ');
                             match ch {
                                 '\u{2588}' => {
                                     window.paint_quad(fill(
@@ -641,5 +708,72 @@ mod tests {
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[0].kind, GridCellKind::GeometricBlock);
         assert_eq!(cells[1].kind, GridCellKind::Text);
+    }
+
+    #[::core::prelude::v1::test]
+    fn glyph_key_from_cell_classifies_render_paths() {
+        let mono = GridCell {
+            col: 0,
+            width: 1,
+            glyph: "A".into(),
+            fg_rgb: 0,
+            bg_rgb: 0,
+            flags: 0,
+            kind: GridCellKind::Text,
+        };
+        let emoji = GridCell {
+            col: 1,
+            width: 2,
+            glyph: "🔥\u{FE0F}".into(),
+            fg_rgb: 0,
+            bg_rgb: 0,
+            flags: 0,
+            kind: GridCellKind::Text,
+        };
+        let block = GridCell {
+            col: 2,
+            width: 1,
+            glyph: "█".into(),
+            fg_rgb: 0,
+            bg_rgb: 0,
+            flags: 0,
+            kind: GridCellKind::GeometricBlock,
+        };
+
+        assert_eq!(glyph_key_from_cell(&mono).render_path, GlyphRenderPath::AtlasMonochrome);
+        assert_eq!(glyph_key_from_cell(&emoji).render_path, GlyphRenderPath::AtlasPolychrome);
+        assert_eq!(glyph_key_from_cell(&block).render_path, GlyphRenderPath::Geometry);
+    }
+
+    #[::core::prelude::v1::test]
+    fn glyph_instances_from_cells_preserves_grid_positions() {
+        let cells = vec![
+            GridCell {
+                col: 0,
+                width: 2,
+                glyph: "🔥\u{FE0F}".into(),
+                fg_rgb: 0x112233,
+                bg_rgb: 0x000000,
+                flags: GHOSTTY_FLAG_BOLD,
+                kind: GridCellKind::Text,
+            },
+            GridCell {
+                col: 2,
+                width: 1,
+                glyph: "█".into(),
+                fg_rgb: 0x445566,
+                bg_rgb: 0x000000,
+                flags: 0,
+                kind: GridCellKind::GeometricBlock,
+            },
+        ];
+
+        let instances = glyph_instances_from_cells(&cells, 7);
+        assert_eq!(instances.len(), 2);
+        assert_eq!(instances[0].row, 7);
+        assert_eq!(instances[0].col, 0);
+        assert_eq!(instances[0].key.render_path, GlyphRenderPath::AtlasPolychrome);
+        assert_eq!(instances[1].col, 2);
+        assert_eq!(instances[1].key.render_path, GlyphRenderPath::Geometry);
     }
 }
