@@ -1,13 +1,13 @@
 //! Terminal surface — manages PTY + terminal backend
 
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 
-use super::pty::{spawn_pty, ConPtyConfig, PtyPair};
+use super::pty::{ConPtyConfig, PtyPair, spawn_pty};
 use super::{DEFAULT_BG, DEFAULT_FG};
 
 /// Events emitted by the terminal
@@ -162,8 +162,8 @@ mod backend {
 #[cfg(not(feature = "ghostty_vt"))]
 mod backend {
     use super::*;
-    use crate::terminal::vt_parser::VtParser;
     use crate::terminal::ScreenBuffer;
+    use crate::terminal::vt_parser::VtParser;
 
     pub struct TerminalBackend {
         parser: VtParser,

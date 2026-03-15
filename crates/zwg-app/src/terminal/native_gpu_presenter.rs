@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use gpui::{Bounds, Pixels};
 #[cfg(target_os = "windows")]
 use windows::{
-    core::{w, Interface},
     Win32::{
         Foundation::{HWND, RECT},
         Graphics::{
@@ -12,10 +11,11 @@ use windows::{
             Dxgi::{Common::*, *},
         },
         UI::WindowsAndMessaging::{
-            CreateWindowExW, DestroyWindow, SetWindowPos, ShowWindow, SWP_NOACTIVATE, SWP_NOZORDER,
-            SW_HIDE, SW_SHOW, WS_CHILD, WS_CLIPSIBLINGS, WS_DISABLED, WS_VISIBLE,
+            CreateWindowExW, DestroyWindow, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
+            SetWindowPos, ShowWindow, WS_CHILD, WS_CLIPSIBLINGS, WS_DISABLED, WS_VISIBLE,
         },
     },
+    core::{Interface, w},
 };
 
 #[cfg(target_os = "windows")]

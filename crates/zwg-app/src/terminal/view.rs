@@ -3,28 +3,28 @@
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
 use gpui::ElementInputHandler;
 use gpui::*;
 
+use super::TerminalSettings;
 #[cfg(feature = "ghostty_vt")]
 use super::gpu_view::{
-    gpu_terminal_canvas, snapshot_can_present_natively, CursorOverlay, GpuTerminalState,
+    CursorOverlay, GpuTerminalState, gpu_terminal_canvas, snapshot_can_present_natively,
 };
 #[cfg(feature = "ghostty_vt")]
 use super::grid_renderer::resolve_cursor_cell;
 use super::grid_renderer::{
-    col_to_char_index, damage_spans_from_terminal_row, full_row_damage, glyph_instances_in_damage,
+    GlyphCache, GridRendererConfig, SelectionPoint, TerminalSnapshot, col_to_char_index,
+    damage_spans_from_terminal_row, full_row_damage, glyph_instances_in_damage,
     grid_cells_from_parts, patch_cells_in_damage, patch_glyph_instances_in_damage, terminal_canvas,
-    GlyphCache, GridRendererConfig, SelectionPoint, TerminalSnapshot,
 };
-use super::pty::{spawn_pty, ConPtyConfig};
+use super::pty::{ConPtyConfig, spawn_pty};
 use super::surface::TerminalSurface;
-use super::TerminalSettings;
 #[cfg(feature = "ghostty_vt")]
 use parking_lot::Mutex;
 
@@ -127,11 +127,7 @@ fn measure_cell_dimensions(cx: &App, font_family: &str, font_size_px: f32) -> (f
         .filter_map(|ch| text_system.advance(font_id, font_size, ch).ok())
         .map(|size| {
             let w: f32 = size.width.into();
-            if w > 1.0 {
-                w
-            } else {
-                CELL_WIDTH_FALLBACK
-            }
+            if w > 1.0 { w } else { CELL_WIDTH_FALLBACK }
         })
         .fold(CELL_WIDTH_FALLBACK, f32::max);
 
@@ -174,7 +170,7 @@ unsafe extern "system" fn ime_getmessage_hook_proc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, TranslateMessage, MSG, PM_REMOVE, WM_KEYDOWN,
+        CallNextHookEx, MSG, PM_REMOVE, TranslateMessage, WM_KEYDOWN,
     };
 
     if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
@@ -337,6 +333,7 @@ pub struct TerminalPane {
     bg_color: u32,
     background_image_path: Option<String>,
     background_image_opacity: f32,
+    global_hotkeys: Vec<String>,
     blink_started_at: Instant,
     /// Current terminal size in cells
     term_cols: u16,
@@ -555,22 +552,24 @@ impl TerminalPane {
         }
 
         let blink_entity = cx.entity().downgrade();
-        cx.spawn(async move |_, cx: &mut AsyncApp| loop {
-            cx.background_executor()
-                .timer(Duration::from_millis(500))
-                .await;
-            if blink_entity
-                .update(cx, |pane: &mut TerminalPane, cx| {
-                    if matches!(pane.state, TerminalState::Running)
-                        && pane.cursor_blink
-                        && pane.snapshot.cursor_visible
-                    {
-                        cx.notify();
-                    }
-                })
-                .is_err()
-            {
-                break;
+        cx.spawn(async move |_, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(500))
+                    .await;
+                if blink_entity
+                    .update(cx, |pane: &mut TerminalPane, cx| {
+                        if matches!(pane.state, TerminalState::Running)
+                            && pane.cursor_blink
+                            && pane.snapshot.cursor_visible
+                        {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         })
         .detach();
@@ -592,6 +591,7 @@ impl TerminalPane {
             bg_color: settings.bg_color,
             background_image_path: settings.background_image_path.clone(),
             background_image_opacity: settings.background_image_opacity,
+            global_hotkeys: settings.global_hotkeys.clone(),
             blink_started_at: Instant::now(),
             term_cols: settings.cols,
             term_rows: settings.rows,
@@ -692,6 +692,7 @@ impl TerminalPane {
         self.bg_color = settings.bg_color;
         self.background_image_path = settings.background_image_path.clone();
         self.background_image_opacity = settings.background_image_opacity;
+        self.global_hotkeys = settings.global_hotkeys.clone();
         self.blink_started_at = Instant::now();
         self.surface
             .set_default_colors(self.fg_color, self.bg_color);
@@ -1396,6 +1397,14 @@ impl TerminalPane {
             return;
         }
 
+        if self
+            .global_hotkeys
+            .iter()
+            .any(|hotkey| crate::app::hotkey_matches(event, hotkey))
+        {
+            return;
+        }
+
         let key: &str = event.keystroke.key.as_ref();
         let modifiers = event.keystroke.modifiers;
         if modifiers.control && !modifiers.alt && key == "c" && self.copy_selection_to_clipboard(cx)
@@ -1693,7 +1702,7 @@ mod snapshot_tests {
         scroll_lines_from_wheel_delta, should_defer_keystroke_to_ime, terminal_layout_size,
         viewport_rows_to_refresh,
     };
-    use gpui::{point, px, size, Bounds, Keystroke, Modifiers, ScrollDelta};
+    use gpui::{Bounds, Keystroke, Modifiers, ScrollDelta, point, px, size};
 
     #[test]
     fn viewport_rows_to_refresh_returns_dirty_rows_without_scroll() {

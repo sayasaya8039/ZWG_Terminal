@@ -17,8 +17,8 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
 
 use super::grid_renderer::{
-    glyph_requires_gpui_overlay, paint_geometry_cell, GlyphCache, GridRendererConfig,
-    SelectionPoint, TerminalSnapshot,
+    GlyphCache, GridRendererConfig, SelectionPoint, TerminalSnapshot, glyph_requires_gpui_overlay,
+    paint_geometry_cell,
 };
 #[cfg(target_os = "windows")]
 use super::native_gpu_presenter::NativeGpuPresenter;

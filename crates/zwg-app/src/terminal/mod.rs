@@ -11,7 +11,7 @@ pub mod view;
 #[cfg(not(feature = "ghostty_vt"))]
 pub mod vt_parser;
 
-use std::sync::{atomic::AtomicBool, Arc};
+use std::sync::{Arc, atomic::AtomicBool};
 
 #[derive(Debug, Clone)]
 pub struct TerminalSettings {
@@ -27,6 +27,7 @@ pub struct TerminalSettings {
     pub bg_color: u32,
     pub background_image_path: Option<String>,
     pub background_image_opacity: f32,
+    pub global_hotkeys: Vec<String>,
     pub input_suppressed: Arc<AtomicBool>,
 }
 

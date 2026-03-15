@@ -777,7 +777,10 @@ mod tests {
         let mut palette = SnippetPalette::new(store);
 
         assert_eq!(palette.activate_store_index(1), Some("B".to_string()));
-        assert_eq!(palette.selected_item().map(|item| item.title.as_str()), Some("Two"));
+        assert_eq!(
+            palette.selected_item().map(|item| item.title.as_str()),
+            Some("Two")
+        );
     }
 
     #[test]

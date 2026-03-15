@@ -7,7 +7,7 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use std::process::Command;
 
-pub const CONFIG_VERSION: u32 = 6;
+pub const CONFIG_VERSION: u32 = 7;
 const DEFAULT_WINDOW_COLS: u16 = 120;
 const DEFAULT_WINDOW_ROWS: u16 = 30;
 pub const DEFAULT_UI_FONT_FAMILY: &str = "Segoe UI";
@@ -20,6 +20,8 @@ const RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
 const RUN_VALUE_NAME: &str = "ZWG Terminal";
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+const LEGACY_SPLIT_DOWN_SHORTCUT: &str = "Ctrl+Shift+E";
+const DEFAULT_SPLIT_DOWN_SHORTCUT: &str = "Ctrl+Shift+S";
 
 /// Color theme definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,7 +155,7 @@ impl Default for KeyboardConfig {
             new_tab: "Ctrl+Shift+T".into(),
             close_tab: "Ctrl+Shift+W".into(),
             split_right: "Ctrl+Shift+D".into(),
-            split_down: "Ctrl+Shift+E".into(),
+            split_down: DEFAULT_SPLIT_DOWN_SHORTCUT.into(),
             close_pane: "Ctrl+Shift+X".into(),
             focus_next_pane: "Ctrl+Tab".into(),
             focus_prev_pane: "Ctrl+Shift+Tab".into(),
@@ -268,6 +270,7 @@ impl AppConfig {
 
     /// Clamp config values to safe ranges
     fn validated(mut self) -> Self {
+        let previous_version = self.version;
         self.version = CONFIG_VERSION;
         if self.shell.trim().is_empty() {
             log::warn!("Empty shell in config, using default");
@@ -285,6 +288,11 @@ impl AppConfig {
         self.font.line_height = self.font.line_height.clamp(1.0, 3.0);
         self.default_window_cols = self.default_window_cols.clamp(60, 240);
         self.default_window_rows = self.default_window_rows.clamp(18, 120);
+        if previous_version < CONFIG_VERSION
+            && self.keyboard.split_down == LEGACY_SPLIT_DOWN_SHORTCUT
+        {
+            self.keyboard.split_down = DEFAULT_SPLIT_DOWN_SHORTCUT.into();
+        }
         self.ai_provider = crate::ai::sanitize_ai_provider_config_value(&self.ai_provider);
         self.ai_api_key = self.ai_api_key.trim().to_string();
         self.ai_model = self.ai_model.trim().to_string();
@@ -732,6 +740,18 @@ mod tests {
         assert_eq!(validated.ai_provider, "gemini");
         assert_eq!(validated.ai_api_key, "test-key");
         assert_eq!(validated.ai_model, "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn config_validated_migrates_legacy_split_down_shortcut() {
+        let mut config = make_test_config();
+        config.version = 6;
+        config.keyboard.split_down = "Ctrl+Shift+E".into();
+
+        let validated = config.validated();
+
+        assert_eq!(validated.version, CONFIG_VERSION);
+        assert_eq!(validated.keyboard.split_down, "Ctrl+Shift+S");
     }
 
     #[test]

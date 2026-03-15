@@ -117,16 +117,16 @@ mod windows_impl {
     use std::fs::File;
     use std::os::windows::io::{FromRawHandle, RawHandle};
     use std::path::Path;
-    use windows::core::{PCWSTR, PWSTR};
     use windows::Win32::Foundation::{CloseHandle, HANDLE};
-    use windows::Win32::System::Console::{CreatePseudoConsole, COORD, HPCON};
+    use windows::Win32::System::Console::{COORD, CreatePseudoConsole, HPCON};
     use windows::Win32::System::Pipes::CreatePipe;
     use windows::Win32::System::Threading::{
-        CreateProcessW, DeleteProcThreadAttributeList, InitializeProcThreadAttributeList,
-        UpdateProcThreadAttribute, CREATE_UNICODE_ENVIRONMENT, EXTENDED_STARTUPINFO_PRESENT,
-        LPPROC_THREAD_ATTRIBUTE_LIST, PROCESS_INFORMATION, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE,
-        STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        CREATE_UNICODE_ENVIRONMENT, CreateProcessW, DeleteProcThreadAttributeList,
+        EXTENDED_STARTUPINFO_PRESENT, InitializeProcThreadAttributeList,
+        LPPROC_THREAD_ATTRIBUTE_LIST, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION,
+        STARTF_USESTDHANDLES, STARTUPINFOEXW, UpdateProcThreadAttribute,
     };
+    use windows::core::{PCWSTR, PWSTR};
 
     /// H7: RAII wrapper for pipe HANDLEs to prevent leaks on error paths
     struct PipeHandle(HANDLE);
@@ -471,7 +471,7 @@ mod windows_impl {
 
 #[cfg(windows)]
 fn windows_resize(pc: &PseudoConsoleHandle, cols: u16, rows: u16) -> io::Result<()> {
-    use windows::Win32::System::Console::{ResizePseudoConsole, COORD};
+    use windows::Win32::System::Console::{COORD, ResizePseudoConsole};
     // M7: clamp to prevent i16 overflow
     let size = COORD {
         X: cols.min(i16::MAX as u16) as i16,

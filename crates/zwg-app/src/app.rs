@@ -4,8 +4,8 @@ use std::io::Write;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
 
@@ -19,24 +19,24 @@ use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
 use windows::Win32::UI::Input::KeyboardAndMouse::ReleaseCapture;
 #[cfg(target_os = "windows")]
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetAncestor, PostMessageW, ShowWindowAsync, GA_ROOT, HTCAPTION, SC_MOVE, SW_RESTORE,
+    GA_ROOT, GetAncestor, HTCAPTION, PostMessageW, SC_MOVE, SW_RESTORE, ShowWindowAsync,
     WM_SYSCOMMAND,
 };
 
 use crate::ai::{
-    default_model_for_provider, next_ai_provider, resolve_ai_api_key, resolve_ai_model,
-    sanitize_ai_provider, AiDirectClient, AiProvider, AiSuggestion, AiSuggestionState,
-    AiSuggestionStatus, QUERY_MIN_CHARS,
+    AiDirectClient, AiProvider, AiSuggestion, AiSuggestionState, AiSuggestionStatus,
+    QUERY_MIN_CHARS, default_model_for_provider, next_ai_provider, resolve_ai_api_key,
+    resolve_ai_model, sanitize_ai_provider,
 };
 use crate::config::{
-    set_launch_on_login, AppConfig, WindowState, DEFAULT_TERMINAL_FONT_FAMILY,
-    DEFAULT_UI_FONT_FAMILY, SUPPORTED_TERMINAL_FONT_FAMILIES,
+    AppConfig, DEFAULT_TERMINAL_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY,
+    SUPPORTED_TERMINAL_FONT_FAMILIES, WindowState, set_launch_on_login,
 };
 use crate::shell::{self, ShellType};
 use crate::snippets::{CsvEncoding, SnippetPalette, SnippetQueueMode, SnippetSettings};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
-use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
 use crate::terminal::TerminalSettings;
+use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
 use crate::{
     ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, OpenSettings, Quit, SnippetQueuePaste,
     SplitDown, SplitRight, ToggleSnippetPalette,
@@ -72,7 +72,7 @@ unsafe extern "system" fn snippet_ime_getmessage_hook_proc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, TranslateMessage, MSG, PM_REMOVE, WM_KEYDOWN,
+        CallNextHookEx, MSG, PM_REMOVE, TranslateMessage, WM_KEYDOWN,
     };
 
     if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
@@ -241,7 +241,7 @@ fn adjust_font_size_value(current: f32, delta: i32) -> f32 {
 
 #[cfg(target_os = "windows")]
 fn pick_background_image_file() -> Option<PathBuf> {
-    use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
+    use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
 
     std::thread::spawn(|| {
         let com_initialized = unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.is_ok();
@@ -401,6 +401,21 @@ enum KeyboardSettingsTextField {
     FocusNextPane,
     FocusPrevPane,
     OpenSettings,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GlobalShortcutAction {
+    NewTab,
+    CloseTab,
+    SplitRight,
+    SplitDown,
+    ClosePane,
+    FocusNext,
+    FocusPrev,
+    OpenSettings,
+    ToggleSnippetPalette,
+    SnippetQueuePaste,
+    Quit,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -874,7 +889,7 @@ impl AppState {
         let terminal_settings =
             terminal_settings_from_config(&config, terminal_input_suppressed.clone());
         let split = cx.new(|cx| SplitContainer::new(&default_shell, terminal_settings, cx));
-        bind_global_key_bindings(cx, &config);
+        bind_global_key_bindings(cx, &config, false);
 
         Self {
             tabs: vec![Tab {
@@ -924,7 +939,7 @@ impl AppState {
 
     pub fn apply_config(&mut self, config: AppConfig, cx: &mut App) {
         self.config = config;
-        bind_global_key_bindings(cx, &self.config);
+        bind_global_key_bindings(cx, &self.config, false);
         let terminal_settings =
             terminal_settings_from_config(&self.config, self.terminal_input_suppressed.clone());
         for tab in &self.tabs {
@@ -1282,7 +1297,7 @@ impl RootView {
                 }
                 let config = self.state.read(cx).config.clone();
                 self.state.update(cx, |_state, app| {
-                    bind_global_key_bindings(app, &config);
+                    bind_global_key_bindings(app, &config, false);
                 });
             }
         } else {
@@ -1299,6 +1314,7 @@ impl RootView {
         self.show_settings = true;
         self.keyboard_settings_active_text = None;
         self.ai_settings_active_text = None;
+        self.refresh_global_key_bindings(cx);
         window.focus(&self.focus_handle);
         cx.notify();
     }
@@ -1307,6 +1323,7 @@ impl RootView {
         self.show_settings = false;
         self.keyboard_settings_active_text = None;
         self.ai_settings_active_text = None;
+        self.refresh_global_key_bindings(cx);
         cx.notify();
     }
 
@@ -2055,6 +2072,7 @@ impl RootView {
         shortcut: String,
         cx: &mut Context<Self>,
     ) {
+        self.keyboard_settings_active_text = None;
         self.persist_config_update(cx, move |config| match field {
             KeyboardSettingsTextField::NewTab => config.keyboard.new_tab = shortcut,
             KeyboardSettingsTextField::CloseTab => config.keyboard.close_tab = shortcut,
@@ -2064,6 +2082,24 @@ impl RootView {
             KeyboardSettingsTextField::FocusNextPane => config.keyboard.focus_next_pane = shortcut,
             KeyboardSettingsTextField::FocusPrevPane => config.keyboard.focus_prev_pane = shortcut,
             KeyboardSettingsTextField::OpenSettings => config.keyboard.open_settings = shortcut,
+        });
+    }
+
+    fn set_keyboard_shortcut_capture(
+        &mut self,
+        field: Option<KeyboardSettingsTextField>,
+        cx: &mut Context<Self>,
+    ) {
+        self.keyboard_settings_active_text = field;
+        self.refresh_global_key_bindings(cx);
+        cx.notify();
+    }
+
+    fn refresh_global_key_bindings(&self, cx: &mut Context<Self>) {
+        let config = self.state.read(cx).config.clone();
+        let capture_active = self.keyboard_settings_active_text.is_some();
+        self.state.update(cx, |_state, app| {
+            bind_global_key_bindings(app, &config, capture_active);
         });
     }
 
@@ -2947,8 +2983,7 @@ impl RootView {
 
         match event.keystroke.key.as_ref() {
             "escape" => {
-                self.keyboard_settings_active_text = None;
-                cx.notify();
+                self.set_keyboard_shortcut_capture(None, cx);
                 return true;
             }
             "backspace" | "delete" => {
@@ -3049,6 +3084,11 @@ impl RootView {
         }
 
         if self.handle_custom_snippet_hotkeys(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.handle_global_shortcut_key(event, window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -3521,7 +3561,7 @@ impl RootView {
                     MouseButton::Left,
                     cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
                         this.settings_category = category_value;
-                        this.keyboard_settings_active_text = None;
+                        this.set_keyboard_shortcut_capture(None, cx);
                         this.ai_settings_active_text = None;
                         cx.notify();
                     }),
@@ -4701,6 +4741,38 @@ impl RootView {
                 self.render_snippet_settings_advanced(cx).into_any_element()
             }
         }
+    }
+
+    fn handle_global_shortcut_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let config = self.state.read(cx).config.clone();
+        let Some(action) = configured_global_shortcut_action(event, &config) else {
+            return false;
+        };
+
+        match action {
+            GlobalShortcutAction::NewTab => self.on_new_tab(&NewTab, window, cx),
+            GlobalShortcutAction::CloseTab => self.on_close_tab(&CloseTab, window, cx),
+            GlobalShortcutAction::SplitRight => self.on_split_right(&SplitRight, window, cx),
+            GlobalShortcutAction::SplitDown => self.on_split_down(&SplitDown, window, cx),
+            GlobalShortcutAction::ClosePane => self.on_close_pane(&ClosePane, window, cx),
+            GlobalShortcutAction::FocusNext => self.on_focus_next(&FocusNext, window, cx),
+            GlobalShortcutAction::FocusPrev => self.on_focus_prev(&FocusPrev, window, cx),
+            GlobalShortcutAction::OpenSettings => self.on_open_settings(&OpenSettings, window, cx),
+            GlobalShortcutAction::ToggleSnippetPalette => {
+                self.on_toggle_snippet_palette(&ToggleSnippetPalette, window, cx)
+            }
+            GlobalShortcutAction::SnippetQueuePaste => {
+                self.on_snippet_queue_paste(&SnippetQueuePaste, window, cx)
+            }
+            GlobalShortcutAction::Quit => self.on_quit_requested(&crate::Quit, window, cx),
+        }
+
+        true
     }
 
     fn render_snippet_settings_general(&mut self, cx: &mut Context<Self>) -> Div {
@@ -7191,9 +7263,11 @@ impl RootView {
                 keyboard.new_tab,
                 self.keyboard_settings_active_text == Some(KeyboardSettingsTextField::NewTab),
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.keyboard_settings_active_text = Some(KeyboardSettingsTextField::NewTab);
+                    this.set_keyboard_shortcut_capture(
+                        Some(KeyboardSettingsTextField::NewTab),
+                        cx,
+                    );
                     window.focus(&this.focus_handle);
-                    cx.notify();
                 }),
             ))
             .child(light_editable_row(
@@ -7202,9 +7276,11 @@ impl RootView {
                 keyboard.close_tab,
                 self.keyboard_settings_active_text == Some(KeyboardSettingsTextField::CloseTab),
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.keyboard_settings_active_text = Some(KeyboardSettingsTextField::CloseTab);
+                    this.set_keyboard_shortcut_capture(
+                        Some(KeyboardSettingsTextField::CloseTab),
+                        cx,
+                    );
                     window.focus(&this.focus_handle);
-                    cx.notify();
                 }),
             ))
             .child(light_editable_row(
@@ -7213,9 +7289,11 @@ impl RootView {
                 keyboard.split_right,
                 self.keyboard_settings_active_text == Some(KeyboardSettingsTextField::SplitRight),
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.keyboard_settings_active_text = Some(KeyboardSettingsTextField::SplitRight);
+                    this.set_keyboard_shortcut_capture(
+                        Some(KeyboardSettingsTextField::SplitRight),
+                        cx,
+                    );
                     window.focus(&this.focus_handle);
-                    cx.notify();
                 }),
             ))
             .child(light_editable_row(
@@ -7224,9 +7302,11 @@ impl RootView {
                 keyboard.split_down,
                 self.keyboard_settings_active_text == Some(KeyboardSettingsTextField::SplitDown),
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.keyboard_settings_active_text = Some(KeyboardSettingsTextField::SplitDown);
+                    this.set_keyboard_shortcut_capture(
+                        Some(KeyboardSettingsTextField::SplitDown),
+                        cx,
+                    );
                     window.focus(&this.focus_handle);
-                    cx.notify();
                 }),
             ))
             .child(light_editable_row(
@@ -7235,9 +7315,11 @@ impl RootView {
                 keyboard.close_pane,
                 self.keyboard_settings_active_text == Some(KeyboardSettingsTextField::ClosePane),
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.keyboard_settings_active_text = Some(KeyboardSettingsTextField::ClosePane);
+                    this.set_keyboard_shortcut_capture(
+                        Some(KeyboardSettingsTextField::ClosePane),
+                        cx,
+                    );
                     window.focus(&this.focus_handle);
-                    cx.notify();
                 }),
             ))
             .child(light_editable_row(
@@ -7247,10 +7329,11 @@ impl RootView {
                 self.keyboard_settings_active_text
                     == Some(KeyboardSettingsTextField::FocusNextPane),
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.keyboard_settings_active_text =
-                        Some(KeyboardSettingsTextField::FocusNextPane);
+                    this.set_keyboard_shortcut_capture(
+                        Some(KeyboardSettingsTextField::FocusNextPane),
+                        cx,
+                    );
                     window.focus(&this.focus_handle);
-                    cx.notify();
                 }),
             ))
             .child(light_editable_row(
@@ -7260,10 +7343,11 @@ impl RootView {
                 self.keyboard_settings_active_text
                     == Some(KeyboardSettingsTextField::FocusPrevPane),
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.keyboard_settings_active_text =
-                        Some(KeyboardSettingsTextField::FocusPrevPane);
+                    this.set_keyboard_shortcut_capture(
+                        Some(KeyboardSettingsTextField::FocusPrevPane),
+                        cx,
+                    );
                     window.focus(&this.focus_handle);
-                    cx.notify();
                 }),
             ))
             .child(light_editable_row(
@@ -7273,14 +7357,15 @@ impl RootView {
                 self.keyboard_settings_active_text
                     == Some(KeyboardSettingsTextField::OpenSettings),
                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.keyboard_settings_active_text =
-                        Some(KeyboardSettingsTextField::OpenSettings);
+                    this.set_keyboard_shortcut_capture(
+                        Some(KeyboardSettingsTextField::OpenSettings),
+                        cx,
+                    );
                     window.focus(&this.focus_handle);
-                    cx.notify();
                 }),
             ))
             .child(light_info_box(
-                "項目をクリックしてからショートカットを押すと即時保存されます。Esc で編集終了、Backspace/Delete で解除します。",
+                "項目をクリックしてからショートカットを押すと即時保存されます。既定では上下分割は Ctrl+Shift+S です。Esc で編集終了、Backspace/Delete で解除します。",
             ))
     }
 
@@ -7836,12 +7921,14 @@ impl Render for RootView {
                     .children(if tab_bar_visible {
                         tab_elements
                     } else {
-                        vec![div()
-                            .font_family(UI_FONT)
-                            .text_size(px(12.0))
-                            .text_color(rgb(SUBTEXT0))
-                            .child(active_shell_name.clone())
-                            .into_any_element()]
+                        vec![
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(12.0))
+                                .text_color(rgb(SUBTEXT0))
+                                .child(active_shell_name.clone())
+                                .into_any_element(),
+                        ]
                     })
                     .child(
                         div()
@@ -8086,26 +8173,104 @@ fn terminal_settings_from_config(
         bg_color: theme.bg,
         background_image_path: config.background_image_path.clone(),
         background_image_opacity: config.background_image_opacity as f32 / 100.0,
+        global_hotkeys: collect_global_hotkeys(config),
         input_suppressed,
     }
 }
 
-fn bind_global_key_bindings(cx: &mut App, config: &AppConfig) {
+fn bind_global_key_bindings(cx: &mut App, config: &AppConfig, keyboard_capture_active: bool) {
     cx.clear_key_bindings();
 
     let mut bindings = Vec::new();
-    push_optional_key_binding(&mut bindings, &config.keyboard.new_tab, NewTab);
-    push_optional_key_binding(&mut bindings, &config.keyboard.close_tab, CloseTab);
-    push_optional_key_binding(&mut bindings, &config.keyboard.split_right, SplitRight);
-    push_optional_key_binding(&mut bindings, &config.keyboard.split_down, SplitDown);
-    push_optional_key_binding(&mut bindings, &config.keyboard.close_pane, ClosePane);
-    push_optional_key_binding(&mut bindings, &config.keyboard.focus_next_pane, FocusNext);
-    push_optional_key_binding(&mut bindings, &config.keyboard.focus_prev_pane, FocusPrev);
-    push_optional_key_binding(&mut bindings, &config.keyboard.open_settings, OpenSettings);
+    if !keyboard_capture_active {
+        push_optional_key_binding(&mut bindings, &config.keyboard.new_tab, NewTab);
+        push_optional_key_binding(&mut bindings, &config.keyboard.close_tab, CloseTab);
+        push_optional_key_binding(&mut bindings, &config.keyboard.split_right, SplitRight);
+        push_optional_key_binding(&mut bindings, &config.keyboard.split_down, SplitDown);
+        push_optional_key_binding(&mut bindings, &config.keyboard.close_pane, ClosePane);
+        push_optional_key_binding(&mut bindings, &config.keyboard.focus_next_pane, FocusNext);
+        push_optional_key_binding(&mut bindings, &config.keyboard.focus_prev_pane, FocusPrev);
+        push_optional_key_binding(&mut bindings, &config.keyboard.open_settings, OpenSettings);
+    }
     bindings.push(KeyBinding::new("ctrl-shift-v", ToggleSnippetPalette, None));
     bindings.push(KeyBinding::new("ctrl-shift-f", SnippetQueuePaste, None));
     bindings.push(KeyBinding::new("ctrl-shift-q", Quit, None));
     cx.bind_keys(bindings);
+}
+
+fn collect_global_hotkeys(config: &AppConfig) -> Vec<String> {
+    let mut shortcuts = Vec::new();
+
+    for shortcut in [
+        config.keyboard.new_tab.as_str(),
+        config.keyboard.close_tab.as_str(),
+        config.keyboard.split_right.as_str(),
+        config.keyboard.split_down.as_str(),
+        config.keyboard.close_pane.as_str(),
+        config.keyboard.focus_next_pane.as_str(),
+        config.keyboard.focus_prev_pane.as_str(),
+        config.keyboard.open_settings.as_str(),
+        "Ctrl+Shift+V",
+        "Ctrl+Shift+F",
+        "Ctrl+Shift+Q",
+    ] {
+        let shortcut = shortcut.trim();
+        if shortcut.is_empty() || shortcuts.iter().any(|existing| existing == shortcut) {
+            continue;
+        }
+        shortcuts.push(shortcut.to_string());
+    }
+
+    shortcuts
+}
+
+fn configured_global_shortcut_action(
+    event: &KeyDownEvent,
+    config: &AppConfig,
+) -> Option<GlobalShortcutAction> {
+    for (shortcut, action) in [
+        (
+            config.keyboard.new_tab.as_str(),
+            GlobalShortcutAction::NewTab,
+        ),
+        (
+            config.keyboard.close_tab.as_str(),
+            GlobalShortcutAction::CloseTab,
+        ),
+        (
+            config.keyboard.split_right.as_str(),
+            GlobalShortcutAction::SplitRight,
+        ),
+        (
+            config.keyboard.split_down.as_str(),
+            GlobalShortcutAction::SplitDown,
+        ),
+        (
+            config.keyboard.close_pane.as_str(),
+            GlobalShortcutAction::ClosePane,
+        ),
+        (
+            config.keyboard.focus_next_pane.as_str(),
+            GlobalShortcutAction::FocusNext,
+        ),
+        (
+            config.keyboard.focus_prev_pane.as_str(),
+            GlobalShortcutAction::FocusPrev,
+        ),
+        (
+            config.keyboard.open_settings.as_str(),
+            GlobalShortcutAction::OpenSettings,
+        ),
+        ("Ctrl+Shift+V", GlobalShortcutAction::ToggleSnippetPalette),
+        ("Ctrl+Shift+F", GlobalShortcutAction::SnippetQueuePaste),
+        ("Ctrl+Shift+Q", GlobalShortcutAction::Quit),
+    ] {
+        if hotkey_matches(event, shortcut) {
+            return Some(action);
+        }
+    }
+
+    None
 }
 
 fn push_optional_key_binding<A: Action>(bindings: &mut Vec<KeyBinding>, shortcut: &str, action: A) {
@@ -9291,7 +9456,7 @@ fn rgba_with_alpha(rgb: u32, alpha_percent: u8) -> u32 {
     (rgb << 8) | alpha
 }
 
-fn hotkey_matches(event: &KeyDownEvent, hotkey: &str) -> bool {
+pub(crate) fn hotkey_matches(event: &KeyDownEvent, hotkey: &str) -> bool {
     if hotkey.trim().is_empty() {
         return false;
     }
@@ -9899,24 +10064,25 @@ fn color_dot(color: u32) -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        adjust_font_size_value, append_text_to_snippet_editor_field,
+        GlobalShortcutAction, SnippetEditorField, SnippetEditorMode, SnippetEditorState,
+        SnippetGroupEditMode, SnippetGroupEditorState, SnippetImeTarget, TextCursorMove,
+        ZoomAction, adjust_font_size_value, append_text_to_snippet_editor_field,
         append_text_to_snippet_ime_target, apply_snippet_group_edit, begin_new_snippet_group_edit,
-        byte_index_to_utf16_offset, byte_range_to_utf16_range, cycle_string_option,
+        byte_index_to_utf16_offset, byte_range_to_utf16_range, collect_global_hotkeys,
+        configured_global_shortcut_action, cycle_string_option,
         delete_text_before_snippet_editor_cursor, direct_text_from_snippet_keystroke,
         hotkey_binding_string, hotkey_matches, hotkey_string_for_keystroke,
         move_snippet_editor_cursor, paste_text_to_snippet_editor_field,
         process_completion_notice_detail, terminal_settings_from_config, titlebar_actions_width,
         titlebar_side_cluster_width, traffic_lights_width, utf16_offset_to_byte_index,
-        utf16_range_to_byte_range, zoom_action_for_window, SnippetEditorField, SnippetEditorMode,
-        SnippetEditorState, SnippetGroupEditMode, SnippetGroupEditorState, SnippetImeTarget,
-        TextCursorMove, ZoomAction,
+        utf16_range_to_byte_range, zoom_action_for_window,
     };
     use crate::config::AppConfig;
     use crate::snippets::{SnippetPalette, SnippetStore};
     use gpui::{KeyDownEvent, Keystroke, Modifiers};
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{atomic::AtomicBool, Arc};
+    use std::sync::{Arc, atomic::AtomicBool};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -10328,7 +10494,60 @@ mod tests {
         assert!(settings.gpu_acceleration);
         assert_eq!(settings.fg_color, config.active_theme().fg);
         assert_eq!(settings.bg_color, config.active_theme().bg);
+        assert!(
+            settings
+                .global_hotkeys
+                .iter()
+                .any(|shortcut| shortcut == "Ctrl+Shift+D")
+        );
+        assert!(
+            settings
+                .global_hotkeys
+                .iter()
+                .any(|shortcut| shortcut == "Ctrl+Comma")
+        );
         assert!(Arc::ptr_eq(&settings.input_suppressed, &input_suppressed));
+    }
+
+    #[test]
+    fn collect_global_hotkeys_keeps_configured_and_fixed_shortcuts_unique() {
+        let mut config = AppConfig::default();
+        config.keyboard.split_right = "Ctrl+Shift+D".into();
+        config.keyboard.open_settings = "Ctrl+Shift+V".into();
+
+        let shortcuts = collect_global_hotkeys(&config);
+
+        assert!(shortcuts.iter().any(|shortcut| shortcut == "Ctrl+Shift+D"));
+        assert!(shortcuts.iter().any(|shortcut| shortcut == "Ctrl+Shift+V"));
+        assert_eq!(
+            shortcuts
+                .iter()
+                .filter(|shortcut| shortcut.as_str() == "Ctrl+Shift+V")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn configured_global_shortcut_action_maps_ctrl_shift_s_to_split_down() {
+        let config = AppConfig::default();
+        let event = KeyDownEvent {
+            keystroke: Keystroke {
+                modifiers: Modifiers {
+                    control: true,
+                    shift: true,
+                    ..Modifiers::default()
+                },
+                key: "s".into(),
+                key_char: Some("S".into()),
+            },
+            is_held: false,
+        };
+
+        assert_eq!(
+            configured_global_shortcut_action(&event, &config),
+            Some(GlobalShortcutAction::SplitDown)
+        );
     }
 
     #[test]
