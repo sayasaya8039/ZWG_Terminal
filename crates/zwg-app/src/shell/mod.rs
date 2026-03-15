@@ -1,7 +1,14 @@
 //! Shell detection and launcher for Windows
 //! Supports: PowerShell, PowerShell 7, CMD, WSL, Git Bash
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::Path;
+#[cfg(windows)]
+use std::process::Command;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Supported shell types
 #[derive(Debug, Clone, PartialEq)]
@@ -66,7 +73,7 @@ pub fn detect_available_shells() -> Vec<(ShellType, String)> {
 
 fn which_exists(cmd: &str) -> bool {
     if cfg!(windows) {
-        std::process::Command::new("where")
+        hidden_command("where")
             .arg(cmd)
             .output()
             .map(|o| o.status.success())
@@ -78,4 +85,11 @@ fn which_exists(cmd: &str) -> bool {
             .map(|o| o.status.success())
             .unwrap_or(false)
     }
+}
+
+#[cfg(windows)]
+fn hidden_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }

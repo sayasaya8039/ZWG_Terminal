@@ -1,6 +1,8 @@
 //! Configuration module — settings, themes, and persistence
 
 use serde::{Deserialize, Serialize};
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 #[cfg(windows)]
 use std::process::Command;
@@ -16,6 +18,8 @@ pub const SUPPORTED_TERMINAL_FONT_FAMILIES: [&str; 3] =
 const RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
 const RUN_VALUE_NAME: &str = "ZWG Terminal";
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 /// Color theme definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -339,7 +343,7 @@ pub fn sanitize_terminal_font_family(family: &str) -> String {
 pub fn launch_on_login_enabled() -> std::io::Result<bool> {
     #[cfg(windows)]
     {
-        let output = Command::new("reg")
+        let output = hidden_windows_command("reg")
             .args(["query", RUN_KEY_PATH, "/v", RUN_VALUE_NAME])
             .output()?;
         return Ok(output.status.success());
@@ -357,7 +361,7 @@ pub fn set_launch_on_login(enabled: bool) -> std::io::Result<()> {
         let output = if enabled {
             let exe = std::env::current_exe()?;
             let command = format!("\"{}\"", exe.display());
-            Command::new("reg")
+            hidden_windows_command("reg")
                 .args([
                     "add",
                     RUN_KEY_PATH,
@@ -371,7 +375,7 @@ pub fn set_launch_on_login(enabled: bool) -> std::io::Result<()> {
                 ])
                 .output()?
         } else {
-            Command::new("reg")
+            hidden_windows_command("reg")
                 .args(["delete", RUN_KEY_PATH, "/v", RUN_VALUE_NAME, "/f"])
                 .output()?
         };
@@ -389,6 +393,13 @@ pub fn set_launch_on_login(enabled: bool) -> std::io::Result<()> {
         let _ = enabled;
         Ok(())
     }
+}
+
+#[cfg(windows)]
+fn hidden_windows_command(program: &str) -> Command {
+    let mut command = Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
 }
 
 /// Window position and size state (persisted separately from config)
