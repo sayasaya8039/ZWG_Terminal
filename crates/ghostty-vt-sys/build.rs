@@ -1,3 +1,5 @@
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -30,6 +32,9 @@ fn main() {
 
     let zig = find_zig();
     let zig_dir = manifest_dir.join("zig");
+    let ghostty_src_link = zig_dir.join("ghostty_src");
+    ensure_ghostty_src(&ghostty_dir.join("src"), &ghostty_src_link)
+        .unwrap_or_else(|e| panic!("Failed to prepare ghostty_src for zig build: {}", e));
     let out_dir = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     let prefix = out_dir.join("zig-out");
 
@@ -84,7 +89,46 @@ fn main() {
     println!("cargo:rustc-link-lib=d3d12");
     println!("cargo:rustc-link-lib=dxgi");
     println!("cargo:rustc-link-lib=d3dcompiler");
+    println!("cargo:rustc-link-lib=dwrite");
     println!("cargo:rustc-link-lib=gdi32");
+}
+
+fn ensure_ghostty_src(source: &Path, target: &Path) -> io::Result<()> {
+    if target.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    #[cfg(windows)]
+    {
+        if std::os::windows::fs::symlink_dir(source, target).is_ok() {
+            return Ok(());
+        }
+    }
+
+    copy_dir_recursive(source, target)
+}
+
+fn copy_dir_recursive(source: &Path, target: &Path) -> io::Result<()> {
+    fs::create_dir_all(target)?;
+
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let entry_type = entry.file_type()?;
+        let from = entry.path();
+        let to = target.join(entry.file_name());
+
+        if entry_type.is_dir() {
+            copy_dir_recursive(&from, &to)?;
+        } else if entry_type.is_file() {
+            fs::copy(&from, &to)?;
+        }
+    }
+
+    Ok(())
 }
 
 fn find_zig() -> PathBuf {

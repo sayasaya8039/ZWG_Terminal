@@ -35,6 +35,91 @@ pub const RECT = extern struct {
 };
 
 // ================================================================
+// DirectWrite types
+// ================================================================
+
+pub const DWRITE_FACTORY_TYPE = enum(i32) {
+    SHARED = 0,
+    ISOLATED = 1,
+    _,
+};
+
+pub const DWRITE_FONT_WEIGHT = enum(i32) {
+    NORMAL = 400,
+    _,
+};
+
+pub const DWRITE_FONT_STYLE = enum(i32) {
+    NORMAL = 0,
+    _,
+};
+
+pub const DWRITE_FONT_STRETCH = enum(i32) {
+    NORMAL = 5,
+    _,
+};
+
+pub const DWRITE_MEASURING_MODE = enum(i32) {
+    NATURAL = 0,
+    _,
+};
+
+pub const DWRITE_RENDERING_MODE = enum(i32) {
+    DEFAULT = 0,
+    ALIASED = 1,
+    GDI_CLASSIC = 2,
+    GDI_NATURAL = 3,
+    NATURAL = 4,
+    NATURAL_SYMMETRIC = 5,
+    OUTLINE = 6,
+    _,
+};
+
+pub const DWRITE_TEXTURE_TYPE = enum(i32) {
+    ALIASED_1x1 = 0,
+    CLEARTYPE_3x1 = 1,
+    _,
+};
+
+pub const DWRITE_MATRIX = extern struct {
+    m11: f32 = 1,
+    m12: f32 = 0,
+    m21: f32 = 0,
+    m22: f32 = 1,
+    dx: f32 = 0,
+    dy: f32 = 0,
+};
+
+pub const DWRITE_FONT_METRICS = extern struct {
+    designUnitsPerEm: u16 = 0,
+    ascent: u16 = 0,
+    descent: u16 = 0,
+    lineGap: i16 = 0,
+    capHeight: u16 = 0,
+    xHeight: u16 = 0,
+    underlinePosition: i16 = 0,
+    underlineThickness: u16 = 0,
+    strikethroughPosition: i16 = 0,
+    strikethroughThickness: u16 = 0,
+};
+
+pub const DWRITE_GLYPH_OFFSET = extern struct {
+    advanceOffset: f32 = 0,
+    ascenderOffset: f32 = 0,
+};
+
+pub const DWRITE_GLYPH_RUN = extern struct {
+    fontFace: ?*IDWriteFontFace = null,
+    fontEmSize: f32 = 0,
+    glyphCount: u32 = 0,
+    glyphIndices: ?[*]const u16 = null,
+    glyphAdvances: ?[*]const f32 = null,
+    glyphOffsets: ?[*]const DWRITE_GLYPH_OFFSET = null,
+    isSideways: BOOL = FALSE,
+    bidiLevel: u32 = 0,
+};
+
+// ================================================================
 // DXGI types
 // ================================================================
 
@@ -88,6 +173,15 @@ pub const D3D12_DESCRIPTOR_HEAP_TYPE = enum(u32) {
 pub const D3D12_DESCRIPTOR_HEAP_FLAGS = enum(u32) {
     NONE = 0,
     SHADER_VISIBLE = 1,
+    _,
+};
+
+pub const D3D12_PRIMITIVE_TOPOLOGY_TYPE = enum(u32) {
+    UNDEFINED = 0,
+    POINT = 1,
+    LINE = 2,
+    TRIANGLE = 3,
+    PATCH = 4,
     _,
 };
 
@@ -260,6 +354,7 @@ pub const D3D12_STATIC_BORDER_COLOR = enum(u32) {
 };
 
 pub const D3D12_SRV_DIMENSION = enum(u32) {
+    BUFFER = 1,
     TEXTURE2D = 4,
     _,
 };
@@ -423,6 +518,19 @@ pub const D3D12_INPUT_LAYOUT_DESC = extern struct {
     NumElements: u32 = 0,
 };
 
+pub const D3D12_STREAM_OUTPUT_DESC = extern struct {
+    pSODeclaration: ?*const anyopaque = null,
+    NumEntries: u32 = 0,
+    pBufferStrides: ?[*]const u32 = null,
+    NumStrides: u32 = 0,
+    RasterizedStream: u32 = 0,
+};
+
+pub const D3D12_CACHED_PIPELINE_STATE = extern struct {
+    pCachedBlob: ?*const anyopaque = null,
+    CachedBlobSizeInBytes: usize = 0,
+};
+
 pub const D3D12_GRAPHICS_PIPELINE_STATE_DESC = extern struct {
     pRootSignature: ?*anyopaque = null,
     VS: D3D12_SHADER_BYTECODE = .{},
@@ -430,20 +538,20 @@ pub const D3D12_GRAPHICS_PIPELINE_STATE_DESC = extern struct {
     DS: D3D12_SHADER_BYTECODE = .{},
     HS: D3D12_SHADER_BYTECODE = .{},
     GS: D3D12_SHADER_BYTECODE = .{},
-    StreamOutput: [5]usize = .{0} ** 5,
+    StreamOutput: D3D12_STREAM_OUTPUT_DESC = .{},
     BlendState: D3D12_BLEND_DESC = .{},
     SampleMask: u32 = 0xFFFFFFFF,
     RasterizerState: D3D12_RASTERIZER_DESC = .{},
     DepthStencilState: D3D12_DEPTH_STENCIL_DESC = .{},
     InputLayout: D3D12_INPUT_LAYOUT_DESC = .{},
     IBStripCutValue: u32 = 0,
-    PrimitiveTopologyType: u32 = 4, // D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE
+    PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE = .TRIANGLE,
     NumRenderTargets: u32 = 1,
     RTVFormats: [8]DXGI_FORMAT = .{.UNKNOWN} ** 8,
     DSVFormat: DXGI_FORMAT = .UNKNOWN,
     SampleDesc: DXGI_SAMPLE_DESC = .{},
     NodeMask: u32 = 0,
-    CachedPSO: [2]usize = .{0} ** 2,
+    CachedPSO: D3D12_CACHED_PIPELINE_STATE = .{},
     Flags: u32 = 0,
 };
 
@@ -504,11 +612,22 @@ pub const D3D12_SHADER_RESOURCE_VIEW_DESC = extern struct {
     Format: DXGI_FORMAT,
     ViewDimension: D3D12_SRV_DIMENSION,
     Shader4ComponentMapping: u32 = 0x00001688, // D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
-    // Texture2D union member
-    MostDetailedMip: u32 = 0,
-    MipLevels: u32 = 1,
-    PlaneSlice: u32 = 0,
-    ResourceMinLODClamp: f32 = 0,
+    u: extern union {
+        Buffer: extern struct {
+            FirstElement: u64 = 0,
+            NumElements: u32 = 0,
+            StructureByteStride: u32 = 0,
+            Flags: u32 = 0,
+        },
+        Texture2D: extern struct {
+            MostDetailedMip: u32 = 0,
+            MipLevels: u32 = 1,
+            PlaneSlice: u32 = 0,
+            ResourceMinLODClamp: f32 = 0,
+        },
+    } = .{
+        .Texture2D = .{},
+    },
 };
 
 pub const D3D12_PLACED_SUBRESOURCE_FOOTPRINT = extern struct {
@@ -571,6 +690,73 @@ pub const ID3DBlob = extern struct {
     }
 };
 
+pub const IDWriteFactory = extern struct {
+    lpVtbl: ?*anyopaque,
+
+    pub fn Release(self: *IDWriteFactory) u32 {
+        return vtCall(self.lpVtbl, 2, *const fn (*IDWriteFactory) callconv(.c) u32)(self);
+    }
+    pub fn GetGdiInterop(self: *IDWriteFactory, out: *?*anyopaque) HRESULT {
+        return vtCall(self.lpVtbl, 17, *const fn (*IDWriteFactory, *?*anyopaque) callconv(.c) HRESULT)(self, out);
+    }
+    pub fn CreateGlyphRunAnalysis(
+        self: *IDWriteFactory,
+        glyph_run: *const DWRITE_GLYPH_RUN,
+        pixels_per_dip: f32,
+        transform: ?*const DWRITE_MATRIX,
+        rendering_mode: DWRITE_RENDERING_MODE,
+        measuring_mode: DWRITE_MEASURING_MODE,
+        baseline_origin_x: f32,
+        baseline_origin_y: f32,
+        out: *?*anyopaque,
+    ) HRESULT {
+        return vtCall(
+            self.lpVtbl,
+            23,
+            *const fn (*IDWriteFactory, *const DWRITE_GLYPH_RUN, f32, ?*const DWRITE_MATRIX, DWRITE_RENDERING_MODE, DWRITE_MEASURING_MODE, f32, f32, *?*anyopaque) callconv(.c) HRESULT,
+        )(self, glyph_run, pixels_per_dip, transform, rendering_mode, measuring_mode, baseline_origin_x, baseline_origin_y, out);
+    }
+};
+
+pub const IDWriteGdiInterop = extern struct {
+    lpVtbl: ?*anyopaque,
+
+    pub fn Release(self: *IDWriteGdiInterop) u32 {
+        return vtCall(self.lpVtbl, 2, *const fn (*IDWriteGdiInterop) callconv(.c) u32)(self);
+    }
+    pub fn CreateFontFaceFromHdc(self: *IDWriteGdiInterop, hdc: HDC, out: *?*anyopaque) HRESULT {
+        return vtCall(self.lpVtbl, 6, *const fn (*IDWriteGdiInterop, HDC, *?*anyopaque) callconv(.c) HRESULT)(self, hdc, out);
+    }
+};
+
+pub const IDWriteFontFace = extern struct {
+    lpVtbl: ?*anyopaque,
+
+    pub fn Release(self: *IDWriteFontFace) u32 {
+        return vtCall(self.lpVtbl, 2, *const fn (*IDWriteFontFace) callconv(.c) u32)(self);
+    }
+    pub fn GetGlyphIndices(self: *IDWriteFontFace, codepoints: [*]const u32, codepoint_count: u32, glyph_indices: [*]u16) HRESULT {
+        return vtCall(self.lpVtbl, 11, *const fn (*IDWriteFontFace, [*]const u32, u32, [*]u16) callconv(.c) HRESULT)(self, codepoints, codepoint_count, glyph_indices);
+    }
+    pub fn GetGdiCompatibleMetrics(self: *IDWriteFontFace, em_size: f32, pixels_per_dip: f32, transform: ?*const DWRITE_MATRIX, out_metrics: *DWRITE_FONT_METRICS) HRESULT {
+        return vtCall(self.lpVtbl, 16, *const fn (*IDWriteFontFace, f32, f32, ?*const DWRITE_MATRIX, *DWRITE_FONT_METRICS) callconv(.c) HRESULT)(self, em_size, pixels_per_dip, transform, out_metrics);
+    }
+};
+
+pub const IDWriteGlyphRunAnalysis = extern struct {
+    lpVtbl: ?*anyopaque,
+
+    pub fn Release(self: *IDWriteGlyphRunAnalysis) u32 {
+        return vtCall(self.lpVtbl, 2, *const fn (*IDWriteGlyphRunAnalysis) callconv(.c) u32)(self);
+    }
+    pub fn GetAlphaTextureBounds(self: *IDWriteGlyphRunAnalysis, texture_type: DWRITE_TEXTURE_TYPE, out_bounds: *RECT) HRESULT {
+        return vtCall(self.lpVtbl, 3, *const fn (*IDWriteGlyphRunAnalysis, DWRITE_TEXTURE_TYPE, *RECT) callconv(.c) HRESULT)(self, texture_type, out_bounds);
+    }
+    pub fn CreateAlphaTexture(self: *IDWriteGlyphRunAnalysis, texture_type: DWRITE_TEXTURE_TYPE, texture_bounds: *const RECT, alpha_values: [*]u8, buffer_size: u32) HRESULT {
+        return vtCall(self.lpVtbl, 4, *const fn (*IDWriteGlyphRunAnalysis, DWRITE_TEXTURE_TYPE, *const RECT, [*]u8, u32) callconv(.c) HRESULT)(self, texture_type, texture_bounds, alpha_values, buffer_size);
+    }
+};
+
 /// ID3D12Device (vtable: IUnknown 0-2, ID3D12Object 3-6, Device 7-43)
 pub const ID3D12Device = extern struct {
     lpVtbl: ?*anyopaque,
@@ -610,6 +796,9 @@ pub const ID3D12Device = extern struct {
     }
     pub fn CreateFence(self: *ID3D12Device, initial: u64, flags: D3D12_FENCE_FLAGS, riid: *const GUID, out: *?*anyopaque) HRESULT {
         return vtCall(self.lpVtbl, 36, *const fn (*ID3D12Device, u64, D3D12_FENCE_FLAGS, *const GUID, *?*anyopaque) callconv(.c) HRESULT)(self, initial, flags, riid, out);
+    }
+    pub fn GetDeviceRemovedReason(self: *ID3D12Device) HRESULT {
+        return vtCall(self.lpVtbl, 37, *const fn (*ID3D12Device) callconv(.c) HRESULT)(self);
     }
 };
 
@@ -740,12 +929,35 @@ pub const ID3D12DescriptorHeap = extern struct {
     pub fn Release(self: *@This()) u32 {
         return vtCall(self.lpVtbl, 2, *const fn (*@This()) callconv(.c) u32)(self);
     }
-    /// Returns D3D12_CPU_DESCRIPTOR_HANDLE (8 bytes, fits in RAX on x64)
     pub fn GetCPUDescriptorHandleForHeapStart(self: *@This()) D3D12_CPU_DESCRIPTOR_HANDLE {
-        return vtCall(self.lpVtbl, 9, *const fn (*@This()) callconv(.c) D3D12_CPU_DESCRIPTOR_HANDLE)(self);
+        var handle: D3D12_CPU_DESCRIPTOR_HANDLE = .{};
+        _ = vtCall(
+            self.lpVtbl,
+            9,
+            *const fn (*@This(), *D3D12_CPU_DESCRIPTOR_HANDLE) callconv(.c) *D3D12_CPU_DESCRIPTOR_HANDLE,
+        )(self, &handle);
+        return handle;
     }
     pub fn GetGPUDescriptorHandleForHeapStart(self: *@This()) D3D12_GPU_DESCRIPTOR_HANDLE {
-        return vtCall(self.lpVtbl, 10, *const fn (*@This()) callconv(.c) D3D12_GPU_DESCRIPTOR_HANDLE)(self);
+        var handle: D3D12_GPU_DESCRIPTOR_HANDLE = .{};
+        _ = vtCall(
+            self.lpVtbl,
+            10,
+            *const fn (*@This(), *D3D12_GPU_DESCRIPTOR_HANDLE) callconv(.c) *D3D12_GPU_DESCRIPTOR_HANDLE,
+        )(self, &handle);
+        return handle;
+    }
+};
+
+/// IDXGIFactory4 (IUnknown + IDXGIObject + IDXGIFactory..4)
+pub const IDXGIFactory4 = extern struct {
+    lpVtbl: ?*anyopaque,
+
+    pub fn Release(self: *@This()) u32 {
+        return vtCall(self.lpVtbl, 2, *const fn (*@This()) callconv(.c) u32)(self);
+    }
+    pub fn EnumWarpAdapter(self: *@This(), riid: *const GUID, out: *?*anyopaque) HRESULT {
+        return vtCall(self.lpVtbl, 27, *const fn (*@This(), *const GUID, *?*anyopaque) callconv(.c) HRESULT)(self, riid, out);
     }
 };
 
@@ -761,6 +973,30 @@ pub const IUnknown = extern struct {
 // ================================================================
 // Free functions (resolved by linker from d3d12.lib etc.)
 // ================================================================
+
+// D3D12 Debug Layer
+pub const ID3D12Debug = extern struct {
+    lpVtbl: ?*anyopaque,
+
+    pub fn Release(self: *ID3D12Debug) u32 {
+        return vtCall(self.lpVtbl, 2, *const fn (*ID3D12Debug) callconv(.c) u32)(self);
+    }
+    pub fn EnableDebugLayer(self: *ID3D12Debug) void {
+        vtCall(self.lpVtbl, 3, *const fn (*ID3D12Debug) callconv(.c) void)(self);
+    }
+};
+
+pub const IID_ID3D12Debug = GUID{
+    .Data1 = 0x344488b7,
+    .Data2 = 0x6846,
+    .Data3 = 0x474b,
+    .Data4 = .{ 0xb9, 0x89, 0xf0, 0x27, 0x44, 0x82, 0x45, 0xe0 },
+};
+
+pub extern fn D3D12GetDebugInterface(
+    riid: *const GUID,
+    ppvDebug: *?*anyopaque,
+) callconv(.c) HRESULT;
 
 pub extern fn D3D12CreateDevice(
     pAdapter: ?*anyopaque,
@@ -788,6 +1024,17 @@ pub extern fn D3DCompile(
     Flags2: u32,
     ppCode: *?*ID3DBlob,
     ppErrorMsgs: *?*ID3DBlob,
+) callconv(.c) HRESULT;
+
+pub extern "dwrite" fn DWriteCreateFactory(
+    factory_type: DWRITE_FACTORY_TYPE,
+    iid: *const GUID,
+    factory: *?*anyopaque,
+) callconv(.c) HRESULT;
+
+pub extern "dxgi" fn CreateDXGIFactory1(
+    riid: *const GUID,
+    ppFactory: *?*anyopaque,
 ) callconv(.c) HRESULT;
 
 // ================================================================
@@ -880,3 +1127,6 @@ pub const IID_ID3D12DescriptorHeap = GUID{ .Data1 = 0x8efb471d, .Data2 = 0x616c,
 pub const IID_ID3D12RootSignature = GUID{ .Data1 = 0xc54a6b66, .Data2 = 0x72df, .Data3 = 0x4ee8, .Data4 = .{ 0x8b, 0xe5, 0xa9, 0x46, 0xa1, 0x42, 0x92, 0x14 } };
 pub const IID_ID3D12PipelineState = GUID{ .Data1 = 0x765a30f3, .Data2 = 0xf624, .Data3 = 0x4c6f, .Data4 = .{ 0xa8, 0x28, 0xac, 0xe9, 0x48, 0x62, 0x24, 0x45 } };
 pub const IID_ID3D12Resource = GUID{ .Data1 = 0x696442be, .Data2 = 0xa72e, .Data3 = 0x4059, .Data4 = .{ 0xbc, 0x79, 0x5b, 0x5c, 0x98, 0x04, 0x0f, 0xad } };
+pub const IID_IDXGIFactory4 = GUID{ .Data1 = 0x1bc6ea02, .Data2 = 0xef36, .Data3 = 0x464f, .Data4 = .{ 0xbf, 0x0c, 0x21, 0xca, 0x39, 0xe5, 0x16, 0x8a } };
+pub const IID_IDXGIAdapter = GUID{ .Data1 = 0x2411e7e1, .Data2 = 0x12ac, .Data3 = 0x4ccf, .Data4 = .{ 0xbd, 0x14, 0x97, 0x98, 0xe8, 0x53, 0x4d, 0xc0 } };
+pub const IID_IDWriteFactory = GUID{ .Data1 = 0xb859ee5a, .Data2 = 0xd838, .Data3 = 0x4b5b, .Data4 = .{ 0xa2, 0xe8, 0x1a, 0xdc, 0x7d, 0x93, 0xdb, 0x48 } };

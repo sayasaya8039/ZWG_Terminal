@@ -1,13 +1,13 @@
 //! Terminal surface — manages PTY + terminal backend
 
 use std::io::Read;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 
-use super::pty::{ConPtyConfig, PtyPair, spawn_pty};
+use super::pty::{spawn_pty, ConPtyConfig, PtyPair};
 use super::{DEFAULT_BG, DEFAULT_FG};
 
 /// Events emitted by the terminal
@@ -27,6 +27,9 @@ mod backend {
         pub terminal: ghostty_vt::Terminal,
         pub cols: u16,
         pub rows: u16,
+        pub max_scrollback: usize,
+        pub default_fg: u32,
+        pub default_bg: u32,
     }
 
     impl TerminalBackend {
@@ -60,6 +63,9 @@ mod backend {
                 terminal,
                 cols,
                 rows,
+                max_scrollback,
+                default_fg: DEFAULT_FG,
+                default_bg: DEFAULT_BG,
             }
         }
 
@@ -87,6 +93,54 @@ mod backend {
             self.terminal.cursor_position().unwrap_or((0, 0))
         }
 
+        pub fn cursor_visible(&self) -> bool {
+            self.terminal.cursor_visible()
+        }
+
+        pub fn set_default_colors(&mut self, fg_rgb: u32, bg_rgb: u32) {
+            self.default_fg = fg_rgb;
+            self.default_bg = bg_rgb;
+            self.terminal.set_default_colors(
+                ghostty_vt::Rgb {
+                    r: ((fg_rgb >> 16) & 0xFF) as u8,
+                    g: ((fg_rgb >> 8) & 0xFF) as u8,
+                    b: (fg_rgb & 0xFF) as u8,
+                },
+                ghostty_vt::Rgb {
+                    r: ((bg_rgb >> 16) & 0xFF) as u8,
+                    g: ((bg_rgb >> 8) & 0xFF) as u8,
+                    b: (bg_rgb & 0xFF) as u8,
+                },
+            );
+        }
+
+        pub fn scroll_viewport(&mut self, delta_lines: i32) -> bool {
+            self.terminal.scroll_viewport(delta_lines).is_ok()
+        }
+
+        pub fn clear_history(&mut self) {
+            let mut terminal = ghostty_vt::Terminal::new_with_scrollback(
+                self.cols,
+                self.rows,
+                self.max_scrollback,
+            )
+            .or_else(|_| ghostty_vt::Terminal::new_with_scrollback(80, 24, self.max_scrollback))
+            .expect("ghostty terminal recreation failed while clearing history");
+            terminal.set_default_colors(
+                ghostty_vt::Rgb {
+                    r: ((self.default_fg >> 16) & 0xFF) as u8,
+                    g: ((self.default_fg >> 8) & 0xFF) as u8,
+                    b: (self.default_fg & 0xFF) as u8,
+                },
+                ghostty_vt::Rgb {
+                    r: ((self.default_bg >> 16) & 0xFF) as u8,
+                    g: ((self.default_bg >> 8) & 0xFF) as u8,
+                    b: (self.default_bg & 0xFF) as u8,
+                },
+            );
+            self.terminal = terminal;
+        }
+
         /// Start async I/O mode (dedicated Zig parser thread).
         pub fn start_async(&mut self) -> bool {
             self.terminal.start_async().is_ok()
@@ -108,14 +162,16 @@ mod backend {
 #[cfg(not(feature = "ghostty_vt"))]
 mod backend {
     use super::*;
-    use crate::terminal::ScreenBuffer;
     use crate::terminal::vt_parser::VtParser;
+    use crate::terminal::ScreenBuffer;
 
     pub struct TerminalBackend {
         parser: VtParser,
         pub screen: ScreenBuffer,
         pub cols: u16,
         pub rows: u16,
+        pub default_fg: u32,
+        pub default_bg: u32,
     }
 
     impl TerminalBackend {
@@ -125,6 +181,8 @@ mod backend {
                 screen: ScreenBuffer::new(cols, rows, max_scrollback),
                 cols,
                 rows,
+                default_fg: DEFAULT_FG,
+                default_bg: DEFAULT_BG,
             }
         }
 
@@ -151,6 +209,26 @@ mod backend {
 
         pub fn cursor_position(&self) -> (u16, u16) {
             (self.screen.cursor.x, self.screen.cursor.y)
+        }
+
+        pub fn cursor_visible(&self) -> bool {
+            self.screen.cursor.visible
+        }
+
+        pub fn set_default_colors(&mut self, fg_rgb: u32, bg_rgb: u32) {
+            self.default_fg = fg_rgb;
+            self.default_bg = bg_rgb;
+            self.screen.current_fg = fg_rgb;
+            self.screen.current_bg = bg_rgb;
+        }
+
+        pub fn scroll_viewport(&mut self, delta_lines: i32) -> bool {
+            self.screen.scroll_viewport(delta_lines);
+            true
+        }
+
+        pub fn clear_history(&mut self) {
+            self.screen.clear_history();
         }
     }
 }
@@ -197,6 +275,10 @@ impl TerminalSurface {
         self.event_rx
             .take()
             .expect("terminal event receiver already taken")
+    }
+
+    pub fn clear_history(&self) {
+        self.backend.lock().clear_history();
     }
 
     /// Spawn a shell and start reading PTY output
@@ -316,7 +398,9 @@ impl TerminalSurface {
         let async_ptr: Option<usize> = {
             let mut b = backend.lock();
             if b.start_async() {
-                log::info!("Async I/O enabled (attach_pty): PTY reader → ring buffer → parser thread");
+                log::info!(
+                    "Async I/O enabled (attach_pty): PTY reader → ring buffer → parser thread"
+                );
                 Some(b.terminal_raw_ptr())
             } else {
                 None
@@ -366,6 +450,18 @@ impl TerminalSurface {
         if let Some(ref pty) = self.pty {
             let _ = pty.resize(cols, rows);
         }
+    }
+
+    pub fn scroll_viewport(&self, delta_lines: i32) -> bool {
+        if delta_lines == 0 {
+            return false;
+        }
+
+        self.backend.lock().scroll_viewport(delta_lines)
+    }
+
+    pub fn set_default_colors(&self, fg_rgb: u32, bg_rgb: u32) {
+        self.backend.lock().set_default_colors(fg_rgb, bg_rgb);
     }
 
     /// Check if the PTY is connected

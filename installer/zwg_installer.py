@@ -40,7 +40,7 @@ from tkinter import (
 from tkinter.ttk import Progressbar
 
 APP_NAME = "ZWG Terminal"
-APP_VERSION = "1.0.1"
+APP_VERSION = "1.1.0"
 APP_EXE = "zwg.exe"
 PUBLISHER = "ZWG Terminal contributors"
 UNINSTALL_KEY = r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\ZWGTerminal"

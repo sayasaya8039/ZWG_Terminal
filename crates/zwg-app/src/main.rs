@@ -12,6 +12,7 @@ use anyhow::Result;
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+mod ai;
 mod app;
 mod config;
 mod shell;
@@ -59,6 +60,7 @@ actions!(
         ClosePane,
         FocusNext,
         FocusPrev,
+        OpenSettings,
         ToggleSnippetPalette,
         SnippetQueuePaste,
     ]
@@ -82,20 +84,6 @@ fn main() {
             }
         })
         .detach();
-
-        // Keybindings
-        cx.bind_keys([
-            KeyBinding::new("ctrl-shift-t", NewTab, None),
-            KeyBinding::new("ctrl-shift-w", CloseTab, None),
-            KeyBinding::new("ctrl-shift-d", SplitRight, None),
-            KeyBinding::new("ctrl-shift-e", SplitDown, None),
-            KeyBinding::new("ctrl-shift-x", ClosePane, None),
-            KeyBinding::new("ctrl-tab", FocusNext, None),
-            KeyBinding::new("ctrl-shift-tab", FocusPrev, None),
-            KeyBinding::new("ctrl-shift-v", ToggleSnippetPalette, None),
-            KeyBinding::new("ctrl-shift-f", SnippetQueuePaste, None),
-            KeyBinding::new("ctrl-shift-q", Quit, None),
-        ]);
 
         // Load saved window state (position + size)
         let window_state = config::WindowState::load();

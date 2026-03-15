@@ -5,6 +5,8 @@ use uuid::Uuid;
 
 use crate::terminal::{TerminalPane, TerminalSettings};
 
+const PANE_BORDER_NEUTRAL: u32 = 0x3C3C3E;
+
 /// Direction of a split
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SplitDirection {
@@ -294,8 +296,18 @@ impl SplitContainer {
         self.focused_id
     }
 
-    pub fn update_terminal_settings(&mut self, terminal_settings: TerminalSettings) {
-        self.terminal_settings = terminal_settings;
+    pub fn update_terminal_settings(
+        &mut self,
+        terminal_settings: TerminalSettings,
+        cx: &mut Context<Self>,
+    ) {
+        self.terminal_settings = terminal_settings.clone();
+        for (_, terminal) in self.all_terminals() {
+            let terminal_settings = terminal_settings.clone();
+            terminal.update(cx, |pane, cx| {
+                pane.update_settings(&terminal_settings, cx);
+            });
+        }
     }
 
     fn begin_resize_drag(
@@ -404,6 +416,11 @@ pub enum FocusDir {
     Prev,
 }
 
+fn leaf_border_style(is_focused: bool) -> (u8, u32) {
+    let width = if is_focused { 1 } else { 1 };
+    (width, PANE_BORDER_NEUTRAL)
+}
+
 impl Render for SplitContainer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused_id = self.focused_id;
@@ -438,12 +455,15 @@ impl SplitContainer {
         match node {
             SplitNode::Leaf { id, terminal } => {
                 let is_focused = *id == focused_id;
+                let (border_width, border_rgb) = leaf_border_style(is_focused);
                 let mut el = div().size_full().child(terminal.clone());
-                if is_focused {
-                    el = el.border_2().border_color(rgb(0x0A84FF));
-                } else {
-                    el = el.border_1().border_color(rgb(0x3C3C3E));
-                }
+                el = match border_width {
+                    0 => el,
+                    1 => el.border_1(),
+                    2 => el.border_2(),
+                    _ => el.border_1(),
+                };
+                el = el.border_color(rgb(border_rgb));
                 el
             }
             SplitNode::Branch {
@@ -533,3 +553,14 @@ impl SplitContainer {
 }
 
 impl EventEmitter<()> for SplitContainer {}
+
+#[cfg(test)]
+mod tests {
+    use super::{PANE_BORDER_NEUTRAL, leaf_border_style};
+
+    #[test]
+    fn leaf_border_style_avoids_blue_focus_ring() {
+        assert_eq!(leaf_border_style(true), (1, PANE_BORDER_NEUTRAL));
+        assert_eq!(leaf_border_style(false), (1, PANE_BORDER_NEUTRAL));
+    }
+}

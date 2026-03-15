@@ -1,4 +1,5 @@
 /target
+/target-tests
 **/*.rs.bk
 *.pdb
 *.exe
@@ -7,4 +8,21 @@
 *.exp
 .env
 *.log
+
+# Build artifacts
+installer/_stage/
+installer/build/
+installer/dist/
+
+# Zig build cache
+crates/ghostty-vt-sys/zig/.zig-cache/
+crates/ghostty-vt-sys/zig/.zig-global-cache/
+crates/ghostty-vt-sys/zig/zig-out/
+crates/ghostty-vt-sys/zig/ghostty_src/
+
+# Misc
+crates/ghostty-vt/benchdata/
+crates/ghostty-vt/examples/
+tmp_*.png
+
 # vendor/ghostty is a git submodule, do not ignore

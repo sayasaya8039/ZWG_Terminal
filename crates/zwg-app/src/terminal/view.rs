@@ -1,31 +1,36 @@
 //! Terminal pane — GPUI view that renders the terminal and handles input
 
 use std::ops::Range;
+use std::path::PathBuf;
 use std::sync::{
-    Arc,
     atomic::{AtomicBool, Ordering},
+    Arc,
 };
+use std::time::{Duration, Instant};
 
-use gpui::*;
 use gpui::ElementInputHandler;
+use gpui::*;
 
-use super::grid_renderer::{
-    GlyphCache, GridRendererConfig, SelectionPoint, TerminalSnapshot, col_to_char_index,
-    damage_spans_from_terminal_row, full_row_damage, glyph_instances_in_damage,
-    grid_cells_from_parts, patch_cells_in_damage, patch_glyph_instances_in_damage,
-    terminal_canvas,
+#[cfg(feature = "ghostty_vt")]
+use super::gpu_view::{
+    gpu_terminal_canvas, snapshot_can_present_natively, CursorOverlay, GpuTerminalState,
 };
 #[cfg(feature = "ghostty_vt")]
-use super::gpu_view::{GpuTerminalState, gpu_terminal_canvas};
+use super::grid_renderer::resolve_cursor_cell;
+use super::grid_renderer::{
+    col_to_char_index, damage_spans_from_terminal_row, full_row_damage, glyph_instances_in_damage,
+    grid_cells_from_parts, patch_cells_in_damage, patch_glyph_instances_in_damage, terminal_canvas,
+    GlyphCache, GridRendererConfig, SelectionPoint, TerminalSnapshot,
+};
+use super::pty::{spawn_pty, ConPtyConfig};
+use super::surface::TerminalSurface;
+use super::TerminalSettings;
 #[cfg(feature = "ghostty_vt")]
 use parking_lot::Mutex;
-use super::pty::{ConPtyConfig, spawn_pty};
-use super::surface::TerminalSurface;
-use super::{DEFAULT_BG, TerminalSettings};
 
-const FONT_FAMILY: &str = "Consolas";
-const FONT_SIZE: f32 = 13.0;
 const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
+const MAX_FRAME_COALESCE_MICROS: u64 = 1_667;
+const ASYNC_PARSE_SETTLE_MILLIS: u64 = 2;
 /// Fallback values — replaced at runtime by measured font metrics
 const CELL_WIDTH_FALLBACK: f32 = 8.4;
 const CELL_HEIGHT_FALLBACK: f32 = 19.5;
@@ -54,9 +59,17 @@ fn apply_ghostty_row_update(
     cached_row: &mut super::grid_renderer::CachedTerminalRow,
     row_update: GhosttyRowUpdate,
     term_cols: u16,
+    default_fg: u32,
+    default_bg: u32,
     force_full: bool,
 ) -> bool {
-    let next_cells = grid_cells_from_parts(&row_update.text, &row_update.style_runs, term_cols);
+    let next_cells = grid_cells_from_parts(
+        &row_update.text,
+        &row_update.style_runs,
+        term_cols,
+        default_fg,
+        default_bg,
+    );
     let damage_spans = if force_full {
         full_row_damage(term_cols)
     } else {
@@ -66,6 +79,8 @@ fn apply_ghostty_row_update(
             &next_cells,
             &row_update.style_runs,
             term_cols,
+            default_fg,
+            default_bg,
         )
     };
     let cells = if force_full {
@@ -97,22 +112,26 @@ fn apply_ghostty_row_update(
     row_changed
 }
 
-/// Measure the actual monospace cell dimensions from the font at FONT_SIZE.
+/// Measure the actual monospace cell dimensions from the configured font.
 /// Cell width = max advance width of representative monospace glyphs.
 /// Cell height = ascent + descent (no extra leading — required for
 /// box-drawing characters │─┌┐└┘ to connect between adjacent rows).
-fn measure_cell_dimensions(cx: &App) -> (f32, f32) {
+fn measure_cell_dimensions(cx: &App, font_family: &str, font_size_px: f32) -> (f32, f32) {
     let text_system = cx.text_system();
-    let font_desc = font(FONT_FAMILY);
+    let font_desc = font(SharedString::from(font_family.to_string()));
     let font_id = text_system.resolve_font(&font_desc);
-    let font_size = px(FONT_SIZE);
+    let font_size = px(font_size_px);
 
     let cell_width = ['M', 'W', '@', '0', '█', '│']
         .into_iter()
         .filter_map(|ch| text_system.advance(font_id, font_size, ch).ok())
         .map(|size| {
             let w: f32 = size.width.into();
-            if w > 1.0 { w } else { CELL_WIDTH_FALLBACK }
+            if w > 1.0 {
+                w
+            } else {
+                CELL_WIDTH_FALLBACK
+            }
         })
         .fold(CELL_WIDTH_FALLBACK, f32::max);
 
@@ -120,7 +139,11 @@ fn measure_cell_dimensions(cx: &App) -> (f32, f32) {
     let descent: f32 = text_system.descent(font_id, font_size).into();
     // descent may be negative (OpenType convention) — use abs
     let cell_height = ascent + descent.abs();
-    let cell_height = if cell_height > FONT_SIZE { cell_height } else { CELL_HEIGHT_FALLBACK };
+    let cell_height = if cell_height > font_size_px {
+        cell_height
+    } else {
+        CELL_HEIGHT_FALLBACK
+    };
 
     // Use exact measured values — NO rounding.
     // cell_height = ascent + descent means paint_line's padding_top = 0,
@@ -151,7 +174,7 @@ unsafe extern "system" fn ime_getmessage_hook_proc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, TranslateMessage, MSG, WM_KEYDOWN, PM_REMOVE,
+        CallNextHookEx, TranslateMessage, MSG, PM_REMOVE, WM_KEYDOWN,
     };
 
     if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
@@ -174,17 +197,20 @@ unsafe extern "system" fn ime_getmessage_hook_proc(
 #[cfg(target_os = "windows")]
 fn install_ime_hook() {
     use std::sync::Once;
-    use windows::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_GETMESSAGE};
     use windows::Win32::System::Threading::GetCurrentThreadId;
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowsHookExW, WH_GETMESSAGE};
 
     static INIT: Once = Once::new();
-    INIT.call_once(|| {
-        unsafe {
-            let thread_id = GetCurrentThreadId();
-            match SetWindowsHookExW(WH_GETMESSAGE, Some(ime_getmessage_hook_proc), None, thread_id) {
-                Ok(_) => log::info!("IME GetMessage hook installed"),
-                Err(e) => log::error!("Failed to install IME hook: {}", e),
-            }
+    INIT.call_once(|| unsafe {
+        let thread_id = GetCurrentThreadId();
+        match SetWindowsHookExW(
+            WH_GETMESSAGE,
+            Some(ime_getmessage_hook_proc),
+            None,
+            thread_id,
+        ) {
+            Ok(_) => log::info!("IME GetMessage hook installed"),
+            Err(e) => log::error!("Failed to install IME hook: {}", e),
         }
     });
 }
@@ -214,6 +240,74 @@ fn format_dropped_paths(paths: &ExternalPaths) -> String {
         .join(" ")
 }
 
+fn viewport_rows_to_refresh(
+    rows: u16,
+    force_full: bool,
+    scroll_delta: i32,
+    dirty_rows: Option<Vec<u16>>,
+) -> Vec<u16> {
+    if rows == 0 {
+        return Vec::new();
+    }
+
+    if force_full || scroll_delta != 0 {
+        return (0..rows).collect();
+    }
+
+    dirty_rows.unwrap_or_else(|| (0..rows).collect())
+}
+
+fn scroll_lines_from_wheel_delta(
+    delta: ScrollDelta,
+    cell_height: f32,
+    line_remainder: &mut f32,
+) -> i32 {
+    let line_height = cell_height.max(1.0);
+    let line_delta = match delta {
+        ScrollDelta::Lines(delta) => delta.y,
+        ScrollDelta::Pixels(delta) => {
+            let pixels: f32 = delta.y.into();
+            pixels / line_height
+        }
+    };
+
+    // GPUI reports positive Y for wheel-up on Windows. Viewport scrolling uses
+    // positive lines to move upward into scrollback, so invert once here.
+    let total = *line_remainder - line_delta;
+    let whole_lines = if total >= 0.0 {
+        total.floor() as i32
+    } else {
+        total.ceil() as i32
+    };
+    *line_remainder = total - whole_lines as f32;
+    whole_lines
+}
+
+fn terminal_layout_size(
+    viewport_size: Size<Pixels>,
+    last_bounds: Option<Bounds<Pixels>>,
+) -> (f32, f32) {
+    if let Some(bounds) = last_bounds {
+        let width: f32 = bounds.size.width.into();
+        let height: f32 = bounds.size.height.into();
+        return (width.max(1.0), height.max(100.0));
+    }
+
+    let width: f32 = viewport_size.width.into();
+    let height: f32 = viewport_size.height.into();
+    (width.max(1.0), (height - WINDOW_CHROME_HEIGHT).max(100.0))
+}
+
+fn should_defer_keystroke_to_ime(ks: &Keystroke, ime_processkey_pending: bool) -> bool {
+    if !ime_processkey_pending {
+        return false;
+    }
+
+    !ks.key_char
+        .as_ref()
+        .is_some_and(|key_char| !key_char.is_empty())
+}
+
 /// Terminal connection state — two-phase init pattern
 enum TerminalState {
     /// PTY is being spawned in background
@@ -234,6 +328,16 @@ pub struct TerminalPane {
     /// Cached cell dimensions
     cell_width: f32,
     cell_height: f32,
+    font_family: SharedString,
+    font_size: f32,
+    cursor_blink: bool,
+    copy_on_select: bool,
+    gpu_acceleration: bool,
+    fg_color: u32,
+    bg_color: u32,
+    background_image_path: Option<String>,
+    background_image_opacity: f32,
+    blink_started_at: Instant,
     /// Current terminal size in cells
     term_cols: u16,
     term_rows: u16,
@@ -244,8 +348,11 @@ pub struct TerminalPane {
     selection_anchor: Option<SelectionPoint>,
     selection_head: Option<SelectionPoint>,
     is_selecting: bool,
+    ime_composing: bool,
+    wheel_scroll_line_remainder: f32,
     /// Keystrokes buffered while PTY is still connecting (Pending state)
     pending_input: Vec<u8>,
+    pending_process_exit_status: Option<i32>,
     /// Cross-frame glyph layout cache — avoids reshaping unchanged glyphs every paint
     glyph_cache: GlyphCache,
     /// DX12 GPU renderer state — bypasses GPUI text shaping when available
@@ -263,6 +370,7 @@ impl TerminalPane {
         let focus_handle = cx.focus_handle();
         let mut surface =
             TerminalSurface::new(settings.cols, settings.rows, settings.scrollback_lines);
+        surface.set_default_colors(settings.fg_color, settings.bg_color);
         let event_rx = surface.take_event_rx();
 
         // Phase A: Return immediately with Pending state (<1ms)
@@ -318,19 +426,28 @@ impl TerminalPane {
         )
         .detach();
 
-        // Wait for PTY output, then coalesce updates with 4ms batching window.
-        // GPUI's display-rate vsync limits actual repaints to ~60fps; the 4ms window
-        // reduces input-to-snapshot latency from ~17ms to ~5ms for interactive use.
+        // Wait for PTY output, then coalesce updates with an upper bound matching
+        // a 600Hz frame budget. This keeps bursty PTY output from flooding the UI
+        // while still allowing high refresh-rate panels to update promptly.
         cx.spawn(
             async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
-                let frame_budget = std::time::Duration::from_micros(4_000);
+                let frame_budget = std::time::Duration::from_micros(MAX_FRAME_COALESCE_MICROS);
                 let mut last_presented: Option<std::time::Instant> = None;
 
                 loop {
-                    if event_rx.recv_async().await.is_err() {
+                    let Ok(event) = event_rx.recv_async().await else {
                         break;
+                    };
+
+                    let mut process_exit_status = match event {
+                        super::surface::TerminalEvent::ProcessExited(code) => Some(code),
+                        _ => None,
+                    };
+                    while let Ok(event) = event_rx.try_recv() {
+                        if let super::surface::TerminalEvent::ProcessExited(code) = event {
+                            process_exit_status = Some(code);
+                        }
                     }
-                    while event_rx.try_recv().is_ok() {}
 
                     if let Some(last_presented_at) = last_presented {
                         let elapsed = last_presented_at.elapsed();
@@ -339,12 +456,27 @@ impl TerminalPane {
                         }
                     }
 
-                    let should_notify = match this.update(cx, |pane: &mut TerminalPane, _cx| {
+                    let mut should_notify = match this.update(cx, |pane: &mut TerminalPane, _cx| {
+                        if process_exit_status.is_some() {
+                            pane.pending_process_exit_status = process_exit_status;
+                        }
                         pane.refresh_snapshot(false)
                     }) {
                         Ok(should_notify) => should_notify,
                         Err(_) => break,
                     };
+
+                    if !should_notify {
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(ASYNC_PARSE_SETTLE_MILLIS))
+                            .await;
+                        should_notify = match this.update(cx, |pane: &mut TerminalPane, _cx| {
+                            pane.refresh_snapshot(false)
+                        }) {
+                            Ok(should_notify) => should_notify,
+                            Err(_) => break,
+                        };
+                    }
 
                     if should_notify
                         && this
@@ -363,28 +495,85 @@ impl TerminalPane {
         )
         .detach();
 
-        let (measured_w, measured_h) = measure_cell_dimensions(cx);
+        let font_family = SharedString::from(settings.font_family.clone());
+        let (measured_w, measured_h) =
+            measure_cell_dimensions(cx, font_family.as_ref(), settings.font_size);
         log::info!(
             "Terminal cell: width={:.2}px height={:.2}px (fallback w={:.1} h={:.1})",
-            measured_w, measured_h, CELL_WIDTH_FALLBACK, CELL_HEIGHT_FALLBACK,
+            measured_w,
+            measured_h,
+            CELL_WIDTH_FALLBACK,
+            CELL_HEIGHT_FALLBACK,
         );
 
-        // Try to initialize DX12 GPU renderer for native rendering bypass
         #[cfg(feature = "ghostty_vt")]
-        let gpu_state = {
-            let initial_w = (settings.cols as f32 * measured_w + HORIZONTAL_TEXT_PADDING * 2.0).ceil() as u32;
-            let initial_h = (settings.rows as f32 * measured_h).ceil() as u32;
-            match GpuTerminalState::new(initial_w.max(64), initial_h.max(64), FONT_SIZE) {
-                Some(state) => {
-                    log::info!("DX12 GPU terminal renderer active — bypassing GPUI text shaping");
-                    Some(Arc::new(Mutex::new(state)))
-                }
-                None => {
-                    log::warn!("DX12 GPU renderer unavailable — falling back to GPUI text shaping");
-                    None
-                }
+        {
+            if settings.gpu_acceleration {
+                let initial_w = (settings.cols as f32 * measured_w + HORIZONTAL_TEXT_PADDING * 2.0)
+                    .ceil() as u32;
+                let initial_h = (settings.rows as f32 * measured_h).ceil() as u32;
+                let gpu_init_width = initial_w.max(64);
+                let gpu_init_height = initial_h.max(64);
+                let this = cx.entity().downgrade();
+                cx.spawn(async move |_, cx: &mut AsyncApp| {
+                    let gpu_result = cx
+                        .background_executor()
+                        .spawn(async move {
+                            GpuTerminalState::new(
+                                gpu_init_width,
+                                gpu_init_height,
+                                settings.font_size,
+                            )
+                        })
+                        .await;
+
+                    let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
+                        match gpu_result {
+                            Some(state) => {
+                                log::info!(
+                                    "DX12 GPU terminal renderer active — bypassing GPUI text shaping"
+                                );
+                                pane.gpu_state = Some(Arc::new(Mutex::new(state)));
+                            }
+                            None => {
+                                let (stage, hr) = ghostty_vt::gpu_renderer_last_init_error();
+                                let stage_name = ghostty_vt::gpu_init_stage_name(stage);
+                                log::warn!(
+                                    "DX12 GPU renderer unavailable — falling back to GPUI text shaping \
+                                     (failed at stage {}={}, HRESULT=0x{:08X})",
+                                    stage, stage_name, hr as u32
+                                );
+                            }
+                        }
+                        cx.notify();
+                    });
+                })
+                .detach();
+            } else {
+                log::info!("DX12 GPU terminal renderer disabled; using GPUI text shaping.");
             }
-        };
+        }
+
+        let blink_entity = cx.entity().downgrade();
+        cx.spawn(async move |_, cx: &mut AsyncApp| loop {
+            cx.background_executor()
+                .timer(Duration::from_millis(500))
+                .await;
+            if blink_entity
+                .update(cx, |pane: &mut TerminalPane, cx| {
+                    if matches!(pane.state, TerminalState::Running)
+                        && pane.cursor_blink
+                        && pane.snapshot.cursor_visible
+                    {
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+        })
+        .detach();
 
         Self {
             surface,
@@ -394,6 +583,16 @@ impl TerminalPane {
             snapshot: TerminalSnapshot::new(settings.rows),
             cell_width: measured_w,
             cell_height: measured_h,
+            font_family,
+            font_size: settings.font_size,
+            cursor_blink: settings.cursor_blink,
+            copy_on_select: settings.copy_on_select,
+            gpu_acceleration: settings.gpu_acceleration,
+            fg_color: settings.fg_color,
+            bg_color: settings.bg_color,
+            background_image_path: settings.background_image_path.clone(),
+            background_image_opacity: settings.background_image_opacity,
+            blink_started_at: Instant::now(),
             term_cols: settings.cols,
             term_rows: settings.rows,
             last_width: 0.0,
@@ -402,13 +601,141 @@ impl TerminalPane {
             selection_anchor: None,
             selection_head: None,
             is_selecting: false,
+            ime_composing: false,
+            wheel_scroll_line_remainder: 0.0,
             pending_input: Vec::new(),
+            pending_process_exit_status: None,
             glyph_cache: Default::default(),
             #[cfg(feature = "ghostty_vt")]
-            gpu_state,
+            gpu_state: None,
             #[cfg(not(feature = "ghostty_vt"))]
             row_generations: vec![0; settings.rows as usize],
         }
+    }
+
+    fn cursor_blink_visible(&self) -> bool {
+        if !self.cursor_blink {
+            return true;
+        }
+
+        (self.blink_started_at.elapsed().as_millis() / 500).is_multiple_of(2)
+    }
+
+    #[cfg(feature = "ghostty_vt")]
+    fn recreate_gpu_state(&mut self, cx: &mut Context<Self>) {
+        if !self.gpu_acceleration {
+            self.gpu_state = None;
+            return;
+        }
+
+        let width = ((self.term_cols as f32 * self.cell_width) + HORIZONTAL_TEXT_PADDING * 2.0)
+            .ceil() as u32;
+        let height = (self.term_rows as f32 * self.cell_height).ceil() as u32;
+        let width = width.max(64);
+        let height = height.max(64);
+        let font_size = self.font_size;
+        let this = cx.entity().downgrade();
+        self.gpu_state = None;
+        cx.spawn(async move |_, cx: &mut AsyncApp| {
+            let gpu_result = cx
+                .background_executor()
+                .spawn(async move { GpuTerminalState::new(width, height, font_size) })
+                .await;
+
+            let _ = this.update(cx, |pane: &mut TerminalPane, cx| {
+                if let Some(state) = gpu_result {
+                    pane.gpu_state = Some(Arc::new(Mutex::new(state)));
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    #[cfg(not(feature = "ghostty_vt"))]
+    fn recreate_gpu_state(&mut self, _cx: &mut Context<Self>) {}
+
+    pub fn take_process_exit_status(&mut self) -> Option<i32> {
+        self.pending_process_exit_status.take()
+    }
+
+    pub fn clear_history(&mut self) {
+        self.surface.clear_history();
+        self.snapshot = TerminalSnapshot::new(self.term_rows);
+        self.selection_anchor = None;
+        self.selection_head = None;
+        self.is_selecting = false;
+        self.pending_process_exit_status = None;
+    }
+
+    pub fn update_settings(&mut self, settings: &TerminalSettings, cx: &mut Context<Self>) {
+        let next_font_family = SharedString::from(settings.font_family.clone());
+        let font_changed = self.font_family != next_font_family
+            || (self.font_size - settings.font_size).abs() > f32::EPSILON;
+        let colors_changed =
+            self.fg_color != settings.fg_color || self.bg_color != settings.bg_color;
+        let blink_changed = self.cursor_blink != settings.cursor_blink;
+        let background_image_changed = self.background_image_path != settings.background_image_path
+            || (self.background_image_opacity - settings.background_image_opacity).abs()
+                > f32::EPSILON;
+
+        self.input_suppressed = settings.input_suppressed.clone();
+        if self.input_suppressed.load(Ordering::Relaxed) {
+            self.ime_composing = false;
+        }
+        self.font_family = next_font_family;
+        self.font_size = settings.font_size;
+        self.cursor_blink = settings.cursor_blink;
+        self.copy_on_select = settings.copy_on_select;
+        self.gpu_acceleration = settings.gpu_acceleration;
+        self.fg_color = settings.fg_color;
+        self.bg_color = settings.bg_color;
+        self.background_image_path = settings.background_image_path.clone();
+        self.background_image_opacity = settings.background_image_opacity;
+        self.blink_started_at = Instant::now();
+        self.surface
+            .set_default_colors(self.fg_color, self.bg_color);
+
+        if font_changed {
+            let (cell_width, cell_height) =
+                measure_cell_dimensions(cx, self.font_family.as_ref(), self.font_size);
+            self.cell_width = cell_width;
+            self.cell_height = cell_height;
+            #[cfg(feature = "ghostty_vt")]
+            self.glyph_cache.lock().clear();
+            self.recreate_gpu_state(cx);
+            if self.last_width > 0.0 && self.last_height > 0.0 {
+                let _ = self.handle_resize(self.last_width, self.last_height);
+            }
+        }
+
+        if font_changed || colors_changed || blink_changed || background_image_changed {
+            self.refresh_snapshot(true);
+            cx.notify();
+        }
+    }
+
+    fn render_background_image(&self) -> Option<AnyElement> {
+        let image_path = self.background_image_path.as_ref()?;
+        if image_path.trim().is_empty() || self.background_image_opacity <= 0.0 {
+            return None;
+        }
+
+        Some(
+            div()
+                .absolute()
+                .top_0()
+                .left_0()
+                .size_full()
+                .overflow_hidden()
+                .child(
+                    img(PathBuf::from(image_path))
+                        .size_full()
+                        .object_fit(ObjectFit::Cover)
+                        .opacity(self.background_image_opacity),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Recalculate terminal grid size from pixel dimensions
@@ -439,22 +766,30 @@ impl TerminalPane {
     }
 
     fn refresh_snapshot(&mut self, force_full: bool) -> bool {
+        self.snapshot.damaged_rows.clear();
         #[cfg(feature = "ghostty_vt")]
-        let (rows, cursor_x, cursor_y, row_updates) = {
+        let (rows, cursor_x, cursor_y, cursor_visible, row_updates) = {
             let mut backend = self.surface.backend.lock();
             let rows = backend.rows;
             let pos = backend.cursor_position();
-            let dirty_rows: Vec<u16> = if force_full {
-                (0..rows).collect()
+            let cursor_visible = backend.cursor_visible();
+            let scroll_delta = if force_full {
+                0
             } else {
+                backend.terminal.take_viewport_scroll_delta()
+            };
+            let dirty_rows = viewport_rows_to_refresh(
+                rows,
+                force_full,
+                scroll_delta,
                 match backend.terminal.take_dirty_viewport_rows(rows) {
-                    Ok(dirty_rows) => dirty_rows,
+                    Ok(dirty_rows) => Some(dirty_rows),
                     Err(err) => {
                         log::debug!("Failed to collect dirty terminal rows: {}", err);
-                        (0..rows).collect()
+                        None
                     }
-                }
-            };
+                },
+            );
             let row_updates = dirty_rows
                 .into_iter()
                 .map(|row| GhosttyRowUpdate {
@@ -467,15 +802,17 @@ impl TerminalPane {
                 rows,
                 pos.0.saturating_sub(1),
                 pos.1.saturating_sub(1),
+                cursor_visible,
                 row_updates,
             )
         };
 
         #[cfg(not(feature = "ghostty_vt"))]
-        let (rows, cursor_x, cursor_y, row_updates) = {
+        let (rows, cursor_x, cursor_y, cursor_visible, row_updates) = {
             let backend = self.surface.backend.lock();
             let rows = backend.rows;
             let (cursor_x, cursor_y) = backend.cursor_position();
+            let cursor_visible = backend.cursor_visible();
             let dirty_rows: Vec<u16> = if force_full {
                 (0..rows).collect()
             } else {
@@ -509,14 +846,19 @@ impl TerminalPane {
                     }
                 })
                 .collect::<Vec<_>>();
-            (rows, cursor_x, cursor_y, row_updates)
+            (rows, cursor_x, cursor_y, cursor_visible, row_updates)
         };
 
-        let mut changed = self.snapshot.cursor_x != cursor_x || self.snapshot.cursor_y != cursor_y;
+        let cursor_changed = self.snapshot.cursor_x != cursor_x
+            || self.snapshot.cursor_y != cursor_y
+            || self.snapshot.cursor_visible != cursor_visible;
+        let mut changed = cursor_changed;
+        let mut content_changed = false;
 
         if self.snapshot.rows.len() != rows as usize {
             self.snapshot.resize(rows);
             changed = true;
+            content_changed = true;
         }
 
         #[cfg(feature = "ghostty_vt")]
@@ -527,7 +869,19 @@ impl TerminalPane {
             }
 
             let cached_row = &mut self.snapshot.rows[index];
-            changed |= apply_ghostty_row_update(cached_row, row_update, self.term_cols, force_full);
+            let row_changed = apply_ghostty_row_update(
+                cached_row,
+                row_update,
+                self.term_cols,
+                self.fg_color,
+                self.bg_color,
+                force_full,
+            );
+            changed |= row_changed;
+            if row_changed {
+                self.snapshot.damaged_rows.push(index as u16);
+                content_changed = true;
+            }
         }
 
         #[cfg(not(feature = "ghostty_vt"))]
@@ -543,10 +897,18 @@ impl TerminalPane {
             cached_row.text = SharedString::from(row_update.text);
             self.row_generations[index] = row_update.generation;
             changed |= row_changed;
+            if row_changed {
+                self.snapshot.damaged_rows.push(index as u16);
+                content_changed = true;
+            }
         }
 
         self.snapshot.cursor_x = cursor_x;
         self.snapshot.cursor_y = cursor_y;
+        self.snapshot.cursor_visible = cursor_visible;
+        if content_changed {
+            self.snapshot.content_revision = self.snapshot.content_revision.wrapping_add(1);
+        }
         changed
     }
 
@@ -578,7 +940,7 @@ impl TerminalPane {
         div()
             .id("terminal-pane")
             .size_full()
-            .bg(rgb(DEFAULT_BG))
+            .bg(rgb(self.bg_color))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
@@ -615,7 +977,7 @@ impl TerminalPane {
         div()
             .id("terminal-pane")
             .size_full()
-            .bg(rgb(DEFAULT_BG))
+            .bg(rgb(self.bg_color))
             .track_focus(&self.focus_handle)
             .flex()
             .items_center()
@@ -643,52 +1005,120 @@ impl TerminalPane {
 
     /// Render the running terminal using canvas paint API for pixel-perfect grid.
     fn render_running(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Detect resize from viewport
-        let vp = window.viewport_size();
-        let vp_w: f32 = vp.width.into();
-        let vp_h: f32 = vp.height.into();
-        let avail_h = (vp_h - WINDOW_CHROME_HEIGHT).max(100.0);
-        if self.handle_resize(vp_w, avail_h) {
+        let (layout_width, layout_height) =
+            terminal_layout_size(window.viewport_size(), self.last_bounds);
+        if self.handle_resize(layout_width, layout_height) {
             self.refresh_snapshot(true);
         }
 
-        let snapshot = self.snapshot.clone();
         let selection = self.selection_range();
+        let mut render_snapshot = self.snapshot.clone();
+        render_snapshot.cursor_visible &= self.cursor_blink_visible();
 
         let ime = self.ime_canvas(cx);
         let config = GridRendererConfig {
             cell_width: self.cell_width,
             cell_height: self.cell_height,
-            font_family: FONT_FAMILY,
-            font_size: FONT_SIZE,
+            font_family: self.font_family.clone(),
+            font_size: self.font_size,
             horizontal_text_padding: HORIZONTAL_TEXT_PADDING,
             term_cols: self.term_cols,
+            fg_color: self.fg_color,
+            bg_color: self.bg_color,
         };
 
-        // Choose rendering path: DX12 GPU (native) or GPUI text shaping (fallback)
+        // Choose rendering path: DX12 native swapchain when possible, otherwise GPUI text shaping.
         #[cfg(feature = "ghostty_vt")]
         let terminal_element: AnyElement = if let Some(ref gpu) = self.gpu_state {
-            gpu_terminal_canvas(snapshot, selection, config, gpu.clone()).into_any_element()
+            let cursor = if render_snapshot.cursor_visible {
+                render_snapshot
+                    .rows
+                    .get(render_snapshot.cursor_y as usize)
+                    .map(|row| {
+                        let (col, width) = resolve_cursor_cell(
+                            render_snapshot.cursor_x,
+                            &row.cells,
+                            self.term_cols,
+                        );
+                        CursorOverlay {
+                            row: render_snapshot.cursor_y,
+                            col,
+                            width: width as f32,
+                        }
+                    })
+            } else {
+                None
+            };
+            #[cfg(target_os = "windows")]
+            if self.background_image_path.is_none()
+                && snapshot_can_present_natively(&render_snapshot)
+            {
+                gpu_terminal_canvas(
+                    render_snapshot.clone(),
+                    cursor,
+                    selection,
+                    config,
+                    gpu.clone(),
+                    self.glyph_cache.clone(),
+                )
+                .into_any_element()
+            } else {
+                gpu.lock().hide_native_presenter();
+                terminal_canvas(
+                    render_snapshot.clone(),
+                    selection,
+                    config,
+                    self.glyph_cache.clone(),
+                )
+                .into_any_element()
+            }
+            #[cfg(not(target_os = "windows"))]
+            {
+                terminal_canvas(
+                    render_snapshot.clone(),
+                    selection,
+                    config,
+                    self.glyph_cache.clone(),
+                )
+                .into_any_element()
+            }
         } else {
-            terminal_canvas(snapshot, selection, config, self.glyph_cache.clone()).into_any_element()
+            terminal_canvas(
+                render_snapshot.clone(),
+                selection,
+                config,
+                self.glyph_cache.clone(),
+            )
+            .into_any_element()
         };
         #[cfg(not(feature = "ghostty_vt"))]
-        let terminal_element: AnyElement =
-            terminal_canvas(snapshot, selection, config, self.glyph_cache.clone()).into_any_element();
+        let terminal_element: AnyElement = terminal_canvas(
+            render_snapshot.clone(),
+            selection,
+            config,
+            self.glyph_cache.clone(),
+        )
+        .into_any_element();
 
-        div()
+        let mut pane = div()
+            .image_cache(retain_all("terminal-background-image-cache"))
             .id("terminal-pane")
             .size_full()
-            .bg(rgb(DEFAULT_BG))
+            .bg(rgb(self.bg_color))
             .overflow_hidden()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_drop(cx.listener(Self::on_external_paths_drop))
-            .child(terminal_element)
-            .child(ime)
+            .on_drop(cx.listener(Self::on_external_paths_drop));
+
+        if let Some(background) = self.render_background_image() {
+            pane = pane.child(background);
+        }
+
+        pane.child(terminal_element).child(ime)
     }
 }
 
@@ -723,9 +1153,8 @@ impl TerminalPane {
     }
 
     fn clear_selection(&mut self) -> bool {
-        let had_selection = self.selection_anchor.is_some()
-            || self.selection_head.is_some()
-            || self.is_selecting;
+        let had_selection =
+            self.selection_anchor.is_some() || self.selection_head.is_some() || self.is_selecting;
         self.selection_anchor = None;
         self.selection_head = None;
         self.is_selecting = false;
@@ -851,10 +1280,7 @@ impl TerminalPane {
     }
 
     fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(text) = cx
-            .read_from_clipboard()
-            .and_then(|item| item.text())
-        else {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return false;
         };
 
@@ -891,8 +1317,9 @@ impl TerminalPane {
     /// be sent (e.g., modifier-only keys).
     fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
         // IME VK_PROCESSKEY: hook already called TranslateMessage.
-        // Text will arrive via EntityInputHandler::replace_text_in_range.
-        if IME_VK_PROCESSKEY.compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+        // Only defer when this event is still part of IME processing.
+        let ime_processkey_pending = IME_VK_PROCESSKEY.swap(false, Ordering::AcqRel);
+        if should_defer_keystroke_to_ime(ks, ime_processkey_pending) {
             return None;
         }
 
@@ -918,7 +1345,11 @@ impl TerminalPane {
             "tab" => Some(b"\t".to_vec()),
             "escape" => Some(vec![0x1b]),
             "space" => {
-                if alt { Some(vec![0x1b, b' ']) } else { Some(vec![b' ']) }
+                if alt {
+                    Some(vec![0x1b, b' '])
+                } else {
+                    Some(vec![b' '])
+                }
             }
             "up" => Some(b"\x1b[A".to_vec()),
             "down" => Some(b"\x1b[B".to_vec()),
@@ -967,7 +1398,8 @@ impl TerminalPane {
 
         let key: &str = event.keystroke.key.as_ref();
         let modifiers = event.keystroke.modifiers;
-        if modifiers.control && !modifiers.alt && key == "c" && self.copy_selection_to_clipboard(cx) {
+        if modifiers.control && !modifiers.alt && key == "c" && self.copy_selection_to_clipboard(cx)
+        {
             cx.stop_propagation();
             return;
         }
@@ -1049,12 +1481,7 @@ impl TerminalPane {
         }
     }
 
-    fn on_mouse_up(
-        &mut self,
-        event: &MouseUpEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
         if !self.is_selecting {
             return;
         }
@@ -1073,7 +1500,52 @@ impl TerminalPane {
                 || was_selecting != self.is_selecting
         };
         if should_notify {
+            if self.copy_on_select && self.selection_range().is_some() {
+                let _ = self.copy_selection_to_clipboard(cx);
+            }
             cx.notify();
+        }
+    }
+
+    fn on_scroll_wheel(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.input_suppressed.load(Ordering::Relaxed) {
+            return;
+        }
+        if !matches!(self.state, TerminalState::Running) {
+            return;
+        }
+
+        let delta_y = match event.delta {
+            ScrollDelta::Lines(delta) => delta.y,
+            ScrollDelta::Pixels(delta) => {
+                let pixels: f32 = delta.y.into();
+                pixels
+            }
+        };
+        if delta_y == 0.0 {
+            return;
+        }
+
+        let line_delta = scroll_lines_from_wheel_delta(
+            event.delta,
+            self.cell_height,
+            &mut self.wheel_scroll_line_remainder,
+        );
+        if line_delta == 0 {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.surface.scroll_viewport(line_delta) {
+            if self.refresh_snapshot(false) {
+                cx.notify();
+            }
+            cx.stop_propagation();
         }
     }
 }
@@ -1090,34 +1562,56 @@ impl Focusable for TerminalPane {
 
 impl EntityInputHandler for TerminalPane {
     fn text_for_range(
-        &mut self, _range: Range<usize>, _adjusted: &mut Option<Range<usize>>,
-        _window: &mut Window, _cx: &mut Context<Self>,
+        &mut self,
+        _range: Range<usize>,
+        _adjusted: &mut Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) -> Option<String> {
         None
     }
 
     fn selected_text_range(
-        &mut self, _ignore: bool, _window: &mut Window, _cx: &mut Context<Self>,
+        &mut self,
+        _ignore: bool,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        Some(UTF16Selection { range: 0..0, reversed: false })
+        Some(UTF16Selection {
+            range: 0..0,
+            reversed: false,
+        })
     }
 
     fn marked_text_range(
-        &self, _window: &mut Window, _cx: &mut Context<Self>,
+        &self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
         None
     }
 
-    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {}
+    fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        self.ime_composing = false;
+    }
 
     /// Committed text from IME → send to PTY
     fn replace_text_in_range(
-        &mut self, _range: Option<Range<usize>>, text: &str,
-        _window: &mut Window, _cx: &mut Context<Self>,
+        &mut self,
+        _range: Option<Range<usize>>,
+        text: &str,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) {
-        if text.is_empty() {
+        if self.input_suppressed.load(Ordering::Relaxed) {
             return;
         }
+        if text.is_empty() {
+            self.ime_composing = false;
+            return;
+        }
+        self.ime_composing = false;
+        IME_VK_PROCESSKEY.store(false, Ordering::Release);
         match self.state {
             TerminalState::Running => {
                 let _ = self.surface.write_input(text.as_bytes());
@@ -1132,14 +1626,30 @@ impl EntityInputHandler for TerminalPane {
     /// Preedit (composing) text from IME — currently not displayed,
     /// but accepting the call prevents gpui from dropping the composition.
     fn replace_and_mark_text_in_range(
-        &mut self, _range: Option<Range<usize>>, _new_text: &str,
-        _new_selected: Option<Range<usize>>, _window: &mut Window, _cx: &mut Context<Self>,
-    ) {}
+        &mut self,
+        _range: Option<Range<usize>>,
+        _new_text: &str,
+        _new_selected: Option<Range<usize>>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) {
+        if self.input_suppressed.load(Ordering::Relaxed) {
+            return;
+        }
+        self.ime_composing = !_new_text.is_empty();
+        IME_VK_PROCESSKEY.store(false, Ordering::Release);
+    }
 
     fn bounds_for_range(
-        &mut self, _range: Range<usize>, element_bounds: Bounds<Pixels>,
-        _window: &mut Window, _cx: &mut Context<Self>,
+        &mut self,
+        _range: Range<usize>,
+        element_bounds: Bounds<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if !self.ime_composing {
+            return None;
+        }
         // Position IME candidate window near cursor
         Some(Bounds::new(
             point(
@@ -1152,7 +1662,10 @@ impl EntityInputHandler for TerminalPane {
     }
 
     fn character_index_for_point(
-        &mut self, _point: Point<Pixels>, _window: &mut Window, _cx: &mut Context<Self>,
+        &mut self,
+        _point: Point<Pixels>,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
     ) -> Option<usize> {
         None
     }
@@ -1174,11 +1687,119 @@ fn slice_text_by_cols(text: &str, start_col: usize, end_col: usize) -> String {
         .collect()
 }
 
+#[cfg(test)]
+mod snapshot_tests {
+    use super::{
+        scroll_lines_from_wheel_delta, should_defer_keystroke_to_ime, terminal_layout_size,
+        viewport_rows_to_refresh,
+    };
+    use gpui::{point, px, size, Bounds, Keystroke, Modifiers, ScrollDelta};
+
+    #[test]
+    fn viewport_rows_to_refresh_returns_dirty_rows_without_scroll() {
+        assert_eq!(
+            viewport_rows_to_refresh(4, false, 0, Some(vec![1, 3])),
+            vec![1, 3]
+        );
+    }
+
+    #[test]
+    fn viewport_rows_to_refresh_forces_full_refresh_when_viewport_scrolled() {
+        assert_eq!(
+            viewport_rows_to_refresh(4, false, 1, Some(vec![3])),
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn viewport_rows_to_refresh_falls_back_to_full_refresh_on_dirty_row_failure() {
+        assert_eq!(viewport_rows_to_refresh(3, false, 0, None), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn should_defer_keystroke_to_ime_only_for_non_text_events() {
+        let process_key = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "ime-process".into(),
+            key_char: None,
+        };
+        let ascii_key = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "a".into(),
+            key_char: Some("a".into()),
+        };
+
+        assert!(should_defer_keystroke_to_ime(&process_key, true));
+        assert!(!should_defer_keystroke_to_ime(&ascii_key, true));
+        assert!(!should_defer_keystroke_to_ime(&ascii_key, false));
+    }
+
+    #[test]
+    fn scroll_lines_from_wheel_delta_preserves_line_steps() {
+        let mut remainder = 0.0;
+        assert_eq!(
+            scroll_lines_from_wheel_delta(
+                ScrollDelta::Lines(point(0.0, 3.0)),
+                20.0,
+                &mut remainder
+            ),
+            -3
+        );
+        assert_eq!(remainder, 0.0);
+    }
+
+    #[test]
+    fn scroll_lines_from_wheel_delta_accumulates_fractional_pixels() {
+        let mut remainder = 0.0;
+        assert_eq!(
+            scroll_lines_from_wheel_delta(
+                ScrollDelta::Pixels(point(px(0.0), px(9.0))),
+                20.0,
+                &mut remainder
+            ),
+            0
+        );
+        assert!(remainder < -0.4 && remainder > -0.5);
+
+        assert_eq!(
+            scroll_lines_from_wheel_delta(
+                ScrollDelta::Pixels(point(px(0.0), px(11.0))),
+                20.0,
+                &mut remainder
+            ),
+            -1
+        );
+        assert_eq!(remainder, 0.0);
+    }
+
+    #[test]
+    fn terminal_layout_size_prefers_last_terminal_bounds() {
+        let (width, height) = terminal_layout_size(
+            size(px(1200.0), px(900.0)),
+            Some(Bounds::new(
+                point(px(10.0), px(20.0)),
+                size(px(840.0), px(640.0)),
+            )),
+        );
+
+        assert_eq!(width, 840.0);
+        assert_eq!(height, 640.0);
+    }
+
+    #[test]
+    fn terminal_layout_size_falls_back_to_viewport_minus_chrome() {
+        let (width, height) = terminal_layout_size(size(px(1200.0), px(900.0)), None);
+
+        assert_eq!(width, 1200.0);
+        assert_eq!(height, 840.0);
+    }
+}
+
 #[cfg(all(test, feature = "ghostty_vt"))]
 mod tests {
     use super::*;
     use crate::terminal::grid_renderer::CachedTerminalRow;
-    use crate::terminal::DEFAULT_FG;
+    use crate::terminal::{DEFAULT_BG, DEFAULT_FG};
 
     fn style_run(start_col: u16, end_col: u16, bg_rgb: u32) -> ghostty_vt::StyleRun {
         ghostty_vt::StyleRun {
@@ -1201,7 +1822,7 @@ mod tests {
     #[::core::prelude::v1::test]
     fn apply_ghostty_row_update_skips_redraw_for_identical_row() {
         let style_runs = vec![style_run(1, 2, DEFAULT_BG)];
-        let cells = grid_cells_from_parts("ab", &style_runs, 4);
+        let cells = grid_cells_from_parts("ab", &style_runs, 4, DEFAULT_FG, DEFAULT_BG);
         let mut row = CachedTerminalRow {
             text: SharedString::from("ab"),
             style_runs: style_runs.clone(),
@@ -1219,6 +1840,8 @@ mod tests {
                 style_runs,
             },
             4,
+            DEFAULT_FG,
+            DEFAULT_BG,
             false,
         );
 
@@ -1230,7 +1853,7 @@ mod tests {
     #[::core::prelude::v1::test]
     fn apply_ghostty_row_update_marks_style_only_changes_as_damage() {
         let previous_style_runs = vec![style_run(2, 2, DEFAULT_BG)];
-        let cells = grid_cells_from_parts("ab", &previous_style_runs, 4);
+        let cells = grid_cells_from_parts("ab", &previous_style_runs, 4, DEFAULT_FG, DEFAULT_BG);
         let mut row = CachedTerminalRow {
             text: SharedString::from("ab"),
             style_runs: previous_style_runs,
@@ -1248,13 +1871,18 @@ mod tests {
                 style_runs: vec![style_run(2, 2, 0x224466)],
             },
             4,
+            DEFAULT_FG,
+            DEFAULT_BG,
             false,
         );
 
         assert!(changed);
-        assert_eq!(row.damage_spans, vec![super::super::grid_renderer::DamageSpan {
-            start_col: 1,
-            end_col: 2,
-        }]);
+        assert_eq!(
+            row.damage_spans,
+            vec![super::super::grid_renderer::DamageSpan {
+                start_col: 1,
+                end_col: 2,
+            }]
+        );
     }
 }

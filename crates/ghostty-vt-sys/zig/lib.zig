@@ -389,6 +389,14 @@ export fn ghostty_vt_terminal_cursor_position(
     return true;
 }
 
+export fn ghostty_vt_terminal_cursor_visible(terminal_ptr: ?*anyopaque) callconv(.c) bool {
+    if (terminal_ptr == null) return false;
+    const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));
+    handle.terminal_mutex.lock();
+    defer handle.terminal_mutex.unlock();
+    return handle.terminal.modes.get(.cursor_visible);
+}
+
 export fn ghostty_vt_terminal_dump_viewport(terminal_ptr: ?*anyopaque) callconv(.c) ghostty_vt_bytes_t {
     if (terminal_ptr == null) return .{ .ptr = null, .len = 0 };
     const handle: *TerminalHandle = @ptrCast(@alignCast(terminal_ptr.?));

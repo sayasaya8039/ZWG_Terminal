@@ -1,21 +1,32 @@
 //! Terminal module — PTY, screen buffer, VT parser, GPUI view
 
+#[cfg(feature = "ghostty_vt")]
+mod gpu_view;
+mod grid_renderer;
+#[cfg(all(feature = "ghostty_vt", target_os = "windows"))]
+mod native_gpu_presenter;
 pub mod pty;
 pub mod surface;
 pub mod view;
 #[cfg(not(feature = "ghostty_vt"))]
 pub mod vt_parser;
-mod grid_renderer;
-#[cfg(feature = "ghostty_vt")]
-mod gpu_view;
 
-use std::sync::{Arc, atomic::AtomicBool};
+use std::sync::{atomic::AtomicBool, Arc};
 
 #[derive(Debug, Clone)]
 pub struct TerminalSettings {
     pub cols: u16,
     pub rows: u16,
     pub scrollback_lines: usize,
+    pub font_family: String,
+    pub font_size: f32,
+    pub cursor_blink: bool,
+    pub copy_on_select: bool,
+    pub gpu_acceleration: bool,
+    pub fg_color: u32,
+    pub bg_color: u32,
+    pub background_image_path: Option<String>,
+    pub background_image_opacity: f32,
     pub input_suppressed: Arc<AtomicBool>,
 }
 
@@ -101,9 +112,9 @@ pub enum CursorShape {
     Bar,
 }
 
-// macOS-style terminal defaults from the Figma reference
+// Terminal defaults
 pub const DEFAULT_FG: u32 = 0xE5E5EA;
-pub const DEFAULT_BG: u32 = 0x1C1C1E;
+pub const DEFAULT_BG: u32 = 0x000000;
 
 /// Screen buffer holding viewport + scrollback
 #[cfg(not(feature = "ghostty_vt"))]
@@ -267,6 +278,39 @@ impl ScreenBuffer {
             self.scrollback.get(abs_idx)
         } else {
             self.viewport.get(abs_idx - self.scrollback.len())
+        }
+    }
+
+    pub fn scroll_viewport(&mut self, delta_lines: i32) {
+        if delta_lines == 0 {
+            return;
+        }
+
+        let max_offset = self.scrollback.len();
+        if delta_lines > 0 {
+            self.scroll_offset = self
+                .scroll_offset
+                .saturating_add(delta_lines as usize)
+                .min(max_offset);
+        } else {
+            self.scroll_offset = self
+                .scroll_offset
+                .saturating_sub(delta_lines.unsigned_abs() as usize);
+        }
+
+        self.generation = self.generation.wrapping_add(1);
+        for rg in &mut self.row_generations {
+            *rg = self.generation;
+        }
+    }
+
+    pub fn clear_history(&mut self) {
+        self.scrollback.clear();
+        self.scroll_offset = 0;
+        self.alternate_screen = None;
+        self.generation = self.generation.wrapping_add(1);
+        for rg in &mut self.row_generations {
+            *rg = self.generation;
         }
     }
 }

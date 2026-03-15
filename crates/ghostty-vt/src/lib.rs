@@ -319,6 +319,10 @@ impl Terminal {
         ok.then_some((col, row))
     }
 
+    pub fn cursor_visible(&self) -> bool {
+        unsafe { ghostty_vt_sys::ghostty_vt_terminal_cursor_visible(self.ptr.as_ptr()) }
+    }
+
     pub fn hyperlink_at(&self, col: u16, row: u16) -> Option<String> {
         let bytes = unsafe {
             ghostty_vt_sys::ghostty_vt_terminal_hyperlink_at(self.ptr.as_ptr(), col, row)
@@ -437,7 +441,7 @@ pub fn classify_content(bytes: &[u8]) -> ContentStats {
 
 // ── DX12 GPU Renderer ──────────────────────────────────────────────────
 
-pub use ghostty_vt_sys::GpuCellData;
+pub use ghostty_vt_sys::{GpuCellData, GpuDirtyRange};
 
 pub struct GpuRenderer {
     ptr: NonNull<c_void>,
@@ -455,7 +459,9 @@ impl GpuRenderer {
 
     /// Resize the offscreen render target. Returns true if resize succeeded.
     pub fn resize(&mut self, width: u32, height: u32) -> bool {
-        unsafe { ghostty_vt_sys::ghostty_gpu_renderer_resize(self.ptr.as_ptr(), width, height) != 0 }
+        unsafe {
+            ghostty_vt_sys::ghostty_gpu_renderer_resize(self.ptr.as_ptr(), width, height) != 0
+        }
     }
 
     /// Render a frame. Returns a slice of RGBA pixels (row-major, with stride padding).
@@ -463,6 +469,7 @@ impl GpuRenderer {
     pub fn render(
         &mut self,
         cells: &[GpuCellData],
+        term_cols: u32,
         cell_width: f32,
         cell_height: f32,
     ) -> Option<&[u8]> {
@@ -471,6 +478,7 @@ impl GpuRenderer {
                 self.ptr.as_ptr(),
                 cells.as_ptr(),
                 cells.len() as u32,
+                term_cols,
                 cell_width,
                 cell_height,
             )
@@ -482,6 +490,78 @@ impl GpuRenderer {
         let height = self.height();
         let len = (stride * height) as usize;
         Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Render only the changed terminal ranges, preserving the previous render target contents.
+    /// The returned slice is valid until the next call to `render`, `render_delta`, or `drop`.
+    pub fn render_delta(
+        &mut self,
+        cells: &[GpuCellData],
+        dirty_ranges: &[GpuDirtyRange],
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> Option<&[u8]> {
+        let ptr = unsafe {
+            ghostty_vt_sys::ghostty_gpu_renderer_render_delta(
+                self.ptr.as_ptr(),
+                cells.as_ptr(),
+                cells.len() as u32,
+                dirty_ranges.as_ptr(),
+                dirty_ranges.len() as u32,
+                term_cols,
+                cell_width,
+                cell_height,
+            )
+        };
+        if ptr.is_null() {
+            return None;
+        }
+        let stride = self.pixel_stride();
+        let height = self.height();
+        let len = (stride * height) as usize;
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    /// Render a frame and leave the GPU render target resident for native presentation.
+    pub fn render_to_texture(
+        &mut self,
+        cells: &[GpuCellData],
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> bool {
+        unsafe {
+            ghostty_vt_sys::ghostty_gpu_renderer_render_to_texture(
+                self.ptr.as_ptr(),
+                cells.as_ptr(),
+                cells.len() as u32,
+                term_cols,
+                cell_width,
+                cell_height,
+            ) != 0
+        }
+    }
+
+    pub fn render_to_surface(
+        &mut self,
+        target_resource: *mut c_void,
+        cells: &[GpuCellData],
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> bool {
+        unsafe {
+            ghostty_vt_sys::ghostty_gpu_renderer_render_to_surface(
+                self.ptr.as_ptr(),
+                target_resource,
+                cells.as_ptr(),
+                cells.len() as u32,
+                term_cols,
+                cell_width,
+                cell_height,
+            ) != 0
+        }
     }
 
     /// Padded row stride in bytes (aligned to 256 for DX12 readback).
@@ -496,6 +576,68 @@ impl GpuRenderer {
     pub fn height(&self) -> u32 {
         unsafe { ghostty_vt_sys::ghostty_gpu_renderer_height(self.ptr.as_ptr() as *const _) }
     }
+
+    pub fn device_ptr(&self) -> *mut c_void {
+        unsafe { ghostty_vt_sys::ghostty_gpu_renderer_device_ptr(self.ptr.as_ptr() as *const _) }
+    }
+
+    pub fn command_queue_ptr(&self) -> *mut c_void {
+        unsafe {
+            ghostty_vt_sys::ghostty_gpu_renderer_command_queue_ptr(self.ptr.as_ptr() as *const _)
+        }
+    }
+
+    pub fn render_target_ptr(&self) -> *mut c_void {
+        unsafe {
+            ghostty_vt_sys::ghostty_gpu_renderer_render_target_ptr(self.ptr.as_ptr() as *const _)
+        }
+    }
+}
+
+/// Retrieve the last GPU renderer init error diagnostic.
+/// Returns `(stage, hresult)` where stage=0 means no error.
+pub fn gpu_renderer_last_init_error() -> (u32, i32) {
+    let mut stage: u32 = 0;
+    let mut hr: i32 = 0;
+    unsafe {
+        ghostty_vt_sys::ghostty_gpu_renderer_last_init_error(&mut stage, &mut hr);
+    }
+    (stage, hr)
+}
+
+/// Human-readable description for a GPU init error stage code.
+pub fn gpu_init_stage_name(stage: u32) -> &'static str {
+    match stage {
+        0 => "none",
+        1 => "alloc_struct",
+        2 => "alloc_glyph_map",
+        3 => "alloc_atlas_bitmap",
+        4 => "gdi_create_dc",
+        5 => "gdi_create_font",
+        6 => "dwrite_create_factory",
+        7 => "dwrite_get_gdi_interop",
+        8 => "dwrite_create_font_face",
+        9 => "dwrite_font_metrics",
+        10 => "dx12_create_device_hw",
+        11 => "dx12_create_device_warp",
+        12 => "dx12_command_queue",
+        13 => "dx12_command_allocator",
+        14 => "dx12_descriptor_heap_rtv",
+        15 => "dx12_descriptor_heap_srv",
+        16 => "dx12_fence",
+        17 => "dx12_fence_event",
+        18 => "dx12_pipeline",
+        19 => "dx12_render_target",
+        20 => "dx12_cell_buffers",
+        21 => "dx12_atlas_texture",
+        22 => "dx12_command_list",
+        23 => "dx12_shader_compile_vs",
+        24 => "dx12_shader_compile_ps",
+        25 => "dx12_root_sig_serialize",
+        26 => "dx12_root_sig_create",
+        27 => "dx12_pso_create",
+        _ => "unknown",
+    }
 }
 
 impl Drop for GpuRenderer {
@@ -506,7 +648,7 @@ impl Drop for GpuRenderer {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_content, ContentKind, Terminal};
+    use super::{ContentKind, Terminal, classify_content};
 
     #[test]
     fn constructors_create_terminal() {
@@ -522,10 +664,16 @@ mod tests {
     fn feed_renders_ascii_and_utf8_text() {
         let mut terminal = Terminal::new(16, 4).expect("constructor should succeed");
 
-        terminal.feed("hello".as_bytes()).expect("ascii feed should succeed");
-        terminal.feed(" 世界".as_bytes()).expect("utf8 feed should succeed");
+        terminal
+            .feed("hello".as_bytes())
+            .expect("ascii feed should succeed");
+        terminal
+            .feed(" 世界".as_bytes())
+            .expect("utf8 feed should succeed");
 
-        let row = terminal.dump_viewport_row(0).expect("row dump should succeed");
+        let row = terminal
+            .dump_viewport_row(0)
+            .expect("row dump should succeed");
         assert!(row.contains("hello 世界"));
     }
 
@@ -537,10 +685,31 @@ mod tests {
             .feed(b"abc\x1b[2;5HXY")
             .expect("feed with escape sequence should succeed");
 
-        let first_row = terminal.dump_viewport_row(0).expect("first row dump should succeed");
-        let second_row = terminal.dump_viewport_row(1).expect("second row dump should succeed");
+        let first_row = terminal
+            .dump_viewport_row(0)
+            .expect("first row dump should succeed");
+        let second_row = terminal
+            .dump_viewport_row(1)
+            .expect("second row dump should succeed");
         assert!(first_row.contains("abc"));
         assert!(second_row.contains("XY"));
+    }
+
+    #[test]
+    fn cursor_visibility_tracks_terminal_mode() {
+        let mut terminal = Terminal::new(16, 4).expect("constructor should succeed");
+
+        assert!(terminal.cursor_visible());
+
+        terminal
+            .feed(b"\x1b[?25l")
+            .expect("hiding cursor should succeed");
+        assert!(!terminal.cursor_visible());
+
+        terminal
+            .feed(b"\x1b[?25h")
+            .expect("showing cursor should succeed");
+        assert!(terminal.cursor_visible());
     }
 
     #[test]
@@ -561,6 +730,54 @@ mod tests {
     fn classify_content_keeps_json_strings_from_becoming_markdown() {
         let stats = classify_content(b"{ \"body\": \"# not a heading\\n- not a list\" }");
         assert_eq!(stats.kind, ContentKind::Json);
+        assert_eq!(stats.markdown_marker_count, 0);
+    }
+
+    #[test]
+    fn classify_content_detects_large_json_streams_across_simd_chunks() {
+        let payload = format!(
+            r#"{{"type":"message","items":[{{"id":1,"text":"{}","ok":true}}],"meta":{{"source":"cli","format":"json"}}}}"#,
+            "x".repeat(96)
+        );
+        let stats = classify_content(payload.as_bytes());
+        assert_eq!(stats.kind, ContentKind::Json);
+        assert!(stats.json_structural_count >= 6);
+    }
+
+    #[test]
+    fn classify_content_handles_escaped_quotes_across_chunk_boundaries() {
+        let payload = format!(
+            "{{\"body\":\"{}\\\\\\\"# not markdown\\\\n- still string\\\\\\\"\",\"done\":false,\"items\":[1,2,3]}}",
+            "a".repeat(48)
+        );
+        let stats = classify_content(payload.as_bytes());
+        assert_eq!(stats.kind, ContentKind::Json);
+        assert_eq!(stats.markdown_marker_count, 0);
+    }
+
+    #[test]
+    fn classify_content_handles_even_backslashes_before_closing_quote_across_chunks() {
+        let mut payload = String::from("{\"body\":\"");
+        while payload.len() % 32 != 28 {
+            payload.push('b');
+        }
+        payload.push('\\');
+        payload.push('\\');
+        payload.push('\\');
+        payload.push('\\');
+        payload.push('"');
+        payload.push_str(",\"done\":false,\"items\":[1,2,3]}");
+
+        let stats = classify_content(payload.as_bytes());
+        assert_eq!(stats.kind, ContentKind::Json);
+        assert!(stats.json_structural_count >= 6);
+        assert_eq!(stats.markdown_marker_count, 0);
+    }
+
+    #[test]
+    fn classify_content_does_not_treat_quoted_lines_as_markdown() {
+        let stats = classify_content(br#""quoted prelude" - not markdown"#);
+        assert_eq!(stats.kind, ContentKind::PlainText);
         assert_eq!(stats.markdown_marker_count, 0);
     }
 

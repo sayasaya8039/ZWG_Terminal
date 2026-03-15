@@ -8,7 +8,7 @@ members = [
 exclude = ["conpty_test"]
 
 [workspace.package]
-version = "1.0.1"
+version = "1.1.0"
 edition = "2024"
 authors = ["ZWG Terminal contributors"]
 license = "MIT"
@@ -33,6 +33,7 @@ unicode-width = "0.2"
 version = "0.61"
 features = [
     "Win32_System_Console",
+    "Win32_System_Com",
     "Win32_System_Threading",
     "Win32_Security",
     "Win32_Foundation",
@@ -41,14 +42,17 @@ features = [
     "Win32_System_IO",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_Direct3D12",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
     "Win32_UI_Shell",
 ]
 
 [profile.release]
-opt-level = 3
-lto = "fat"
-codegen-units = 1
-strip = "symbols"
+opt-level = 2
+lto = false
+codegen-units = 16
+strip = true
 panic = "abort"
 overflow-checks = false
 debug = false

@@ -20,6 +20,15 @@ pub struct ghostty_vt_content_stats_t {
     pub markdown_marker_count: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuDirtyRange {
+    pub start_instance: u32,
+    pub instance_count: u32,
+    pub row_start: u32,
+    pub row_count: u32,
+}
+
 unsafe extern "C" {
     pub fn ghostty_vt_terminal_new(cols: u16, rows: u16) -> *mut core::ffi::c_void;
     pub fn ghostty_vt_terminal_new_with_scrollback(
@@ -69,6 +78,7 @@ unsafe extern "C" {
         col_out: *mut u16,
         row_out: *mut u16,
     ) -> bool;
+    pub fn ghostty_vt_terminal_cursor_visible(terminal: *mut core::ffi::c_void) -> bool;
 
     pub fn ghostty_vt_terminal_dump_viewport(
         terminal: *mut core::ffi::c_void,
@@ -111,9 +121,7 @@ unsafe extern "C" {
     pub fn ghostty_vt_bytes_free(bytes: ghostty_vt_bytes_t);
 
     // Async I/O
-    pub fn ghostty_vt_terminal_start_async(
-        terminal: *mut core::ffi::c_void,
-    ) -> core::ffi::c_int;
+    pub fn ghostty_vt_terminal_start_async(terminal: *mut core::ffi::c_void) -> core::ffi::c_int;
     pub fn ghostty_vt_terminal_stop_async(terminal: *mut core::ffi::c_void);
     pub fn ghostty_vt_terminal_feed_async(
         terminal: *mut core::ffi::c_void,
@@ -122,10 +130,7 @@ unsafe extern "C" {
     ) -> usize;
     pub fn ghostty_vt_terminal_has_new_data(terminal: *mut core::ffi::c_void) -> bool;
     pub fn ghostty_vt_terminal_content_kind(terminal: *const core::ffi::c_void) -> u8;
-    pub fn ghostty_simd_detect_content(
-        bytes: *const u8,
-        len: usize,
-    ) -> ghostty_vt_content_stats_t;
+    pub fn ghostty_simd_detect_content(bytes: *const u8, len: usize) -> ghostty_vt_content_stats_t;
 
     // DX12 GPU renderer
     pub fn ghostty_gpu_renderer_new(
@@ -143,12 +148,53 @@ unsafe extern "C" {
         renderer: *mut core::ffi::c_void,
         cells: *const GpuCellData,
         cell_count: u32,
+        term_cols: u32,
         cell_width: f32,
         cell_height: f32,
     ) -> *const u8;
+    pub fn ghostty_gpu_renderer_render_delta(
+        renderer: *mut core::ffi::c_void,
+        cells: *const GpuCellData,
+        cell_count: u32,
+        dirty_ranges: *const GpuDirtyRange,
+        dirty_range_count: u32,
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> *const u8;
+    pub fn ghostty_gpu_renderer_render_to_texture(
+        renderer: *mut core::ffi::c_void,
+        cells: *const GpuCellData,
+        cell_count: u32,
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> u8;
+    pub fn ghostty_gpu_renderer_render_to_surface(
+        renderer: *mut core::ffi::c_void,
+        target_resource: *mut core::ffi::c_void,
+        cells: *const GpuCellData,
+        cell_count: u32,
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> u8;
     pub fn ghostty_gpu_renderer_pixel_stride(renderer: *const core::ffi::c_void) -> u32;
     pub fn ghostty_gpu_renderer_width(renderer: *const core::ffi::c_void) -> u32;
     pub fn ghostty_gpu_renderer_height(renderer: *const core::ffi::c_void) -> u32;
+    pub fn ghostty_gpu_renderer_device_ptr(
+        renderer: *const core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
+    pub fn ghostty_gpu_renderer_command_queue_ptr(
+        renderer: *const core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
+    pub fn ghostty_gpu_renderer_render_target_ptr(
+        renderer: *const core::ffi::c_void,
+    ) -> *mut core::ffi::c_void;
+
+    /// Retrieve the last GPU renderer init error (stage code + HRESULT).
+    /// stage=0 means no error. See GpuInitStage enum in gpu_renderer.zig.
+    pub fn ghostty_gpu_renderer_last_init_error(stage_out: *mut u32, hr_out: *mut i32);
 }
 
 /// Cell data passed to the GPU renderer (20 bytes, C-compatible).

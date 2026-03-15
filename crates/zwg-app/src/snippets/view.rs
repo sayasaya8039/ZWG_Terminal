@@ -771,6 +771,16 @@ mod tests {
     }
 
     #[test]
+    fn activate_store_index_dispatches_clicked_item() {
+        let store =
+            SnippetStore::from_items(vec![Snippet::new("One", "A"), Snippet::new("Two", "B")]);
+        let mut palette = SnippetPalette::new(store);
+
+        assert_eq!(palette.activate_store_index(1), Some("B".to_string()));
+        assert_eq!(palette.selected_item().map(|item| item.title.as_str()), Some("Two"));
+    }
+
+    #[test]
     fn toggling_favorite_updates_selected_item() {
         let store = SnippetStore::from_items(vec![Snippet::new("One", "A")]);
         let mut palette = SnippetPalette::new(store);

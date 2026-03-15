@@ -30,21 +30,21 @@
 | ステップ | コマンド | 必須 |
 |----------|---------|------|
 | プロセス停止 | `taskkill.exe /F /IM ghostty.exe 2>/dev/null \|\| true` | 必須（ビルド前） |
-| Release ビルド | `cargo.exe build --release` | 必須 |
+| Release ビルド | `cargo zigbuild --release -p zwg-app` | 必須 |
 | ビルド成功確認 | エラー0であること | 必須 |
 | Git コミット+プッシュ | `git add → commit → push` | 必須 |
 
 ### 実行フロー（スキップ禁止）
 
 ```
-taskkill ghostty.exe → cargo.exe build --release → エラー0確認 → git add/commit/push → 完了報告
+taskkill ghostty.exe → cargo zigbuild --release -p zwg-app → エラー0確認 → git add/commit/push → 完了報告
 ```
 
 - **ビルド前に必ず `taskkill.exe /F /IM ghostty.exe` を実行**（Windowsがexeをロックするため）
 - プロセスが存在しない場合のエラーは無視する（`2>/dev/null || true`）
 - ビルドエラーが出た場合: 即座に修正して再ビルド（ユーザーに確認しない）
 - エージェントに委任する場合も、エージェントのプロンプトにこのビルドルールを含めること
-- `cargo build`（debugビルド）ではなく `cargo.exe build --release` を使うこと
+- `cargo build`（debugビルド）ではなく `cargo zigbuild --release -p zwg-app` を使うこと
 
 ---
 

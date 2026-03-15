@@ -72,6 +72,7 @@ pub fn build(b: *std.Build) void {
     lib.linkSystemLibrary("d3d12");
     lib.linkSystemLibrary("dxgi");
     lib.linkSystemLibrary("d3dcompiler");
+    lib.linkSystemLibrary("dwrite");
     lib.linkSystemLibrary("gdi32");
 
     // terminal_options

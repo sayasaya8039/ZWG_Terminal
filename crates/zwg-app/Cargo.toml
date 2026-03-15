@@ -30,6 +30,7 @@ raw-window-handle = "0.6"
 image = "0.25"
 encoding_rs = "0.8"
 rfd = "0.15"
+ureq = { version = "2.12", features = ["json"] }
 ghostty-vt = { path = "../ghostty-vt", optional = true }
 
 [build-dependencies]

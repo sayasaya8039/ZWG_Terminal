@@ -5,9 +5,13 @@ use std::path::PathBuf;
 #[cfg(windows)]
 use std::process::Command;
 
-pub const CONFIG_VERSION: u32 = 2;
+pub const CONFIG_VERSION: u32 = 6;
 const DEFAULT_WINDOW_COLS: u16 = 120;
 const DEFAULT_WINDOW_ROWS: u16 = 30;
+pub const DEFAULT_UI_FONT_FAMILY: &str = "Segoe UI";
+pub const DEFAULT_TERMINAL_FONT_FAMILY: &str = "Consolas";
+pub const SUPPORTED_TERMINAL_FONT_FAMILIES: [&str; 3] =
+    ["Consolas", "Lucida Console", "Courier New"];
 #[cfg(windows)]
 const RUN_KEY_PATH: &str = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
 #[cfg(windows)]
@@ -118,10 +122,53 @@ pub struct FontConfig {
 impl Default for FontConfig {
     fn default() -> Self {
         Self {
-            family: "Cascadia Code".into(),
+            family: DEFAULT_TERMINAL_FONT_FAMILY.into(),
             size: 14.0,
             line_height: 1.3,
         }
+    }
+}
+
+/// Keyboard shortcut configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct KeyboardConfig {
+    pub new_tab: String,
+    pub close_tab: String,
+    pub split_right: String,
+    pub split_down: String,
+    pub close_pane: String,
+    pub focus_next_pane: String,
+    pub focus_prev_pane: String,
+    pub open_settings: String,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self {
+            new_tab: "Ctrl+Shift+T".into(),
+            close_tab: "Ctrl+Shift+W".into(),
+            split_right: "Ctrl+Shift+D".into(),
+            split_down: "Ctrl+Shift+E".into(),
+            close_pane: "Ctrl+Shift+X".into(),
+            focus_next_pane: "Ctrl+Tab".into(),
+            focus_prev_pane: "Ctrl+Shift+Tab".into(),
+            open_settings: "Ctrl+Comma".into(),
+        }
+    }
+}
+
+impl KeyboardConfig {
+    fn sanitized(mut self) -> Self {
+        self.new_tab = self.new_tab.trim().to_string();
+        self.close_tab = self.close_tab.trim().to_string();
+        self.split_right = self.split_right.trim().to_string();
+        self.split_down = self.split_down.trim().to_string();
+        self.close_pane = self.close_pane.trim().to_string();
+        self.focus_next_pane = self.focus_next_pane.trim().to_string();
+        self.focus_prev_pane = self.focus_prev_pane.trim().to_string();
+        self.open_settings = self.open_settings.trim().to_string();
+        self
     }
 }
 
@@ -132,13 +179,26 @@ pub struct AppConfig {
     pub version: u32,
     pub shell: String,
     pub font: FontConfig,
+    pub keyboard: KeyboardConfig,
     pub theme: String, // theme name
+    pub background_image_path: Option<String>,
+    pub background_image_opacity: u8,
     pub scrollback_lines: usize,
     pub cursor_blink: bool,
     pub tab_bar_visible: bool,
     pub status_bar_visible: bool,
     pub launch_on_login: bool,
     pub confirm_on_close: bool,
+    pub notification_bell: bool,
+    pub visual_bell: bool,
+    pub process_completion_alert: bool,
+    pub copy_on_select: bool,
+    pub clear_history_on_exit: bool,
+    pub ai_suggestions_enabled: bool,
+    pub ai_provider: String,
+    pub ai_api_key: String,
+    pub ai_model: String,
+    pub gpu_acceleration: bool,
     pub default_window_cols: u16,
     pub default_window_rows: u16,
 }
@@ -149,13 +209,26 @@ impl Default for AppConfig {
             version: CONFIG_VERSION,
             shell: crate::shell::detect_default_shell(),
             font: FontConfig::default(),
+            keyboard: KeyboardConfig::default(),
             theme: "Catppuccin Mocha".into(),
+            background_image_path: None,
+            background_image_opacity: 35,
             scrollback_lines: 10_000,
             cursor_blink: true,
             tab_bar_visible: true,
             status_bar_visible: true,
             launch_on_login: false,
             confirm_on_close: true,
+            notification_bell: false,
+            visual_bell: true,
+            process_completion_alert: true,
+            copy_on_select: false,
+            clear_history_on_exit: false,
+            ai_suggestions_enabled: true,
+            ai_provider: "anthropic".into(),
+            ai_api_key: String::new(),
+            ai_model: String::new(),
+            gpu_acceleration: false,
             default_window_cols: DEFAULT_WINDOW_COLS,
             default_window_rows: DEFAULT_WINDOW_ROWS,
         }
@@ -196,11 +269,21 @@ impl AppConfig {
             log::warn!("Empty shell in config, using default");
             self.shell = crate::shell::detect_default_shell();
         }
+        self.background_image_path = self
+            .background_image_path
+            .map(|path| path.trim().to_string())
+            .filter(|path| !path.is_empty());
+        self.keyboard = self.keyboard.sanitized();
+        self.font.family = sanitize_terminal_font_family(&self.font.family);
+        self.background_image_opacity = self.background_image_opacity.clamp(0, 100);
         self.scrollback_lines = self.scrollback_lines.clamp(100, 100_000);
         self.font.size = self.font.size.clamp(6.0, 72.0);
         self.font.line_height = self.font.line_height.clamp(1.0, 3.0);
         self.default_window_cols = self.default_window_cols.clamp(60, 240);
         self.default_window_rows = self.default_window_rows.clamp(18, 120);
+        self.ai_provider = crate::ai::sanitize_ai_provider_config_value(&self.ai_provider);
+        self.ai_api_key = self.ai_api_key.trim().to_string();
+        self.ai_model = self.ai_model.trim().to_string();
         self
     }
 
@@ -241,6 +324,16 @@ impl AppConfig {
     pub fn available_themes() -> Vec<&'static str> {
         vec!["Catppuccin Mocha", "Catppuccin Latte", "Tokyo Night"]
     }
+}
+
+pub fn sanitize_terminal_font_family(family: &str) -> String {
+    let trimmed = family.trim();
+    SUPPORTED_TERMINAL_FONT_FAMILIES
+        .iter()
+        .copied()
+        .find(|supported| supported.eq_ignore_ascii_case(trimmed))
+        .unwrap_or(DEFAULT_TERMINAL_FONT_FAMILY)
+        .to_string()
 }
 
 pub fn launch_on_login_enabled() -> std::io::Result<bool> {
@@ -380,13 +473,26 @@ mod tests {
             version: CONFIG_VERSION,
             shell: "cmd.exe".into(),
             font: FontConfig::default(),
+            keyboard: KeyboardConfig::default(),
             theme: "Catppuccin Mocha".into(),
+            background_image_path: None,
+            background_image_opacity: 35,
             scrollback_lines: 10_000,
             cursor_blink: true,
             tab_bar_visible: true,
             status_bar_visible: true,
             launch_on_login: false,
             confirm_on_close: true,
+            notification_bell: false,
+            visual_bell: true,
+            process_completion_alert: true,
+            copy_on_select: false,
+            clear_history_on_exit: false,
+            ai_suggestions_enabled: true,
+            ai_provider: "anthropic".into(),
+            ai_api_key: String::new(),
+            ai_model: String::new(),
+            gpu_acceleration: false,
             default_window_cols: DEFAULT_WINDOW_COLS,
             default_window_rows: DEFAULT_WINDOW_ROWS,
         }
@@ -402,13 +508,30 @@ mod tests {
                 size: 16.0,
                 line_height: 1.5,
             },
+            keyboard: KeyboardConfig {
+                new_tab: "Ctrl+Alt+T".into(),
+                close_tab: "Ctrl+Alt+W".into(),
+                ..KeyboardConfig::default()
+            },
             theme: "Tokyo Night".into(),
+            background_image_path: Some("C:/wallpaper.png".into()),
+            background_image_opacity: 48,
             scrollback_lines: 5000,
             cursor_blink: false,
             tab_bar_visible: true,
             status_bar_visible: false,
             launch_on_login: true,
             confirm_on_close: false,
+            notification_bell: true,
+            visual_bell: false,
+            process_completion_alert: false,
+            copy_on_select: true,
+            clear_history_on_exit: true,
+            ai_suggestions_enabled: false,
+            ai_provider: "openai".into(),
+            ai_api_key: "test-key".into(),
+            ai_model: "gpt-4.1-mini".into(),
+            gpu_acceleration: true,
             default_window_cols: 132,
             default_window_rows: 40,
         };
@@ -418,12 +541,29 @@ mod tests {
         assert_eq!(restored.shell, "cmd.exe");
         assert_eq!(restored.font.family, "Consolas");
         assert_eq!(restored.font.size, 16.0);
+        assert_eq!(restored.keyboard.new_tab, "Ctrl+Alt+T");
+        assert_eq!(restored.keyboard.close_tab, "Ctrl+Alt+W");
         assert_eq!(restored.theme, "Tokyo Night");
+        assert_eq!(
+            restored.background_image_path.as_deref(),
+            Some("C:/wallpaper.png")
+        );
+        assert_eq!(restored.background_image_opacity, 48);
         assert_eq!(restored.scrollback_lines, 5000);
         assert!(!restored.cursor_blink);
         assert!(!restored.status_bar_visible);
         assert!(restored.launch_on_login);
         assert!(!restored.confirm_on_close);
+        assert!(restored.notification_bell);
+        assert!(!restored.visual_bell);
+        assert!(!restored.process_completion_alert);
+        assert!(restored.copy_on_select);
+        assert!(restored.clear_history_on_exit);
+        assert!(!restored.ai_suggestions_enabled);
+        assert_eq!(restored.ai_provider, "openai");
+        assert_eq!(restored.ai_api_key, "test-key");
+        assert_eq!(restored.ai_model, "gpt-4.1-mini");
+        assert!(restored.gpu_acceleration);
         assert_eq!(restored.default_window_cols, 132);
         assert_eq!(restored.default_window_rows, 40);
     }
@@ -443,6 +583,19 @@ mod tests {
         };
         let v2 = config2.validated();
         assert_eq!(v2.scrollback_lines, 100_000);
+    }
+
+    #[test]
+    fn config_validated_normalizes_background_image_settings() {
+        let mut config = make_test_config();
+        config.background_image_path = Some("   ".into());
+        config.background_image_opacity = 255;
+        config.keyboard.open_settings = "  Ctrl+Comma  ".into();
+
+        let validated = config.validated();
+        assert_eq!(validated.background_image_path, None);
+        assert_eq!(validated.background_image_opacity, 100);
+        assert_eq!(validated.keyboard.open_settings, "Ctrl+Comma");
     }
 
     #[test]
@@ -543,8 +696,53 @@ mod tests {
     #[test]
     fn font_config_default_values() {
         let f = FontConfig::default();
-        assert_eq!(f.family, "Cascadia Code");
+        assert_eq!(f.family, DEFAULT_TERMINAL_FONT_FAMILY);
         assert_eq!(f.size, 14.0);
         assert_eq!(f.line_height, 1.3);
+    }
+
+    #[test]
+    fn config_validated_normalizes_unknown_font_family_to_windows_default() {
+        let mut config = make_test_config();
+        config.font.family = "JetBrains Mono".into();
+
+        let validated = config.validated();
+        assert_eq!(validated.font.family, DEFAULT_TERMINAL_FONT_FAMILY);
+    }
+
+    #[test]
+    fn config_validated_normalizes_ai_provider_and_trims_ai_fields() {
+        let mut config = make_test_config();
+        config.ai_provider = "Google".into();
+        config.ai_api_key = "  test-key  ".into();
+        config.ai_model = "  gemini-2.0-flash  ".into();
+
+        let validated = config.validated();
+        assert_eq!(validated.ai_provider, "gemini");
+        assert_eq!(validated.ai_api_key, "test-key");
+        assert_eq!(validated.ai_model, "gemini-2.0-flash");
+    }
+
+    #[test]
+    fn supported_terminal_font_families_only_include_windows_defaults() {
+        assert_eq!(
+            SUPPORTED_TERMINAL_FONT_FAMILIES,
+            ["Consolas", "Lucida Console", "Courier New"]
+        );
+    }
+
+    #[test]
+    fn config_default_notification_settings_match_ui_defaults() {
+        let config = AppConfig::default();
+        assert!(!config.notification_bell);
+        assert!(config.visual_bell);
+        assert!(config.process_completion_alert);
+        assert!(!config.copy_on_select);
+        assert!(!config.clear_history_on_exit);
+        assert!(config.ai_suggestions_enabled);
+        assert_eq!(config.ai_provider, "anthropic");
+        assert!(config.ai_api_key.is_empty());
+        assert!(config.ai_model.is_empty());
+        assert!(!config.gpu_acceleration);
     }
 }

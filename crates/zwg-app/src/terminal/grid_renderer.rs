@@ -5,6 +5,7 @@ use gpui::*;
 use parking_lot::Mutex;
 use unicode_width::UnicodeWidthChar;
 
+#[cfg(test)]
 use super::{DEFAULT_BG, DEFAULT_FG};
 
 /// Cross-frame glyph layout cache type.
@@ -52,6 +53,9 @@ pub(super) struct TerminalSnapshot {
     pub rows: Vec<CachedTerminalRow>,
     pub cursor_x: u16,
     pub cursor_y: u16,
+    pub cursor_visible: bool,
+    pub content_revision: u64,
+    pub damaged_rows: Vec<u16>,
 }
 
 impl TerminalSnapshot {
@@ -60,22 +64,28 @@ impl TerminalSnapshot {
             rows: vec![CachedTerminalRow::default(); rows as usize],
             cursor_x: 0,
             cursor_y: 0,
+            cursor_visible: true,
+            content_revision: 0,
+            damaged_rows: Vec::new(),
         }
     }
 
     pub fn resize(&mut self, rows: u16) {
         self.rows
             .resize(rows as usize, CachedTerminalRow::default());
+        self.damaged_rows.clear();
     }
 }
 
 pub(super) struct GridRendererConfig {
     pub cell_width: f32,
     pub cell_height: f32,
-    pub font_family: &'static str,
+    pub font_family: SharedString,
     pub font_size: f32,
     pub horizontal_text_padding: f32,
     pub term_cols: u16,
+    pub fg_color: u32,
+    pub bg_color: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -182,9 +192,62 @@ pub(crate) fn is_geometric_block_char(ch: char) -> bool {
     )
 }
 
+pub(crate) fn is_box_drawing_char(ch: char) -> bool {
+    matches!(
+        ch,
+        '\u{2500}'
+            | '\u{2501}'
+            | '\u{2502}'
+            | '\u{2503}'
+            | '\u{250C}'
+            | '\u{2510}'
+            | '\u{2514}'
+            | '\u{2518}'
+            | '\u{251C}'
+            | '\u{2524}'
+            | '\u{252C}'
+            | '\u{2534}'
+            | '\u{253C}'
+            | '\u{250F}'
+            | '\u{2513}'
+            | '\u{2517}'
+            | '\u{251B}'
+            | '\u{2523}'
+            | '\u{252B}'
+            | '\u{2533}'
+            | '\u{253B}'
+            | '\u{254B}'
+            | '\u{2550}'
+            | '\u{2551}'
+            | '\u{2554}'
+            | '\u{2557}'
+            | '\u{255A}'
+            | '\u{255D}'
+            | '\u{2560}'
+            | '\u{2563}'
+            | '\u{2566}'
+            | '\u{2569}'
+            | '\u{256C}'
+            | '\u{256D}'
+            | '\u{256E}'
+            | '\u{2570}'
+            | '\u{256F}'
+    )
+}
+
+pub(crate) fn is_geometry_char(ch: char) -> bool {
+    is_geometric_block_char(ch) || is_box_drawing_char(ch)
+}
+
 pub(crate) fn sanitize_text_for_shaping(text: &str) -> String {
     text.chars()
-        .map(|ch| if is_geometric_block_char(ch) { BRAILLE_BLANK } else { ch })
+        .map(|ch| {
+            if is_geometric_block_char(ch) {
+                BRAILLE_BLANK
+            } else {
+                ch
+            }
+        })
         .collect()
 }
 
@@ -197,6 +260,22 @@ fn looks_like_emoji(glyph: &str) -> bool {
                 | '\u{FE0F}'
         )
     })
+}
+
+pub(crate) fn glyph_requires_gpui_overlay(glyph: &str) -> bool {
+    if glyph.is_empty() {
+        return false;
+    }
+    if looks_like_emoji(glyph) {
+        return true;
+    }
+
+    let mut chars = glyph.chars();
+    match (chars.next(), chars.next()) {
+        (Some(ch), None) => ch as u32 > 0xFFFF,
+        (_, Some(_)) => true,
+        _ => false,
+    }
 }
 
 pub(crate) fn glyph_key_from_cell(cell: &GridCell) -> GlyphKey {
@@ -215,7 +294,8 @@ pub(crate) fn glyph_key_from_cell(cell: &GridCell) -> GlyphKey {
 }
 
 pub(crate) fn glyph_instances_from_cells(cells: &[GridCell], row: u16) -> Vec<GlyphInstance> {
-    cells.iter()
+    cells
+        .iter()
         .map(|cell| GlyphInstance {
             row,
             col: cell.col,
@@ -235,14 +315,20 @@ fn spans_overlap(start: u16, end: u16, span: DamageSpan) -> bool {
 fn cell_overlaps_damage(cell: &GridCell, spans: &[DamageSpan]) -> bool {
     let start = cell.col;
     let end = cell.col.saturating_add(cell.width as u16);
-    spans.iter().copied().any(|span| spans_overlap(start, end, span))
+    spans
+        .iter()
+        .copied()
+        .any(|span| spans_overlap(start, end, span))
 }
 
 #[cfg(feature = "ghostty_vt")]
 fn instance_overlaps_damage(instance: &GlyphInstance, spans: &[DamageSpan]) -> bool {
     let start = instance.col;
     let end = instance.col.saturating_add(instance.key.width as u16);
-    spans.iter().copied().any(|span| spans_overlap(start, end, span))
+    spans
+        .iter()
+        .copied()
+        .any(|span| spans_overlap(start, end, span))
 }
 
 #[cfg(feature = "ghostty_vt")]
@@ -266,7 +352,10 @@ struct StyleDamageSignature {
 }
 
 #[cfg(feature = "ghostty_vt")]
-fn column_damage_signatures(cells: &[GridCell], max_cols: u16) -> Vec<Option<ColumnDamageSignature>> {
+fn column_damage_signatures(
+    cells: &[GridCell],
+    max_cols: u16,
+) -> Vec<Option<ColumnDamageSignature>> {
     let mut columns = vec![None; max_cols as usize];
     for cell in cells {
         let signature = ColumnDamageSignature {
@@ -293,10 +382,13 @@ fn column_damage_signatures(cells: &[GridCell], max_cols: u16) -> Vec<Option<Col
 fn style_damage_signatures(
     style_runs: &[ghostty_vt::StyleRun],
     term_cols: u16,
+    default_fg: u32,
+    default_bg: u32,
 ) -> Vec<StyleDamageSignature> {
     (0..term_cols)
         .map(|col| {
-            let (fg_rgb, bg_rgb, flags) = grid_cell_style_at(style_runs, col + 1);
+            let (fg_rgb, bg_rgb, flags) =
+                grid_cell_style_at(style_runs, col + 1, default_fg, default_bg);
             StyleDamageSignature {
                 fg_rgb,
                 bg_rgb,
@@ -379,9 +471,11 @@ pub(crate) fn damage_spans_from_style_runs(
     previous: &[ghostty_vt::StyleRun],
     next: &[ghostty_vt::StyleRun],
     term_cols: u16,
+    default_fg: u32,
+    default_bg: u32,
 ) -> Vec<DamageSpan> {
-    let previous_columns = style_damage_signatures(previous, term_cols);
-    let next_columns = style_damage_signatures(next, term_cols);
+    let previous_columns = style_damage_signatures(previous, term_cols, default_fg, default_bg);
+    let next_columns = style_damage_signatures(next, term_cols, default_fg, default_bg);
     let mut spans = Vec::new();
     let mut span_start = None;
 
@@ -417,11 +511,19 @@ pub(crate) fn damage_spans_from_terminal_row(
     next_cells: &[GridCell],
     next_styles: &[ghostty_vt::StyleRun],
     term_cols: u16,
+    default_fg: u32,
+    default_bg: u32,
 ) -> Vec<DamageSpan> {
     merge_damage_spans(
         damage_spans_from_cells(previous_cells, next_cells, term_cols)
             .into_iter()
-            .chain(damage_spans_from_style_runs(previous_styles, next_styles, term_cols))
+            .chain(damage_spans_from_style_runs(
+                previous_styles,
+                next_styles,
+                term_cols,
+                default_fg,
+                default_bg,
+            ))
             .collect(),
     )
 }
@@ -488,7 +590,10 @@ pub(crate) fn patch_glyph_instances_in_damage(
 }
 
 #[cfg(feature = "ghostty_vt")]
-pub(crate) fn glyph_instances_from_row(row: &CachedTerminalRow, row_idx: u16) -> Vec<GlyphInstance> {
+pub(crate) fn glyph_instances_from_row(
+    row: &CachedTerminalRow,
+    row_idx: u16,
+) -> Vec<GlyphInstance> {
     glyph_instances_from_cells(&row.cells, row_idx)
 }
 
@@ -539,12 +644,19 @@ fn persist_active_glyph_plans(
 }
 
 #[cfg(feature = "ghostty_vt")]
-fn prune_glyph_cache(cache: &mut HashMap<GlyphKey, PreparedGlyphPlan>, active_keys: &HashSet<GlyphKey>) {
+fn prune_glyph_cache(
+    cache: &mut HashMap<GlyphKey, PreparedGlyphPlan>,
+    active_keys: &HashSet<GlyphKey>,
+) {
     cache.retain(|key, _| active_keys.contains(key));
 }
 
 #[cfg(feature = "ghostty_vt")]
-fn resolve_cursor_cell(cursor_col: u16, row_cells: &[GridCell], term_cols: u16) -> (u16, u8) {
+pub(crate) fn resolve_cursor_cell(
+    cursor_col: u16,
+    row_cells: &[GridCell],
+    term_cols: u16,
+) -> (u16, u8) {
     let clamped = cursor_col.min(term_cols.saturating_sub(1));
     for cell in row_cells {
         let start = cell.col;
@@ -590,7 +702,12 @@ fn glyph_layout_for_key(
         .entry(key.clone())
         .or_insert_with(|| {
             let run = text_run_for_glyph_key(key, font_desc, Hsla::default());
-            let shaped = text_system.shape_line(SharedString::from(key.glyph.clone()), font_size, &[run], None);
+            let shaped = text_system.shape_line(
+                SharedString::from(key.glyph.clone()),
+                font_size,
+                &[run],
+                None,
+            );
             glyph_plan_from_layout(&shaped, cell_height)
         })
         .clone()
@@ -634,7 +751,8 @@ fn paint_glyph_instance(
 ) {
     let glyph_color = Hsla::from(rgb(instance.fg_rgb));
     let cell_origin = point(
-        bounds.origin.x + px(config.horizontal_text_padding + instance.col as f32 * config.cell_width),
+        bounds.origin.x
+            + px(config.horizontal_text_padding + instance.col as f32 * config.cell_width),
         bounds.origin.y + px(instance.row as f32 * config.cell_height),
     );
     let baseline_origin = point(cell_origin.x, cell_origin.y + plan.baseline_y);
@@ -675,12 +793,359 @@ fn paint_glyph_instance(
 }
 
 #[cfg(feature = "ghostty_vt")]
-fn default_grid_cell_style() -> (u32, u32, u8) {
-    (DEFAULT_FG, DEFAULT_BG, 0)
+pub(super) fn paint_gpu_overlay_glyphs(
+    snapshot: &TerminalSnapshot,
+    bounds: Bounds<Pixels>,
+    config: &GridRendererConfig,
+    window: &mut Window,
+    cx: &mut App,
+    glyph_cache: &GlyphCache,
+) {
+    let text_system = window.text_system().clone();
+    let font_desc = font(config.font_family.clone());
+    let font_size = px(config.font_size);
+    let mut active_glyph_keys: HashSet<GlyphKey> = HashSet::new();
+    let mut glyph_layout_cache = {
+        let shared = glyph_cache.lock();
+        active_glyph_keys.extend(
+            snapshot
+                .rows
+                .iter()
+                .flat_map(|row| row.glyph_instances.iter())
+                .filter(|instance| glyph_requires_gpui_overlay(&instance.key.glyph))
+                .map(|instance| instance.key.clone()),
+        );
+        shared
+            .iter()
+            .filter_map(|(key, plan)| {
+                active_glyph_keys
+                    .contains(key)
+                    .then(|| (key.clone(), plan.clone()))
+            })
+            .collect::<HashMap<_, _>>()
+    };
+
+    for row_data in &snapshot.rows {
+        for instance in &row_data.glyph_instances {
+            if !glyph_requires_gpui_overlay(&instance.key.glyph) {
+                continue;
+            }
+            let layout = glyph_layout_for_key(
+                &instance.key,
+                &text_system,
+                &font_desc,
+                font_size,
+                config.cell_height,
+                &mut glyph_layout_cache,
+            );
+            paint_glyph_instance(instance, &layout, bounds, config, window);
+        }
+    }
+
+    let mut cache = glyph_cache.lock();
+    prune_glyph_cache(&mut cache, &active_glyph_keys);
+    persist_active_glyph_plans(&mut cache, &glyph_layout_cache, &active_glyph_keys);
+    let _ = cx;
+}
+
+fn paint_geometry_rect(
+    window: &mut Window,
+    origin: Point<Pixels>,
+    width: f32,
+    height: f32,
+    color: Hsla,
+) {
+    if width <= 0.0 || height <= 0.0 {
+        return;
+    }
+
+    window.paint_quad(fill(
+        Bounds::new(origin, size(px(width), px(height))),
+        color,
+    ));
+}
+
+pub(crate) fn paint_geometry_cell(
+    row: u16,
+    cell: &GridCell,
+    bounds: Bounds<Pixels>,
+    config: &GridRendererConfig,
+    window: &mut Window,
+) {
+    let fg = Hsla::from(rgb(cell.fg_rgb));
+    let x =
+        bounds.origin.x + px(config.horizontal_text_padding + cell.col as f32 * config.cell_width);
+    let y = bounds.origin.y + px(row as f32 * config.cell_height);
+    let cell_width = config.cell_width * cell.width as f32;
+    let cell_height = config.cell_height;
+    let mid_x = cell_width * 0.5;
+    let mid_y = cell_height * 0.5;
+    let light = (cell_width.min(cell_height) * 0.12).max(1.0).ceil();
+    let heavy = (light * 1.8).max(2.0).ceil();
+    let edge_overdraw = 0.5;
+    let horizontal = |window: &mut Window, start: f32, end: f32, thickness: f32| {
+        let start = if start <= 0.0 {
+            -edge_overdraw
+        } else {
+            start - edge_overdraw
+        };
+        let end = if end >= cell_width {
+            cell_width + edge_overdraw
+        } else {
+            end + edge_overdraw
+        };
+        paint_geometry_rect(
+            window,
+            point(x + px(start), y + px((cell_height - thickness) * 0.5)),
+            end - start,
+            thickness,
+            fg,
+        );
+    };
+    let vertical = |window: &mut Window, start: f32, end: f32, thickness: f32| {
+        let start = if start <= 0.0 {
+            -edge_overdraw
+        } else {
+            start - edge_overdraw
+        };
+        let end = if end >= cell_height {
+            cell_height + edge_overdraw
+        } else {
+            end + edge_overdraw
+        };
+        paint_geometry_rect(
+            window,
+            point(x + px((cell_width - thickness) * 0.5), y + px(start)),
+            thickness,
+            end - start,
+            fg,
+        );
+    };
+    let double_horizontal = |window: &mut Window, start: f32, end: f32| {
+        let lane = (cell_height * 0.24).max(1.0);
+        let start = if start <= 0.0 {
+            -edge_overdraw
+        } else {
+            start - edge_overdraw
+        };
+        let end = if end >= cell_width {
+            cell_width + edge_overdraw
+        } else {
+            end + edge_overdraw
+        };
+        paint_geometry_rect(
+            window,
+            point(x + px(start), y + px(lane - light * 0.5)),
+            end - start,
+            light,
+            fg,
+        );
+        paint_geometry_rect(
+            window,
+            point(x + px(start), y + px(cell_height - lane - light * 0.5)),
+            end - start,
+            light,
+            fg,
+        );
+    };
+    let double_vertical = |window: &mut Window, start: f32, end: f32| {
+        let lane = (cell_width * 0.24).max(1.0);
+        let start = if start <= 0.0 {
+            -edge_overdraw
+        } else {
+            start - edge_overdraw
+        };
+        let end = if end >= cell_height {
+            cell_height + edge_overdraw
+        } else {
+            end + edge_overdraw
+        };
+        paint_geometry_rect(
+            window,
+            point(x + px(lane - light * 0.5), y + px(start)),
+            light,
+            end - start,
+            fg,
+        );
+        paint_geometry_rect(
+            window,
+            point(x + px(cell_width - lane - light * 0.5), y + px(start)),
+            light,
+            end - start,
+            fg,
+        );
+    };
+    let ch = cell.glyph.chars().next().unwrap_or(' ');
+
+    match ch {
+        '\u{2588}' => paint_geometry_rect(window, point(x, y), cell_width, cell_height, fg),
+        '\u{2580}' => paint_geometry_rect(window, point(x, y), cell_width, cell_height * 0.5, fg),
+        '\u{2584}' => paint_geometry_rect(
+            window,
+            point(x, y + px(cell_height * 0.5)),
+            cell_width,
+            cell_height * 0.5,
+            fg,
+        ),
+        '\u{258C}' => paint_geometry_rect(window, point(x, y), cell_width * 0.5, cell_height, fg),
+        '\u{2590}' => paint_geometry_rect(
+            window,
+            point(x + px(cell_width * 0.5), y),
+            cell_width * 0.5,
+            cell_height,
+            fg,
+        ),
+        '\u{2591}' => paint_geometry_rect(
+            window,
+            point(x, y),
+            cell_width,
+            cell_height,
+            fg.opacity(0.25),
+        ),
+        '\u{2592}' => paint_geometry_rect(
+            window,
+            point(x, y),
+            cell_width,
+            cell_height,
+            fg.opacity(0.5),
+        ),
+        '\u{2593}' => paint_geometry_rect(
+            window,
+            point(x, y),
+            cell_width,
+            cell_height,
+            fg.opacity(0.75),
+        ),
+        '\u{2500}' => horizontal(window, 0.0, cell_width, light),
+        '\u{2501}' => horizontal(window, 0.0, cell_width, heavy),
+        '\u{2502}' => vertical(window, 0.0, cell_height, light),
+        '\u{2503}' => vertical(window, 0.0, cell_height, heavy),
+        '\u{2550}' => double_horizontal(window, 0.0, cell_width),
+        '\u{2551}' => double_vertical(window, 0.0, cell_height),
+        '\u{250C}' | '\u{256D}' => {
+            horizontal(window, mid_x, cell_width, light);
+            vertical(window, mid_y, cell_height, light);
+        }
+        '\u{2510}' | '\u{256E}' => {
+            horizontal(window, 0.0, mid_x, light);
+            vertical(window, mid_y, cell_height, light);
+        }
+        '\u{2514}' | '\u{2570}' => {
+            horizontal(window, mid_x, cell_width, light);
+            vertical(window, 0.0, mid_y, light);
+        }
+        '\u{2518}' | '\u{256F}' => {
+            horizontal(window, 0.0, mid_x, light);
+            vertical(window, 0.0, mid_y, light);
+        }
+        '\u{251C}' => {
+            horizontal(window, mid_x, cell_width, light);
+            vertical(window, 0.0, cell_height, light);
+        }
+        '\u{2524}' => {
+            horizontal(window, 0.0, mid_x, light);
+            vertical(window, 0.0, cell_height, light);
+        }
+        '\u{252C}' => {
+            horizontal(window, 0.0, cell_width, light);
+            vertical(window, mid_y, cell_height, light);
+        }
+        '\u{2534}' => {
+            horizontal(window, 0.0, cell_width, light);
+            vertical(window, 0.0, mid_y, light);
+        }
+        '\u{253C}' => {
+            horizontal(window, 0.0, cell_width, light);
+            vertical(window, 0.0, cell_height, light);
+        }
+        '\u{250F}' => {
+            horizontal(window, mid_x, cell_width, heavy);
+            vertical(window, mid_y, cell_height, heavy);
+        }
+        '\u{2513}' => {
+            horizontal(window, 0.0, mid_x, heavy);
+            vertical(window, mid_y, cell_height, heavy);
+        }
+        '\u{2517}' => {
+            horizontal(window, mid_x, cell_width, heavy);
+            vertical(window, 0.0, mid_y, heavy);
+        }
+        '\u{251B}' => {
+            horizontal(window, 0.0, mid_x, heavy);
+            vertical(window, 0.0, mid_y, heavy);
+        }
+        '\u{2523}' => {
+            horizontal(window, mid_x, cell_width, heavy);
+            vertical(window, 0.0, cell_height, heavy);
+        }
+        '\u{252B}' => {
+            horizontal(window, 0.0, mid_x, heavy);
+            vertical(window, 0.0, cell_height, heavy);
+        }
+        '\u{2533}' => {
+            horizontal(window, 0.0, cell_width, heavy);
+            vertical(window, mid_y, cell_height, heavy);
+        }
+        '\u{253B}' => {
+            horizontal(window, 0.0, cell_width, heavy);
+            vertical(window, 0.0, mid_y, heavy);
+        }
+        '\u{254B}' => {
+            horizontal(window, 0.0, cell_width, heavy);
+            vertical(window, 0.0, cell_height, heavy);
+        }
+        '\u{2554}' => {
+            double_horizontal(window, mid_x, cell_width);
+            double_vertical(window, mid_y, cell_height);
+        }
+        '\u{2557}' => {
+            double_horizontal(window, 0.0, mid_x);
+            double_vertical(window, mid_y, cell_height);
+        }
+        '\u{255A}' => {
+            double_horizontal(window, mid_x, cell_width);
+            double_vertical(window, 0.0, mid_y);
+        }
+        '\u{255D}' => {
+            double_horizontal(window, 0.0, mid_x);
+            double_vertical(window, 0.0, mid_y);
+        }
+        '\u{2560}' => {
+            double_horizontal(window, mid_x, cell_width);
+            double_vertical(window, 0.0, cell_height);
+        }
+        '\u{2563}' => {
+            double_horizontal(window, 0.0, mid_x);
+            double_vertical(window, 0.0, cell_height);
+        }
+        '\u{2566}' => {
+            double_horizontal(window, 0.0, cell_width);
+            double_vertical(window, mid_y, cell_height);
+        }
+        '\u{2569}' => {
+            double_horizontal(window, 0.0, cell_width);
+            double_vertical(window, 0.0, mid_y);
+        }
+        '\u{256C}' => {
+            double_horizontal(window, 0.0, cell_width);
+            double_vertical(window, 0.0, cell_height);
+        }
+        _ => {}
+    }
 }
 
 #[cfg(feature = "ghostty_vt")]
-fn grid_cell_style_at(style_runs: &[ghostty_vt::StyleRun], col: u16) -> (u32, u32, u8) {
+pub(crate) fn default_grid_cell_style(default_fg: u32, default_bg: u32) -> (u32, u32, u8) {
+    (default_fg, default_bg, 0)
+}
+
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn grid_cell_style_at(
+    style_runs: &[ghostty_vt::StyleRun],
+    col: u16,
+    default_fg: u32,
+    default_bg: u32,
+) -> (u32, u32, u8) {
     style_runs
         .iter()
         .find(|run| run.start_col <= col && col <= run.end_col)
@@ -689,12 +1154,23 @@ fn grid_cell_style_at(style_runs: &[ghostty_vt::StyleRun], col: u16) -> (u32, u3
             let bg = ((run.bg.r as u32) << 16) | ((run.bg.g as u32) << 8) | (run.bg.b as u32);
             (fg, bg, run.flags)
         })
-        .unwrap_or_else(default_grid_cell_style)
+        .unwrap_or_else(|| default_grid_cell_style(default_fg, default_bg))
 }
 
 #[cfg(feature = "ghostty_vt")]
-pub(crate) fn grid_cells_from_row(row: &CachedTerminalRow, max_cols: u16) -> Vec<GridCell> {
-    grid_cells_from_parts(row.text.as_ref(), &row.style_runs, max_cols)
+pub(crate) fn grid_cells_from_row(
+    row: &CachedTerminalRow,
+    max_cols: u16,
+    default_fg: u32,
+    default_bg: u32,
+) -> Vec<GridCell> {
+    grid_cells_from_parts(
+        row.text.as_ref(),
+        &row.style_runs,
+        max_cols,
+        default_fg,
+        default_bg,
+    )
 }
 
 #[cfg(feature = "ghostty_vt")]
@@ -702,6 +1178,8 @@ pub(crate) fn grid_cells_from_parts(
     text: &str,
     style_runs: &[ghostty_vt::StyleRun],
     max_cols: u16,
+    default_fg: u32,
+    default_bg: u32,
 ) -> Vec<GridCell> {
     let mut cells: Vec<GridCell> = Vec::new();
     let mut col = 0u16;
@@ -718,7 +1196,8 @@ pub(crate) fn grid_cells_from_parts(
             break;
         }
 
-        let (fg_rgb, bg_rgb, flags) = grid_cell_style_at(style_runs, col + 1);
+        let (fg_rgb, bg_rgb, flags) =
+            grid_cell_style_at(style_runs, col + 1, default_fg, default_bg);
         cells.push(GridCell {
             col,
             width,
@@ -726,7 +1205,7 @@ pub(crate) fn grid_cells_from_parts(
             fg_rgb,
             bg_rgb,
             flags,
-            kind: if is_geometric_block_char(ch) {
+            kind: if is_geometry_char(ch) {
                 GridCellKind::GeometricBlock
             } else {
                 GridCellKind::Text
@@ -748,7 +1227,7 @@ pub(super) fn terminal_canvas(
         |_, _, _| (),
         move |bounds: Bounds<Pixels>, _, window: &mut Window, _cx: &mut App| {
             let text_system = window.text_system().clone();
-            let font_desc = font(config.font_family);
+            let font_desc = font(config.font_family.clone());
             let font_size = px(config.font_size);
             let line_height_px = px(config.cell_height);
             let num_rows = snapshot.rows.len();
@@ -776,12 +1255,14 @@ pub(super) fn terminal_canvas(
                 );
             }
 
-            window.paint_quad(fill(bounds, Hsla::from(rgb(DEFAULT_BG))));
-
             if let Some((sel_start, sel_end)) = selection {
                 let max_row = sel_end.row.min(num_rows.saturating_sub(1) as u16);
                 for row in sel_start.row..=max_row {
-                    let sc = if row == sel_start.row { sel_start.col } else { 0 };
+                    let sc = if row == sel_start.row {
+                        sel_start.col
+                    } else {
+                        0
+                    };
                     let ec = if row == sel_end.row {
                         sel_end.col
                     } else {
@@ -794,16 +1275,11 @@ pub(super) fn terminal_canvas(
                         Bounds::new(
                             point(
                                 bounds.origin.x
-                                    + px(
-                                        config.horizontal_text_padding
-                                            + sc as f32 * config.cell_width,
-                                    ),
+                                    + px(config.horizontal_text_padding
+                                        + sc as f32 * config.cell_width),
                                 bounds.origin.y + px(row as f32 * config.cell_height),
                             ),
-                            size(
-                                px((ec - sc) as f32 * config.cell_width),
-                                line_height_px,
-                            ),
+                            size(px((ec - sc) as f32 * config.cell_width), line_height_px),
                         ),
                         rgba(0x2F6FED55),
                     ));
@@ -817,10 +1293,9 @@ pub(super) fn terminal_canvas(
 
                 #[cfg(feature = "ghostty_vt")]
                 for srun in &row_data.style_runs {
-                    let bg_val = ((srun.bg.r as u32) << 16)
-                        | ((srun.bg.g as u32) << 8)
-                        | (srun.bg.b as u32);
-                    if bg_val != DEFAULT_BG {
+                    let bg_val =
+                        ((srun.bg.r as u32) << 16) | ((srun.bg.g as u32) << 8) | (srun.bg.b as u32);
+                    if bg_val != config.bg_color {
                         let sc = srun.start_col.saturating_sub(1) as f32;
                         let ec = srun.end_col as f32;
                         if ec > sc {
@@ -828,16 +1303,11 @@ pub(super) fn terminal_canvas(
                                 Bounds::new(
                                     point(
                                         bounds.origin.x
-                                            + px(
-                                                config.horizontal_text_padding
-                                                    + sc * config.cell_width,
-                                            ),
+                                            + px(config.horizontal_text_padding
+                                                + sc * config.cell_width),
                                         bounds.origin.y + px(row_y),
                                     ),
-                                    size(
-                                        px((ec - sc) * config.cell_width),
-                                        line_height_px,
-                                    ),
+                                    size(px((ec - sc) * config.cell_width), line_height_px),
                                 ),
                                 Hsla::from(rgb(bg_val)),
                             ));
@@ -874,7 +1344,7 @@ pub(super) fn terminal_canvas(
                         bounds.origin.x + px(config.horizontal_text_padding),
                         bounds.origin.y + px(row_y),
                     );
-                    let default_fg = Hsla::from(rgb(DEFAULT_FG));
+                    let default_fg = Hsla::from(rgb(config.fg_color));
                     let runs = vec![TextRun {
                         len: shaped_text.len(),
                         font: font_desc.clone(),
@@ -885,12 +1355,12 @@ pub(super) fn terminal_canvas(
                     }];
 
                     let has_wide_cells = text.chars().any(|ch| char_cell_width(ch) > 1);
-                    let force_width = if !has_wide_cells && text.chars().all(|ch| char_cell_width(ch) <= 1)
-                    {
-                        Some(px(config.cell_width))
-                    } else {
-                        None
-                    };
+                    let force_width =
+                        if !has_wide_cells && text.chars().all(|ch| char_cell_width(ch) <= 1) {
+                            Some(px(config.cell_width))
+                        } else {
+                            None
+                        };
                     let shaped = text_system.shape_line(
                         SharedString::from(shaped_text),
                         font_size,
@@ -902,79 +1372,15 @@ pub(super) fn terminal_canvas(
 
                 #[cfg(feature = "ghostty_vt")]
                 {
-                    for instance in glyph_instances {
-                        if instance.key.render_path == GlyphRenderPath::Geometry {
-                            let fg = Hsla::from(rgb(instance.fg_rgb));
-                            let x = bounds.origin.x
-                                + px(
-                                    config.horizontal_text_padding
-                                        + instance.col as f32 * config.cell_width,
-                                );
-                            let y = bounds.origin.y
-                                + px(instance.row as f32 * config.cell_height);
-                            let cw = px(config.cell_width * instance.key.width as f32);
-                            let ch = instance.key.glyph.chars().next().unwrap_or(' ');
-                            match ch {
-                                '\u{2588}' => {
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(x, y), size(cw, line_height_px)),
-                                        fg,
-                                    ));
-                                }
-                                '\u{2580}' => {
-                                    let h = px(config.cell_height * 0.5);
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(x, y), size(cw, h)),
-                                        fg,
-                                    ));
-                                }
-                                '\u{2584}' => {
-                                    let h = px(config.cell_height * 0.5);
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(x, y + h), size(cw, h)),
-                                        fg,
-                                    ));
-                                }
-                                '\u{258C}' => {
-                                    let hw = px(config.cell_width * 0.5);
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(x, y), size(hw, line_height_px)),
-                                        fg,
-                                    ));
-                                }
-                                '\u{2590}' => {
-                                    let hw = px(config.cell_width * 0.5);
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(x + hw, y), size(hw, line_height_px)),
-                                        fg,
-                                    ));
-                                }
-                                '\u{2591}' => {
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(x, y), size(cw, line_height_px)),
-                                        fg.opacity(0.25),
-                                    ));
-                                }
-                                '\u{2592}' => {
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(x, y), size(cw, line_height_px)),
-                                        fg.opacity(0.5),
-                                    ));
-                                }
-                                '\u{2593}' => {
-                                    window.paint_quad(fill(
-                                        Bounds::new(point(x, y), size(cw, line_height_px)),
-                                        fg.opacity(0.75),
-                                    ));
-                                }
-                                _ => {}
-                            }
+                    for cell in &row_data.cells {
+                        if cell.kind == GridCellKind::GeometricBlock {
+                            paint_geometry_cell(row_idx as u16, cell, bounds, &config, window);
                         }
                     }
                 }
             }
 
-            if (snapshot.cursor_y as usize) < num_rows {
+            if snapshot.cursor_visible && (snapshot.cursor_y as usize) < num_rows {
                 #[cfg(feature = "ghostty_vt")]
                 let (cursor_col, cursor_width) = snapshot
                     .rows
@@ -990,10 +1396,8 @@ pub(super) fn terminal_canvas(
                     Bounds::new(
                         point(
                             bounds.origin.x
-                                + px(
-                                    config.horizontal_text_padding
-                                        + cursor_col as f32 * config.cell_width,
-                                ),
+                                + px(config.horizontal_text_padding
+                                    + cursor_col as f32 * config.cell_width),
                             bounds.origin.y + px(snapshot.cursor_y as f32 * config.cell_height),
                         ),
                         size(px(config.cell_width * cursor_width as f32), line_height_px),
@@ -1225,15 +1629,31 @@ mod tests {
                 ghostty_vt::StyleRun {
                     start_col: 1,
                     end_col: 2,
-                    fg: ghostty_vt::Rgb { r: 0xAA, g: 0x00, b: 0x00 },
-                    bg: ghostty_vt::Rgb { r: 0x00, g: 0x00, b: 0x00 },
+                    fg: ghostty_vt::Rgb {
+                        r: 0xAA,
+                        g: 0x00,
+                        b: 0x00,
+                    },
+                    bg: ghostty_vt::Rgb {
+                        r: 0x00,
+                        g: 0x00,
+                        b: 0x00,
+                    },
                     flags: GHOSTTY_FLAG_BOLD,
                 },
                 ghostty_vt::StyleRun {
                     start_col: 3,
                     end_col: 3,
-                    fg: ghostty_vt::Rgb { r: 0x00, g: 0xAA, b: 0x00 },
-                    bg: ghostty_vt::Rgb { r: 0x00, g: 0x00, b: 0x00 },
+                    fg: ghostty_vt::Rgb {
+                        r: 0x00,
+                        g: 0xAA,
+                        b: 0x00,
+                    },
+                    bg: ghostty_vt::Rgb {
+                        r: 0x00,
+                        g: 0x00,
+                        b: 0x00,
+                    },
                     flags: 0,
                 },
             ],
@@ -1243,7 +1663,7 @@ mod tests {
             damaged_glyph_instances: Vec::new(),
         };
 
-        let cells = grid_cells_from_row(&row, 10);
+        let cells = grid_cells_from_row(&row, 10, DEFAULT_FG, DEFAULT_BG);
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[0].glyph, "🔥\u{FE0F}");
         assert_eq!(cells[0].width, 2);
@@ -1260,8 +1680,16 @@ mod tests {
             style_runs: vec![ghostty_vt::StyleRun {
                 start_col: 1,
                 end_col: 2,
-                fg: ghostty_vt::Rgb { r: 0xFF, g: 0x88, b: 0x33 },
-                bg: ghostty_vt::Rgb { r: 0x11, g: 0x22, b: 0x33 },
+                fg: ghostty_vt::Rgb {
+                    r: 0xFF,
+                    g: 0x88,
+                    b: 0x33,
+                },
+                bg: ghostty_vt::Rgb {
+                    r: 0x11,
+                    g: 0x22,
+                    b: 0x33,
+                },
                 flags: 0,
             }],
             cells: Vec::new(),
@@ -1270,10 +1698,44 @@ mod tests {
             damaged_glyph_instances: Vec::new(),
         };
 
-        let cells = grid_cells_from_row(&row, 10);
+        let cells = grid_cells_from_row(&row, 10, DEFAULT_FG, DEFAULT_BG);
         assert_eq!(cells.len(), 2);
         assert_eq!(cells[0].kind, GridCellKind::GeometricBlock);
         assert_eq!(cells[1].kind, GridCellKind::Text);
+    }
+
+    #[::core::prelude::v1::test]
+    fn grid_cells_from_row_marks_box_drawing_as_geometry() {
+        let row = CachedTerminalRow {
+            text: SharedString::from("─═│┌a"),
+            style_runs: vec![ghostty_vt::StyleRun {
+                start_col: 1,
+                end_col: 5,
+                fg: ghostty_vt::Rgb {
+                    r: 0xFF,
+                    g: 0x88,
+                    b: 0x33,
+                },
+                bg: ghostty_vt::Rgb {
+                    r: 0x11,
+                    g: 0x22,
+                    b: 0x33,
+                },
+                flags: 0,
+            }],
+            cells: Vec::new(),
+            glyph_instances: Vec::new(),
+            damage_spans: Vec::new(),
+            damaged_glyph_instances: Vec::new(),
+        };
+
+        let cells = grid_cells_from_row(&row, 10, DEFAULT_FG, DEFAULT_BG);
+        assert_eq!(cells.len(), 5);
+        assert_eq!(cells[0].kind, GridCellKind::GeometricBlock);
+        assert_eq!(cells[1].kind, GridCellKind::GeometricBlock);
+        assert_eq!(cells[2].kind, GridCellKind::GeometricBlock);
+        assert_eq!(cells[3].kind, GridCellKind::GeometricBlock);
+        assert_eq!(cells[4].kind, GridCellKind::Text);
     }
 
     #[::core::prelude::v1::test]
@@ -1283,8 +1745,16 @@ mod tests {
             style_runs: vec![ghostty_vt::StyleRun {
                 start_col: 1,
                 end_col: 3,
-                fg: ghostty_vt::Rgb { r: 0xAA, g: 0xBB, b: 0xCC },
-                bg: ghostty_vt::Rgb { r: 0x11, g: 0x22, b: 0x33 },
+                fg: ghostty_vt::Rgb {
+                    r: 0xAA,
+                    g: 0xBB,
+                    b: 0xCC,
+                },
+                bg: ghostty_vt::Rgb {
+                    r: 0x11,
+                    g: 0x22,
+                    b: 0x33,
+                },
                 flags: GHOSTTY_FLAG_UNDERLINE,
             }],
             cells: Vec::new(),
@@ -1294,8 +1764,14 @@ mod tests {
         };
 
         assert_eq!(
-            grid_cells_from_parts(row.text.as_ref(), &row.style_runs, 10),
-            grid_cells_from_row(&row, 10)
+            grid_cells_from_parts(
+                row.text.as_ref(),
+                &row.style_runs,
+                10,
+                DEFAULT_FG,
+                DEFAULT_BG
+            ),
+            grid_cells_from_row(&row, 10, DEFAULT_FG, DEFAULT_BG)
         );
     }
 
@@ -1329,9 +1805,18 @@ mod tests {
             kind: GridCellKind::GeometricBlock,
         };
 
-        assert_eq!(glyph_key_from_cell(&mono).render_path, GlyphRenderPath::AtlasMonochrome);
-        assert_eq!(glyph_key_from_cell(&emoji).render_path, GlyphRenderPath::AtlasPolychrome);
-        assert_eq!(glyph_key_from_cell(&block).render_path, GlyphRenderPath::Geometry);
+        assert_eq!(
+            glyph_key_from_cell(&mono).render_path,
+            GlyphRenderPath::AtlasMonochrome
+        );
+        assert_eq!(
+            glyph_key_from_cell(&emoji).render_path,
+            GlyphRenderPath::AtlasPolychrome
+        );
+        assert_eq!(
+            glyph_key_from_cell(&block).render_path,
+            GlyphRenderPath::Geometry
+        );
     }
 
     #[::core::prelude::v1::test]
@@ -1361,7 +1846,10 @@ mod tests {
         assert_eq!(instances.len(), 2);
         assert_eq!(instances[0].row, 7);
         assert_eq!(instances[0].col, 0);
-        assert_eq!(instances[0].key.render_path, GlyphRenderPath::AtlasPolychrome);
+        assert_eq!(
+            instances[0].key.render_path,
+            GlyphRenderPath::AtlasPolychrome
+        );
         assert_eq!(instances[1].col, 2);
         assert_eq!(instances[1].key.render_path, GlyphRenderPath::Geometry);
     }
@@ -1451,6 +1939,9 @@ mod tests {
             }],
             cursor_x: 0,
             cursor_y: 0,
+            cursor_visible: true,
+            content_revision: 0,
+            damaged_rows: Vec::new(),
         };
 
         let keys = collect_active_glyph_keys(&snapshot);
@@ -1498,6 +1989,9 @@ mod tests {
             }],
             cursor_x: 0,
             cursor_y: 0,
+            cursor_visible: true,
+            content_revision: 0,
+            damaged_rows: Vec::new(),
         };
 
         let keys = collect_damaged_glyph_keys(&snapshot);
@@ -1687,13 +2181,21 @@ mod tests {
         let next = vec![ghostty_vt::StyleRun {
             start_col: 3,
             end_col: 4,
-            fg: ghostty_vt::Rgb { r: 0xAA, g: 0xAA, b: 0xAA },
-            bg: ghostty_vt::Rgb { r: 0x22, g: 0x44, b: 0x66 },
+            fg: ghostty_vt::Rgb {
+                r: 0xAA,
+                g: 0xAA,
+                b: 0xAA,
+            },
+            bg: ghostty_vt::Rgb {
+                r: 0x22,
+                g: 0x44,
+                b: 0x66,
+            },
             flags: 0,
         }];
 
         assert_eq!(
-            damage_spans_from_style_runs(&previous, &next, 6),
+            damage_spans_from_style_runs(&previous, &next, 6, DEFAULT_FG, DEFAULT_BG),
             vec![DamageSpan {
                 start_col: 2,
                 end_col: 4,
@@ -1725,8 +2227,16 @@ mod tests {
         let next_styles = vec![ghostty_vt::StyleRun {
             start_col: 4,
             end_col: 4,
-            fg: ghostty_vt::Rgb { r: 0xAA, g: 0xAA, b: 0xAA },
-            bg: ghostty_vt::Rgb { r: 0x22, g: 0x44, b: 0x66 },
+            fg: ghostty_vt::Rgb {
+                r: 0xAA,
+                g: 0xAA,
+                b: 0xAA,
+            },
+            bg: ghostty_vt::Rgb {
+                r: 0x22,
+                g: 0x44,
+                b: 0x66,
+            },
             flags: 0,
         }];
 
@@ -1737,6 +2247,8 @@ mod tests {
                 &next_cells,
                 &next_styles,
                 6,
+                DEFAULT_FG,
+                DEFAULT_BG,
             ),
             vec![
                 DamageSpan {
@@ -1972,5 +2484,4 @@ mod tests {
 
         assert_eq!(glyph_baseline_y(&layout, 16.0), px(11.0));
     }
-
 }
