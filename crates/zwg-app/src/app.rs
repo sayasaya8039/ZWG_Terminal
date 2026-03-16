@@ -72,15 +72,57 @@ unsafe extern "system" fn snippet_ime_getmessage_hook_proc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, MSG, PM_REMOVE, TranslateMessage, WM_KEYDOWN,
+        CallNextHookEx, MSG, PM_REMOVE, TranslateMessage, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+        WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
     };
 
     if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
         unsafe {
             let msg = &*(lparam.0 as *const MSG);
+            if snippet_ime_trace_enabled() {
+                match msg.message {
+                    message if message == WM_IME_STARTCOMPOSITION => {
+                        log::debug!(
+                            "IME_CMP_START time={} wparam=0x{:X} lparam=0x{:X}",
+                            msg.time,
+                            msg.wParam.0,
+                            msg.lParam.0
+                        );
+                    }
+                    message if message == WM_IME_COMPOSITION => {
+                        log::debug!(
+                            "IME_CMP message time={} wparam=0x{:X} lparam=0x{:X}",
+                            msg.time,
+                            msg.wParam.0,
+                            msg.lParam.0
+                        );
+                    }
+                    message if message == WM_IME_ENDCOMPOSITION => {
+                        log::debug!(
+                            "IME_CMP_END time={} wparam=0x{:X} lparam=0x{:X}",
+                            msg.time,
+                            msg.wParam.0,
+                            msg.lParam.0
+                        );
+                    }
+                    _ => {}
+                }
+            }
             if msg.message == WM_KEYDOWN {
                 let vk = (msg.wParam.0 & 0xFFFF) as u16;
+                if snippet_ime_trace_enabled() {
+                    log::debug!(
+                        "IME_HOOK raw keydown vk=0x{:04X} code={} wparam=0x{:X} lparam=0x{:X}",
+                        vk,
+                        msg.message,
+                        msg.wParam.0,
+                        msg.lParam.0,
+                    );
+                }
                 if vk == 0xE5 {
+                    if snippet_ime_trace_enabled() {
+                        log::debug!("IME_HOOK VK_PROCESSKEY detected -> latch");
+                    }
                     let _ = TranslateMessage(msg as *const MSG);
                     SNIPPET_IME_VK_PROCESSKEY.store(true, Ordering::Release);
                 }
@@ -115,22 +157,85 @@ fn install_snippet_ime_hook() {
 #[cfg(not(target_os = "windows"))]
 fn install_snippet_ime_hook() {}
 
+fn snippet_ime_trace_enabled() -> bool {
+    use std::sync::OnceLock;
+
+    static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+    *TRACE_ENABLED.get_or_init(|| {
+        std::env::var("ZWG_IME_TRACE")
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn log_snippet_ime_keystroke(context: &str, keystroke: &Keystroke, detail: &str) {
+    if !snippet_ime_trace_enabled() {
+        return;
+    }
+
+    log::debug!(
+        "IME_TRACE [{}] key={} key_char={:?} ctrl:{} alt:{} shift:{} detail={}",
+        context,
+        keystroke.key,
+        keystroke.key_char,
+        keystroke.modifiers.control,
+        keystroke.modifiers.alt,
+        keystroke.modifiers.shift,
+        detail
+    );
+}
+
+fn log_snippet_ime_text(context: &str, target: Option<SnippetImeTarget>, text: &str) {
+    if !snippet_ime_trace_enabled() {
+        return;
+    }
+
+    log::debug!(
+        "IME_TEXT [{}] target={:?} text={:?}",
+        context,
+        target,
+        text
+    );
+}
+
 fn should_defer_snippet_keystroke_to_ime(keystroke: &Keystroke) -> bool {
     let ime_processkey_pending = SNIPPET_IME_VK_PROCESSKEY.swap(false, Ordering::AcqRel);
     if !ime_processkey_pending {
+        log_snippet_ime_keystroke(
+            "should_defer_snippet_keystroke_to_ime",
+            keystroke,
+            "processkey not pending -> direct",
+        );
         return false;
     }
 
     if let Some(text) = direct_text_from_snippet_keystroke(keystroke) {
         // Keep direct IME-resolved non-ASCII characters (e.g. あ, 漢字候補確定) in snippet inputs,
         // but continue deferring ASCII keystrokes during IME processing.
-        return text.chars().all(|ch| ch.is_ascii());
+        let defer = text.chars().all(|ch| ch.is_ascii());
+        log_snippet_ime_keystroke(
+            "should_defer_snippet_keystroke_to_ime",
+            keystroke,
+            &format!("direct_text={:?}, defer={}", text, defer),
+        );
+        return defer;
     }
 
-    !keystroke
+    let defer = !keystroke
         .key_char
         .as_ref()
-        .is_some_and(|key_char| !key_char.is_empty())
+        .is_some_and(|key_char| !key_char.is_empty());
+    log_snippet_ime_keystroke(
+        "should_defer_snippet_keystroke_to_ime",
+        keystroke,
+        &format!("fallback key_char defer={}", defer),
+    );
+    defer
 }
 
 fn direct_text_from_snippet_keystroke(keystroke: &Keystroke) -> Option<String> {
@@ -741,6 +846,7 @@ fn append_text_to_snippet_ime_target(
     if text.is_empty() {
         return false;
     }
+    log_snippet_ime_text("append_text_to_snippet_ime_target", Some(target), text);
 
     match target {
         SnippetImeTarget::PaletteQuery => {
@@ -792,7 +898,7 @@ enum SnippetEditorField {
     Content,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SnippetImeTarget {
     PaletteQuery,
     GroupName,
@@ -2559,6 +2665,7 @@ impl RootView {
                     return false;
                 }
                 if let Some(text) = direct_text_from_snippet_keystroke(&event.keystroke) {
+                    log_snippet_ime_text("handle_snippet_group_editor_key direct insert", Some(SnippetImeTarget::GroupName), &text);
                     editor.draft_name.push_str(&text);
                     cx.notify();
                 } else if event.keystroke.key_char.is_none() {
@@ -2783,10 +2890,18 @@ impl RootView {
                 let Some(text) = direct_text_from_snippet_keystroke(&event.keystroke) else {
                     return false;
                 };
-
                 let Some(editor) = self.snippet_editor.as_mut() else {
                     return false;
                 };
+                let snippet_target = Some(match editor.active_field {
+                    SnippetEditorField::Title => SnippetImeTarget::EditorTitle,
+                    SnippetEditorField::Content => SnippetImeTarget::EditorContent,
+                });
+                log_snippet_ime_text(
+                    "handle_snippet_editor_key direct insert",
+                    snippet_target,
+                    &text,
+                );
                 if append_text_to_snippet_editor_field(editor, &text) {
                     cx.notify();
                     return true;
@@ -3070,6 +3185,11 @@ impl RootView {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let snippet_ime_target = self.compute_snippet_ime_target();
+        log_snippet_ime_keystroke(
+            "on_key_down",
+            &event.keystroke,
+            &format!("snippet_ime_target={:?}", snippet_ime_target),
+        );
 
         if self.handle_snippet_settings_key(event, window, cx)
             || self.handle_ai_settings_key(event, window, cx)
@@ -8444,6 +8564,7 @@ impl EntityInputHandler for RootView {
         let Some(target) = self.compute_snippet_ime_target() else {
             return;
         };
+        log_snippet_ime_text("replace_text_in_range start", Some(target), text);
         let Some(current_text) = self.current_snippet_ime_text(target) else {
             return;
         };
@@ -8476,6 +8597,7 @@ impl EntityInputHandler for RootView {
         let Some(target) = self.compute_snippet_ime_target() else {
             return;
         };
+        log_snippet_ime_text("replace_and_mark_text_in_range start", Some(target), new_text);
         let Some(current_text) = self.current_snippet_ime_text(target) else {
             return;
         };

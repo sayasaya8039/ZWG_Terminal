@@ -1,10 +1,13 @@
 //! Terminal pane — GPUI view that renders the terminal and handles input
 
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{
     Arc,
+    Mutex as StdMutex,
     atomic::{AtomicBool, Ordering},
+    OnceLock,
 };
 use std::time::{Duration, Instant};
 
@@ -162,6 +165,196 @@ const SELECTION_BG: u32 = 0x2F6FED;
 // with the real MSG so IME composition works correctly.
 
 static IME_VK_PROCESSKEY: AtomicBool = AtomicBool::new(false);
+#[cfg(target_os = "windows")]
+static IME_COMPOSITION_RESULT_QUEUE: StdMutex<VecDeque<String>> = StdMutex::new(VecDeque::new());
+
+fn terminal_ime_trace_enabled() -> bool {
+    static TRACE_ENABLED: OnceLock<bool> = OnceLock::new();
+    *TRACE_ENABLED.get_or_init(|| {
+        std::env::var("ZWG_IME_TRACE")
+            .map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "on" | "yes"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn queue_ime_endcomposition_text(hwnd: windows::Win32::Foundation::HWND) {
+    let Some(text) = read_ime_result_text(hwnd) else {
+        if terminal_ime_trace_enabled() {
+            log::debug!(
+                "IME_TERM queue endcomposition skipped (no text read) wnd=0x{:X}",
+                hwnd.0 as usize
+            );
+        }
+        return;
+    };
+    if terminal_ime_trace_enabled() {
+        log::debug!("IME_TERM queued endcomposition text={:?}", text);
+    }
+
+    match IME_COMPOSITION_RESULT_QUEUE.lock() {
+        Ok(mut queue) => queue.push_back(text),
+        Err(err) => err.into_inner().push_back(text),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn take_ime_endcomposition_texts() -> Vec<String> {
+    match IME_COMPOSITION_RESULT_QUEUE.lock() {
+        Ok(mut queue) => queue.drain(..).collect(),
+        Err(err) => err.into_inner().drain(..).collect(),
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn read_ime_result_text(hwnd: windows::Win32::Foundation::HWND) -> Option<String> {
+    use windows::Win32::UI::Input::Ime::{
+        GCS_COMPREADSTR, GCS_COMPSTR, GCS_RESULTREADSTR, GCS_RESULTSTR, IME_COMPOSITION_STRING,
+        ImmGetCompositionStringW, ImmGetContext, ImmReleaseContext,
+    };
+
+    let himc = unsafe { ImmGetContext(hwnd) };
+
+    if himc.0.is_null() {
+        if terminal_ime_trace_enabled() {
+            log::debug!(
+                "IME_TERM no IME context for wnd=0x{:X}",
+                hwnd.0 as usize
+            );
+        }
+        return None;
+    }
+
+    fn read_string_for_kind(
+        himc: windows::Win32::UI::Input::Ime::HIMC,
+        kind: IME_COMPOSITION_STRING,
+        kind_name: &str,
+    ) -> Option<String> {
+        use std::ffi::c_void;
+
+        let required_bytes = unsafe { ImmGetCompositionStringW(himc, kind, None, 0) as usize };
+        if required_bytes == 0 {
+            if terminal_ime_trace_enabled() {
+                log::debug!("IME_TERM {} size=0", kind_name);
+            }
+            return None;
+        }
+
+        let mut buffer = vec![0u8; required_bytes];
+        let buffer_len = u32::try_from(buffer.len()).ok()?;
+        let written = unsafe {
+            ImmGetCompositionStringW(
+                himc,
+                kind,
+                Some(buffer.as_mut_ptr().cast::<c_void>()),
+                buffer_len,
+            )
+        };
+        if written == 0 {
+            if terminal_ime_trace_enabled() {
+                log::debug!("IME_TERM {} written=0", kind_name);
+            }
+            return None;
+        }
+
+        let bytes = Vec::from(&buffer[..written as usize]);
+        if bytes.is_empty() {
+            if terminal_ime_trace_enabled() {
+                log::debug!("IME_TERM {} bytes empty", kind_name);
+            }
+            return None;
+        }
+
+        if !bytes.len().is_multiple_of(2) {
+            if terminal_ime_trace_enabled() {
+                log::debug!(
+                    "IME_TERM {} odd byte length for utf16-le: {}",
+                    kind_name,
+                    bytes.len()
+                );
+            }
+        }
+
+        let mut u16_units = bytes
+            .chunks_exact(2)
+            .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+            .collect::<Vec<_>>();
+        while u16_units.last().is_some_and(|value| *value == 0) {
+            u16_units.pop();
+        }
+        if u16_units.is_empty() {
+            if terminal_ime_trace_enabled() {
+                log::debug!("IME_TERM {} utf16 units empty", kind_name);
+            }
+            return None;
+        }
+        if let Ok(text) = String::from_utf16(&u16_units) {
+            if terminal_ime_trace_enabled() {
+                log::debug!(
+                    "IME_TERM {} decoded utf16-le units={} bytes={} -> {:?}",
+                    kind_name,
+                    u16_units.len(),
+                    bytes.len(),
+                    text
+                );
+            }
+            return Some(text);
+        }
+
+        let text = String::from_utf16_lossy(&u16_units);
+        if terminal_ime_trace_enabled() {
+            log::debug!(
+                "IME_TERM {} utf16-le decode lossy units={} bytes={} -> {:?}",
+                kind_name,
+                u16_units.len(),
+                bytes.len(),
+                text
+            );
+        }
+        if text.is_empty() {
+            if terminal_ime_trace_enabled() {
+                log::debug!("IME_TERM {} text empty", kind_name);
+            }
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+        let result = read_string_for_kind(himc, GCS_RESULTSTR, "RESULTSTR")
+            .or_else(|| read_string_for_kind(himc, GCS_RESULTREADSTR, "RESULTREADSTR"))
+            .or_else(|| read_string_for_kind(himc, GCS_COMPSTR, "COMPSTR"))
+            .or_else(|| read_string_for_kind(himc, GCS_COMPREADSTR, "COMPREADSTR"));
+
+    unsafe { let _ = ImmReleaseContext(hwnd, himc); };
+
+    if terminal_ime_trace_enabled() {
+        log::debug!("IME_TERM IME read result -> {:?}", result);
+    }
+    result
+}
+
+fn log_terminal_ime_keystroke(context: &str, keystroke: &Keystroke, detail: &str) {
+    if !terminal_ime_trace_enabled() {
+        return;
+    }
+
+    log::debug!(
+        "IME_TERM [{}] key={} key_char={:?} ctrl:{} alt:{} shift:{} detail={}",
+        context,
+        keystroke.key,
+        keystroke.key_char,
+        keystroke.modifiers.control,
+        keystroke.modifiers.alt,
+        keystroke.modifiers.shift,
+        detail
+    );
+}
 
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn ime_getmessage_hook_proc(
@@ -170,15 +363,69 @@ unsafe extern "system" fn ime_getmessage_hook_proc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, MSG, PM_REMOVE, TranslateMessage, WM_KEYDOWN,
+        CallNextHookEx, MSG, PM_REMOVE, TranslateMessage, WM_IME_COMPOSITION,
+        WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
+    };
+    use windows::Win32::UI::Input::Ime::{
+        GCS_RESULTREADSTR, GCS_RESULTSTR,
     };
 
     if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
         unsafe {
             let msg = &*(lparam.0 as *const MSG);
+            match msg.message {
+                message if message == WM_IME_STARTCOMPOSITION => {
+                    if terminal_ime_trace_enabled() {
+                        log::debug!(
+                            "IME_TERM_CMP_START time={} wparam=0x{:X} lparam=0x{:X}",
+                            msg.time,
+                            msg.wParam.0,
+                            msg.lParam.0
+                        );
+                    }
+                }
+                message if message == WM_IME_COMPOSITION => {
+                    let composition_flags = msg.lParam.0 as u32;
+                    if (composition_flags & (GCS_RESULTSTR.0 | GCS_RESULTREADSTR.0)) != 0 {
+                        queue_ime_endcomposition_text(msg.hwnd);
+                    }
+                    if terminal_ime_trace_enabled() {
+                        log::debug!(
+                            "IME_TERM_CMP message time={} wparam=0x{:X} lparam=0x{:X}",
+                            msg.time,
+                            msg.wParam.0,
+                            msg.lParam.0
+                        );
+                    }
+                }
+                message if message == WM_IME_ENDCOMPOSITION => {
+                    queue_ime_endcomposition_text(msg.hwnd);
+                    if terminal_ime_trace_enabled() {
+                        log::debug!(
+                            "IME_TERM_CMP_END time={} wparam=0x{:X} lparam=0x{:X}",
+                            msg.time,
+                            msg.wParam.0,
+                            msg.lParam.0
+                        );
+                    }
+                }
+                _ => {}
+            }
             if msg.message == WM_KEYDOWN {
                 let vk = (msg.wParam.0 & 0xFFFF) as u16;
+                if terminal_ime_trace_enabled() {
+                    log::debug!(
+                        "IME_TERM_HOOK raw keydown vk=0x{:04X} code={} wparam=0x{:X} lparam=0x{:X}",
+                        vk,
+                        msg.message,
+                        msg.wParam.0,
+                        msg.lParam.0,
+                    );
+                }
                 if vk == 0xE5 {
+                    if terminal_ime_trace_enabled() {
+                        log::debug!("IME_TERM_HOOK VK_PROCESSKEY detected -> latch");
+                    }
                     // VK_PROCESSKEY: IME is processing this key.
                     // Call TranslateMessage with the ORIGINAL MSG (real time/pt).
                     let _ = TranslateMessage(msg as *const MSG);
@@ -295,6 +542,15 @@ fn terminal_layout_size(
 }
 
 fn should_defer_keystroke_to_ime(ks: &Keystroke, ime_processkey_pending: bool) -> bool {
+    if terminal_ime_trace_enabled() {
+        log::debug!(
+            "IME_TERM should_defer_keystroke_to_ime key={} pending={} key_char={:?}",
+            ks.key,
+            ime_processkey_pending,
+            ks.key_char
+        );
+    }
+
     if !ime_processkey_pending {
         return false;
     }
@@ -305,6 +561,7 @@ fn should_defer_keystroke_to_ime(ks: &Keystroke, ime_processkey_pending: bool) -
 }
 
 /// Terminal connection state — two-phase init pattern
+#[derive(Debug)]
 enum TerminalState {
     /// PTY is being spawned in background
     Pending,
@@ -927,6 +1184,9 @@ impl TerminalPane {
                 // Don't register IME handler when input is suppressed
                 // (e.g., group editor overlay is open)
                 if !suppressed.load(Ordering::Relaxed) {
+                    if terminal_ime_trace_enabled() {
+                        log::debug!("IME_TERM register_input handler");
+                    }
                     let handler = ElementInputHandler::new(bounds, entity.clone());
                     window.handle_input(&focus, handler, cx);
                 }
@@ -1006,6 +1266,8 @@ impl TerminalPane {
 
     /// Render the running terminal using canvas paint API for pixel-perfect grid.
     fn render_running(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.flush_ime_endcomposition_queue();
+
         let (layout_width, layout_height) =
             terminal_layout_size(window.viewport_size(), self.last_bounds);
         if self.handle_resize(layout_width, layout_height) {
@@ -1280,6 +1542,35 @@ impl TerminalPane {
         }
     }
 
+    fn flush_ime_endcomposition_queue(&mut self) {
+        #[cfg(target_os = "windows")]
+        {
+            let texts = take_ime_endcomposition_texts();
+            if terminal_ime_trace_enabled() {
+                log::debug!(
+                    "IME_TERM flush queue: {} item(s) from IME end composition",
+                    texts.len()
+                );
+            }
+
+            for text in texts {
+                if text.is_empty() {
+                    continue;
+                }
+
+                if terminal_ime_trace_enabled() {
+                    log::debug!("IME_TERM flush endcomposition text={:?}", text);
+                }
+
+                let bytes = normalize_terminal_newlines(&text);
+                self.write_terminal_bytes(&bytes);
+            }
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {}
+    }
+
     fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return false;
@@ -1393,6 +1684,12 @@ impl TerminalPane {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        log_terminal_ime_keystroke(
+            "on_key_down",
+            &event.keystroke,
+            "terminal pane keydown",
+        );
+
         if self.input_suppressed.load(Ordering::Relaxed) {
             return;
         }
@@ -1425,6 +1722,11 @@ impl TerminalPane {
             None => {
                 // IME key or unknown — stop propagation to prevent gpui's
                 // broken TranslateMessage from interfering with IME.
+                log_terminal_ime_keystroke(
+                    "on_key_down",
+                    &event.keystroke,
+                    "keystroke_to_bytes:none -> stop propagation",
+                );
                 cx.stop_propagation();
                 return;
             }
@@ -1577,6 +1879,12 @@ impl EntityInputHandler for TerminalPane {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
+        if terminal_ime_trace_enabled() {
+            log::debug!(
+                "IME_TERM text_for_range called range={:?} adjusted={:?}",
+                _range, _adjusted
+            );
+        }
         None
     }
 
@@ -1586,6 +1894,9 @@ impl EntityInputHandler for TerminalPane {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        if terminal_ime_trace_enabled() {
+            log::debug!("IME_TERM selected_text_range called ignore={}", _ignore);
+        }
         Some(UTF16Selection {
             range: 0..0,
             reversed: false,
@@ -1597,10 +1908,16 @@ impl EntityInputHandler for TerminalPane {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
+        if terminal_ime_trace_enabled() {
+            log::debug!("IME_TERM marked_text_range called");
+        }
         None
     }
 
     fn unmark_text(&mut self, _window: &mut Window, _cx: &mut Context<Self>) {
+        if terminal_ime_trace_enabled() {
+            log::debug!("IME_TERM unmark_text called");
+        }
         self.ime_composing = false;
     }
 
@@ -1617,7 +1934,17 @@ impl EntityInputHandler for TerminalPane {
         }
         if text.is_empty() {
             self.ime_composing = false;
+            log::debug!("IME_TERM replace_text_in_range empty text; composing cleared");
             return;
+        }
+        if terminal_ime_trace_enabled() {
+            log::debug!(
+                "IME_TERM replace_text_in_range state={:?} range={:?} text={:?} bytes={:?}",
+                self.state,
+                _range,
+                text,
+                text.as_bytes()
+            );
         }
         self.ime_composing = false;
         IME_VK_PROCESSKEY.store(false, Ordering::Release);
@@ -1642,6 +1969,13 @@ impl EntityInputHandler for TerminalPane {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) {
+        if terminal_ime_trace_enabled() {
+            log::debug!(
+                "IME_TERM replace_and_mark_text_in_range composing={} len={}",
+                !_new_text.is_empty(),
+                _new_text.len()
+            );
+        }
         if self.input_suppressed.load(Ordering::Relaxed) {
             return;
         }
@@ -1656,6 +1990,12 @@ impl EntityInputHandler for TerminalPane {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
+        if terminal_ime_trace_enabled() {
+            log::debug!(
+                "IME_TERM bounds_for_range called range={:?} composing={}",
+                _range, self.ime_composing
+            );
+        }
         if !self.ime_composing {
             return None;
         }
@@ -1676,6 +2016,12 @@ impl EntityInputHandler for TerminalPane {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<usize> {
+        if terminal_ime_trace_enabled() {
+            log::debug!(
+                "IME_TERM character_index_for_point called point={:?}",
+                _point
+            );
+        }
         None
     }
 }

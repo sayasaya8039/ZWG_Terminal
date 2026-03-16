@@ -332,6 +332,7 @@ fn cell_to_char_index(text: &str, cell_col: usize) -> usize {
 }
 
 // Re-export main types
+#[allow(unused_imports)]
 pub use surface::TerminalSurface;
 pub use view::TerminalPane;
 

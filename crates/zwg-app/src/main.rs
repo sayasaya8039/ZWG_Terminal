@@ -313,6 +313,13 @@ fn main() {
     )
     .init();
 
+    if std::env::var("ZWG_IME_TRACE")
+        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+    {
+        log::info!("ZWG_IME_TRACE=1 enabled");
+    }
+
     log::info!("ZWG Terminal v{} starting", env!("CARGO_PKG_VERSION"));
     let resources_path = locate_resources_path();
 
