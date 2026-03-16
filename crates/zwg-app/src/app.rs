@@ -121,6 +121,10 @@ fn should_defer_snippet_keystroke_to_ime(keystroke: &Keystroke) -> bool {
         return false;
     }
 
+    if direct_text_from_snippet_keystroke(keystroke).is_some() {
+        return false;
+    }
+
     !keystroke
         .key_char
         .as_ref()
@@ -137,7 +141,7 @@ fn direct_text_from_snippet_keystroke(keystroke: &Keystroke) -> Option<String> {
     }
 
     let key: &str = keystroke.key.as_ref();
-    if key.len() == 1 {
+    if key.chars().count() == 1 {
         return Some(key.to_string());
     }
     if key == "space" {
@@ -10069,10 +10073,10 @@ mod tests {
         ZoomAction, adjust_font_size_value, append_text_to_snippet_editor_field,
         append_text_to_snippet_ime_target, apply_snippet_group_edit, begin_new_snippet_group_edit,
         byte_index_to_utf16_offset, byte_range_to_utf16_range, collect_global_hotkeys,
-        configured_global_shortcut_action, cycle_string_option,
+        configured_global_shortcut_action, cycle_string_option, should_defer_snippet_keystroke_to_ime,
         delete_text_before_snippet_editor_cursor, direct_text_from_snippet_keystroke,
         hotkey_binding_string, hotkey_matches, hotkey_string_for_keystroke,
-        move_snippet_editor_cursor, paste_text_to_snippet_editor_field,
+        move_snippet_editor_cursor, paste_text_to_snippet_editor_field, SNIPPET_IME_VK_PROCESSKEY,
         process_completion_notice_detail, terminal_settings_from_config, titlebar_actions_width,
         titlebar_side_cluster_width, traffic_lights_width, utf16_offset_to_byte_index,
         utf16_range_to_byte_range, zoom_action_for_window,
@@ -10082,7 +10086,10 @@ mod tests {
     use gpui::{KeyDownEvent, Keystroke, Modifiers};
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::{Arc, atomic::AtomicBool};
+    use std::sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    };
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -10306,6 +10313,44 @@ mod tests {
             direct_text_from_snippet_keystroke(&keystroke).as_deref(),
             Some("a")
         );
+    }
+
+    #[test]
+    fn direct_snippet_text_from_keystroke_falls_back_to_single_unicode_key() {
+        let keystroke = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "あ".into(),
+            key_char: None,
+        };
+
+        assert_eq!(
+            direct_text_from_snippet_keystroke(&keystroke).as_deref(),
+            Some("あ")
+        );
+    }
+
+    #[test]
+    fn should_defer_snippet_keystroke_to_ime_skips_when_not_text() {
+        let keystroke = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "process".into(),
+            key_char: None,
+        };
+
+        SNIPPET_IME_VK_PROCESSKEY.store(true, Ordering::Release);
+        assert!(should_defer_snippet_keystroke_to_ime(&keystroke));
+    }
+
+    #[test]
+    fn should_defer_snippet_keystroke_to_ime_allows_single_text_key() {
+        let keystroke = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "あ".into(),
+            key_char: None,
+        };
+
+        SNIPPET_IME_VK_PROCESSKEY.store(true, Ordering::Release);
+        assert!(!should_defer_snippet_keystroke_to_ime(&keystroke));
     }
 
     #[test]
