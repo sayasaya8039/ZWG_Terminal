@@ -45,7 +45,9 @@ unsafe impl Sync for PtyPair {}
 
 impl PtyPair {
     pub fn write_input(&self, data: &[u8]) -> io::Result<usize> {
-        self.master_write.lock().write(data)
+        let mut writer = self.master_write.lock();
+        writer.write_all(data)?;
+        Ok(data.len())
     }
 
     pub fn reader(&self) -> Arc<Mutex<Box<dyn Read + Send>>> {
@@ -496,5 +498,59 @@ pub fn spawn_pty(config: ConPtyConfig) -> io::Result<PtyPair> {
             io::ErrorKind::Unsupported,
             "Non-Windows PTY not yet implemented",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, Cursor};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct PartialWriter {
+        writes: Arc<Mutex<Vec<u8>>>,
+        chunk_size: usize,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Write for PartialWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            let take = buf.len().min(self.chunk_size);
+            self.writes.lock().extend_from_slice(&buf[..take]);
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_input_retries_until_all_bytes_are_written() {
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let pair = PtyPair {
+            master_read: Arc::new(Mutex::new(Box::new(Cursor::new(Vec::<u8>::new())))),
+            master_write: Arc::new(Mutex::new(Box::new(PartialWriter {
+                writes: writes.clone(),
+                chunk_size: 3,
+                calls: calls.clone(),
+            }))),
+            child_pid: 1,
+            #[cfg(windows)]
+            pseudo_console: None,
+            #[cfg(windows)]
+            process_handle: None,
+        };
+
+        let payload = b"paste payload";
+        let written = pair
+            .write_input(payload)
+            .expect("write_input should succeed");
+
+        assert_eq!(written, payload.len());
+        assert_eq!(&*writes.lock(), payload);
+        assert!(calls.load(Ordering::Relaxed) > 1);
     }
 }
