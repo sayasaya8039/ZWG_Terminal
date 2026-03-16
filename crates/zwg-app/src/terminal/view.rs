@@ -663,7 +663,7 @@ pub struct TerminalPane {
     is_selecting: bool,
     ime_composing: bool,
     wheel_scroll_line_remainder: f32,
-    last_user_input: Option<(UserInputSource, Vec<u8>, Instant)>,
+    recent_user_inputs: VecDeque<(UserInputSource, Vec<u8>, Instant)>,
     /// Keystrokes buffered while PTY is still connecting (Pending state)
     pending_input: Vec<u8>,
     pending_process_exit_status: Option<i32>,
@@ -947,7 +947,7 @@ impl TerminalPane {
             is_selecting: false,
             ime_composing: false,
             wheel_scroll_line_remainder: 0.0,
-            last_user_input: None,
+            recent_user_inputs: VecDeque::new(),
             pending_input: Vec::new(),
             pending_process_exit_status: None,
             glyph_cache: Default::default(),
@@ -1584,28 +1584,44 @@ impl TerminalPane {
 
     fn should_drop_duplicate_user_input(&mut self, source: UserInputSource, data: &[u8]) -> bool {
         let now = Instant::now();
-        let duplicate = self
-            .last_user_input
-            .as_ref()
-            .is_some_and(|(previous_source, previous, at)| {
-                if previous != data {
-                    return false;
-                }
+        // Prune entries older than the cross-route window
+        let cutoff = Duration::from_millis(CROSS_ROUTE_DUPLICATE_WINDOW_MS);
+        while self
+            .recent_user_inputs
+            .front()
+            .is_some_and(|(_, _, at)| now.duration_since(*at) > cutoff)
+        {
+            self.recent_user_inputs.pop_front();
+        }
 
-                let elapsed = now.duration_since(*at);
-                if *previous_source != source {
-                    return elapsed <= Duration::from_millis(CROSS_ROUTE_DUPLICATE_WINDOW_MS);
-                }
+        // Check against ALL recent inputs, not just the last one.
+        // This prevents delayed ImeEndComposition flushes from escaping
+        // duplicate detection when subsequent keystrokes have updated the history.
+        let duplicate = self.recent_user_inputs.iter().any(|(prev_source, prev_data, at)| {
+            if prev_data != data {
+                return false;
+            }
 
-                source.is_commit_source()
-                    && elapsed <= Duration::from_millis(SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS)
-            });
+            let elapsed = now.duration_since(*at);
+            if *prev_source != source {
+                return elapsed <= Duration::from_millis(CROSS_ROUTE_DUPLICATE_WINDOW_MS);
+            }
 
-        self.last_user_input = Some((source, data.to_vec(), now));
+            source.is_commit_source()
+                && elapsed <= Duration::from_millis(SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS)
+        });
+
+        // Cap the deque to prevent unbounded growth
+        const MAX_RECENT_ENTRIES: usize = 32;
+        if self.recent_user_inputs.len() >= MAX_RECENT_ENTRIES {
+            self.recent_user_inputs.pop_front();
+        }
+        self.recent_user_inputs
+            .push_back((source, data.to_vec(), now));
 
         if duplicate && terminal_ime_trace_enabled() {
             log::debug!(
-                "IME_TERM dropped cross-route duplicate source={:?} bytes={:?}",
+                "IME_TERM dropped duplicate source={:?} bytes={:?}",
                 source as u8,
                 data
             );
