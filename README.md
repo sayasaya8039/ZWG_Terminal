@@ -18,6 +18,12 @@
 
 ---
 
+## スクリーンショット
+
+![ZWG Terminal Settings](tmp_figma_settings.png)
+
+---
+
 ## ダウンロード
 
 > **ビルド不要でインストールできます**
@@ -258,6 +264,10 @@ Zed エディタで使用されている GPUI 0.2 を採用。Direct2D/DirectWri
 
 DirectX 12 ネイティブ GPU レンダラーにより、大量テキスト出力時でも高速な描画を実現。HLSL シェーダーによるグリフレンダリングパイプラインを搭載しています。
 
+### WASM ランタイム
+
+アプリ起動時に埋め込み WASM モジュールを安全に初期化し、`zig-ffi` / `dx12-renderer` / `gpui-host` の各 capability を検証します。ホスト import を持たないため、ファイル・ネットワーク・Windows API への直接アクセスはできません。
+
 ### Win32 ネイティブ統合
 
 - **カスタムタイトルバー**: Win32 `PostMessageW(WM_SYSCOMMAND, SC_MOVE)` による直接ドラッグ
@@ -291,6 +301,72 @@ cargo build --release
 # 2. インストーラー作成（ステージング + PyInstaller）
 python installer/build_installer.py
 # → installer/dist/ZWG_Terminal_Setup.exe が生成されます
+```
+
+## MSIX / 署名 / Winget
+
+### `.msix` ビルド
+
+```powershell
+# リリース EXE を先に作成
+cargo build --release
+
+# 自己署名証明書を作成
+powershell -ExecutionPolicy Bypass -File packaging/windows/New-CodeSigningCert.ps1
+
+# MSIX を生成して署名
+powershell -ExecutionPolicy Bypass -File packaging/windows/Build-MSIX.ps1 `
+  -Version 1.1.2.0 `
+  -Publisher "CN=ZWG Terminal Test" `
+  -Architecture x64 `
+  -PfxPath packaging/windows/certs/ZWGTerminal-TestCert.pfx `
+  -PfxPassword changeit
+```
+
+### `.exe` ビルド
+
+```powershell
+# ポータブル EXE
+cargo build --release
+
+# GUI セットアップ EXE
+python installer/build_installer.py
+```
+
+### コード署名手順（自署名）
+
+```powershell
+# 1. 証明書作成
+powershell -ExecutionPolicy Bypass -File packaging/windows/New-CodeSigningCert.ps1 `
+  -Subject "CN=ZWG Terminal Test" `
+  -Password "changeit"
+
+# 2. EXE 署名
+signtool sign /fd SHA256 /f packaging/windows/certs/ZWGTerminal-TestCert.pfx `
+  /p changeit /tr http://timestamp.digicert.com /td SHA256 target/release/zwg.exe
+
+# 3. MSIX 署名
+signtool sign /fd SHA256 /f packaging/windows/certs/ZWGTerminal-TestCert.pfx `
+  /p changeit /tr http://timestamp.digicert.com /td SHA256 `
+  packaging/windows/dist/ZWG_Terminal_1.1.2.0_x64.msix
+```
+
+### Winget / Microsoft Store 提出物
+
+- Winget manifest テンプレート: `packaging/winget/manifests/s/sayasaya8039/ZWGTerminal/1.1.2/`
+- Microsoft Store / sideload 用 AppxManifest: `packaging/windows/AppxManifest.xml`
+- 本体 EXE の実行レベルは `resources/windows/app.manifest` で `asInvoker` を固定
+
+### ARM64 確認
+
+```powershell
+# ARM64 向けに Zig と Rust の両方を検証
+rustup target add aarch64-pc-windows-msvc
+cargo build --release --target aarch64-pc-windows-msvc
+powershell -ExecutionPolicy Bypass -File packaging/windows/Build-MSIX.ps1 `
+  -Version 1.1.2.0 `
+  -Publisher "CN=ZWG Terminal Test" `
+  -Architecture arm64
 ```
 
 ---

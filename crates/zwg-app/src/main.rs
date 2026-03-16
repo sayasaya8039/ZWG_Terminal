@@ -21,6 +21,7 @@ mod shell;
 mod snippets;
 mod split;
 mod terminal;
+mod wasm_runtime;
 
 use gpui::*;
 
@@ -314,13 +315,25 @@ fn main() {
     .init();
 
     if std::env::var("ZWG_IME_TRACE")
-        .map(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "on" | "yes"
+            )
+        })
         .unwrap_or(false)
     {
         log::info!("ZWG_IME_TRACE=1 enabled");
     }
 
     log::info!("ZWG Terminal v{} starting", env!("CARGO_PKG_VERSION"));
+    let wasm_runtime = wasm_runtime::initialize().expect("embedded WASM runtime init failed");
+    log::info!(
+        "WASM runtime ready: abi={} capabilities=0x{:X} ({})",
+        wasm_runtime.abi_version,
+        wasm_runtime.capabilities,
+        wasm_runtime.capability_summary()
+    );
     let resources_path = locate_resources_path();
 
     let app = Application::new().with_assets(Assets {

@@ -1,0 +1,15 @@
+PackageIdentifier: sayasaya8039.ZWGTerminal
+PackageVersion: 1.1.2
+InstallerType: portable
+Commands:
+  - zwg
+ReleaseDate: 2026-03-16
+Installers:
+  - Architecture: x64
+    InstallerUrl: https://github.com/sayasaya8039/ZWG_Terminal/releases/download/v1.1.2/zwg.exe
+    InstallerSha256: REPLACE_WITH_X64_SHA256
+  - Architecture: arm64
+    InstallerUrl: https://github.com/sayasaya8039/ZWG_Terminal/releases/download/v1.1.2/zwg-arm64.exe
+    InstallerSha256: REPLACE_WITH_ARM64_SHA256
+ManifestType: installer
+ManifestVersion: 1.10.0

@@ -1,0 +1,21 @@
+PackageIdentifier: sayasaya8039.ZWGTerminal
+PackageVersion: 1.1.2
+PackageLocale: ja-JP
+Publisher: ZWG Terminal contributors
+PublisherUrl: https://github.com/sayasaya8039/ZWG_Terminal
+PublisherSupportUrl: https://github.com/sayasaya8039/ZWG_Terminal/issues
+Author: ZWG Terminal contributors
+PackageName: ZWG Terminal
+PackageUrl: https://github.com/sayasaya8039/ZWG_Terminal
+License: MIT
+LicenseUrl: https://github.com/sayasaya8039/ZWG_Terminal/blob/main/LICENSE
+ShortDescription: Ghostty VT + Zig + WASM + GPUI + DX12 による Windows ターミナル
+Description: Windows 向けの GPU 加速ターミナル。Ghostty VT を Zig FFI で統合し、GPUI と DX12 で UI と描画を構成します。
+Tags:
+  - terminal
+  - gpui
+  - dx12
+  - zig
+  - wasm
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

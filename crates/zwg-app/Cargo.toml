@@ -31,6 +31,7 @@ image = "0.25"
 encoding_rs = "0.8"
 rfd = "0.15"
 ureq = { version = "2.12", features = ["json"] }
+wasmi = { version = "2.0.0-beta.2", default-features = true }
 ghostty-vt = { path = "../ghostty-vt", optional = true }
 
 [build-dependencies]

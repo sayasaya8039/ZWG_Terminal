@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:desktop6="http://schemas.microsoft.com/appx/manifest/desktop/windows10/6"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap desktop6 rescap">
+  <Identity
+    Name="sayasaya8039.ZWGTerminal"
+    Publisher="__PUBLISHER__"
+    Version="__VERSION__"
+    ProcessorArchitecture="__ARCH__" />
+  <Properties>
+    <DisplayName>ZWG Terminal</DisplayName>
+    <PublisherDisplayName>ZWG Terminal contributors</PublisherDisplayName>
+    <Description>Ghostty VT + Zig + WASM + GPUI + DX12 による Windows ターミナル</Description>
+    <Logo>resources\icons\zwg_256.png</Logo>
+  </Properties>
+  <Resources>
+    <Resource Language="ja-jp" />
+  </Resources>
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19045.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+  <Applications>
+    <Application
+      Id="ZWGTerminal"
+      Executable="zwg.exe"
+      EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="ZWG Terminal"
+        Description="Ghostty VT + Zig + WASM + GPUI + DX12 による Windows ターミナル"
+        BackgroundColor="transparent"
+        Square44x44Logo="resources\icons\zwg_48.png"
+        Square150x150Logo="resources\icons\zwg_256.png" />
+    </Application>
+  </Applications>
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+</Package>

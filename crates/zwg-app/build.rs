@@ -1,12 +1,12 @@
 //! Build script for zwg-app
 //! - Embeds Windows application icon
-//! - Sets up Windows manifest
+//! - Sets up Windows resources
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=../../resources/icons/zwg.ico");
 
-    // Embed Windows icon and manifest
+    // Embed Windows icon
     #[cfg(windows)]
     {
         let mut res = winresource::WindowsResource::new();

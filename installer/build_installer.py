@@ -4,6 +4,7 @@ Stages release files and runs PyInstaller to create a single-EXE installer.
 """
 
 import os
+import stat
 import shutil
 import subprocess
 import sys
@@ -17,10 +18,16 @@ ICON = RESOURCES / "icons" / "zwg.ico"
 INSTALLER_SCRIPT = ROOT / "installer" / "zwg_installer.py"
 
 
+def remove_readonly(func, path, _excinfo):
+    """Allow shutil.rmtree to delete read-only files/directories from staged assets."""
+    os.chmod(path, stat.S_IWRITE)
+    func(path)
+
+
 def stage_files():
     """Copy release artifacts into _stage/ for embedding."""
     if STAGE.exists():
-        shutil.rmtree(STAGE)
+        shutil.rmtree(STAGE, onexc=remove_readonly)
     STAGE.mkdir(parents=True)
 
     # Main binary
@@ -48,6 +55,11 @@ def run_pyinstaller():
     """Build the installer EXE with PyInstaller."""
     dist_dir = ROOT / "installer" / "dist"
     build_dir = ROOT / "installer" / "build"
+
+    if build_dir.exists():
+        shutil.rmtree(build_dir, onexc=remove_readonly)
+    if dist_dir.exists():
+        shutil.rmtree(dist_dir, onexc=remove_readonly)
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
