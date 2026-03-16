@@ -4,10 +4,8 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
-    Mutex as StdMutex,
+    Arc, Mutex as StdMutex, OnceLock,
     atomic::{AtomicBool, Ordering},
-    OnceLock,
 };
 use std::time::{Duration, Instant};
 
@@ -34,6 +32,9 @@ use parking_lot::Mutex;
 const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
 const MAX_FRAME_COALESCE_MICROS: u64 = 1_667;
 const ASYNC_PARSE_SETTLE_MILLIS: u64 = 2;
+const ASYNC_PARSE_RETRY_LIMIT: usize = 4;
+const CROSS_ROUTE_DUPLICATE_WINDOW_MS: u64 = 250;
+const SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS: u64 = 30;
 /// Fallback values — replaced at runtime by measured font metrics
 const CELL_WIDTH_FALLBACK: f32 = 8.4;
 const CELL_HEIGHT_FALLBACK: f32 = 19.5;
@@ -115,6 +116,19 @@ fn apply_ghostty_row_update(
     row_changed
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UserInputSource {
+    KeyDown,
+    TextCommit,
+    ImeEndComposition,
+}
+
+impl UserInputSource {
+    fn is_commit_source(self) -> bool {
+        matches!(self, Self::TextCommit | Self::ImeEndComposition)
+    }
+}
+
 /// Measure the actual monospace cell dimensions from the configured font.
 /// Cell width = max advance width of representative monospace glyphs.
 /// Cell height = ascent + descent (no extra leading — required for
@@ -155,8 +169,6 @@ fn measure_cell_dimensions(cx: &App, font_family: &str, font_size_px: f32) -> (f
 const SUBTEXT0: u32 = 0x8E8E93;
 const SURFACE0: u32 = 0x48484A;
 const RED: u32 = 0xFF5F57;
-const SELECTION_BG: u32 = 0x2F6FED;
-
 // ── IME hook: fix Japanese/Chinese/Korean input for gpui 0.2.2 ──────
 //
 // gpui 0.2.2 calls TranslateMessage inside WndProc with a synthetic MSG
@@ -222,10 +234,7 @@ fn read_ime_result_text(hwnd: windows::Win32::Foundation::HWND) -> Option<String
 
     if himc.0.is_null() {
         if terminal_ime_trace_enabled() {
-            log::debug!(
-                "IME_TERM no IME context for wnd=0x{:X}",
-                hwnd.0 as usize
-            );
+            log::debug!("IME_TERM no IME context for wnd=0x{:X}", hwnd.0 as usize);
         }
         return None;
     }
@@ -326,12 +335,14 @@ fn read_ime_result_text(hwnd: windows::Win32::Foundation::HWND) -> Option<String
         }
     }
 
-        let result = read_string_for_kind(himc, GCS_RESULTSTR, "RESULTSTR")
-            .or_else(|| read_string_for_kind(himc, GCS_RESULTREADSTR, "RESULTREADSTR"))
-            .or_else(|| read_string_for_kind(himc, GCS_COMPSTR, "COMPSTR"))
-            .or_else(|| read_string_for_kind(himc, GCS_COMPREADSTR, "COMPREADSTR"));
+    let result = read_string_for_kind(himc, GCS_RESULTSTR, "RESULTSTR")
+        .or_else(|| read_string_for_kind(himc, GCS_RESULTREADSTR, "RESULTREADSTR"))
+        .or_else(|| read_string_for_kind(himc, GCS_COMPSTR, "COMPSTR"))
+        .or_else(|| read_string_for_kind(himc, GCS_COMPREADSTR, "COMPREADSTR"));
 
-    unsafe { let _ = ImmReleaseContext(hwnd, himc); };
+    unsafe {
+        let _ = ImmReleaseContext(hwnd, himc);
+    };
 
     if terminal_ime_trace_enabled() {
         log::debug!("IME_TERM IME read result -> {:?}", result);
@@ -366,9 +377,6 @@ unsafe extern "system" fn ime_getmessage_hook_proc(
         CallNextHookEx, MSG, PM_REMOVE, TranslateMessage, WM_IME_COMPOSITION,
         WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
     };
-    use windows::Win32::UI::Input::Ime::{
-        GCS_RESULTREADSTR, GCS_RESULTSTR,
-    };
 
     if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
         unsafe {
@@ -385,10 +393,6 @@ unsafe extern "system" fn ime_getmessage_hook_proc(
                     }
                 }
                 message if message == WM_IME_COMPOSITION => {
-                    let composition_flags = msg.lParam.0 as u32;
-                    if (composition_flags & (GCS_RESULTSTR.0 | GCS_RESULTREADSTR.0)) != 0 {
-                        queue_ime_endcomposition_text(msg.hwnd);
-                    }
                     if terminal_ime_trace_enabled() {
                         log::debug!(
                             "IME_TERM_CMP message time={} wparam=0x{:X} lparam=0x{:X}",
@@ -555,9 +559,52 @@ fn should_defer_keystroke_to_ime(ks: &Keystroke, ime_processkey_pending: bool) -
         return false;
     }
 
-    !ks.key_char
+    // key_char が存在する場合、文字種で判定
+    if let Some(ref key_char) = ks.key_char {
+        if !key_char.is_empty() {
+            // ASCII文字はIME処理中なので defer（ローマ字入力中の a, k, i 等）
+            // 非ASCII文字はIME確定文字なので defer 解除（あ, 漢字 等）
+            let defer = key_char.chars().all(|ch| ch.is_ascii());
+            if terminal_ime_trace_enabled() {
+                log::debug!(
+                    "IME_TERM should_defer key_char={:?} all_ascii={} -> defer={}",
+                    key_char, defer, defer
+                );
+            }
+            return defer;
+        }
+    }
+
+    // key_char が空または None → defer（IMEがまだ処理中）
+    true
+}
+
+#[cfg(target_os = "windows")]
+fn should_route_keystroke_via_text_input(ks: &Keystroke) -> bool {
+    if ks.modifiers.control || ks.modifiers.alt {
+        return false;
+    }
+
+    ks.key_char
         .as_ref()
-        .is_some_and(|key_char| !key_char.is_empty())
+        .is_some_and(|key_char| !key_char.is_empty() && key_char.chars().any(|ch| !ch.is_ascii()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn should_route_keystroke_via_text_input(_ks: &Keystroke) -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
+fn should_forward_replace_text_to_terminal(text: &str, _ime_composing: bool) -> bool {
+    // On Windows, all non-empty text from replace_text_in_range should be forwarded.
+    // Both IME composition commits and regular keystrokes flow through this path.
+    !text.is_empty()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn should_forward_replace_text_to_terminal(text: &str, _ime_composing: bool) -> bool {
+    !text.is_empty()
 }
 
 /// Terminal connection state — two-phase init pattern
@@ -604,6 +651,7 @@ pub struct TerminalPane {
     is_selecting: bool,
     ime_composing: bool,
     wheel_scroll_line_remainder: f32,
+    last_user_input: Option<(UserInputSource, Vec<u8>, Instant)>,
     /// Keystrokes buffered while PTY is still connecting (Pending state)
     pending_input: Vec<u8>,
     pending_process_exit_status: Option<i32>,
@@ -643,7 +691,6 @@ impl TerminalPane {
                             shell: shell_for_spawn,
                             cols: initial_cols,
                             rows: initial_rows,
-                            working_directory: None,
                             env: Vec::new(),
                         };
                         spawn_pty(config)
@@ -710,26 +757,54 @@ impl TerminalPane {
                         }
                     }
 
-                    let mut should_notify = match this.update(cx, |pane: &mut TerminalPane, _cx| {
-                        if process_exit_status.is_some() {
-                            pane.pending_process_exit_status = process_exit_status;
-                        }
-                        pane.refresh_snapshot(false)
-                    }) {
-                        Ok(should_notify) => should_notify,
-                        Err(_) => break,
-                    };
+                    if process_exit_status.is_some()
+                        && this
+                            .update(cx, |pane: &mut TerminalPane, _cx| {
+                                pane.pending_process_exit_status = process_exit_status;
+                            })
+                            .is_err()
+                    {
+                        break;
+                    }
 
-                    if !should_notify {
-                        cx.background_executor()
-                            .timer(std::time::Duration::from_millis(ASYNC_PARSE_SETTLE_MILLIS))
-                            .await;
+                    let mut should_notify = false;
+                    let mut settled = false;
+                    for attempt in 0..ASYNC_PARSE_RETRY_LIMIT {
                         should_notify = match this.update(cx, |pane: &mut TerminalPane, _cx| {
                             pane.refresh_snapshot(false)
                         }) {
                             Ok(should_notify) => should_notify,
-                            Err(_) => break,
+                            Err(_) => {
+                                settled = true;
+                                break;
+                            }
                         };
+
+                        if should_notify {
+                            break;
+                        }
+
+                        if attempt + 1 == ASYNC_PARSE_RETRY_LIMIT {
+                            settled = true;
+                            break;
+                        }
+
+                        cx.background_executor()
+                            .timer(std::time::Duration::from_millis(ASYNC_PARSE_SETTLE_MILLIS))
+                            .await;
+                    }
+
+                    if this
+                        .update(cx, |pane: &mut TerminalPane, _cx| {
+                            pane.surface.finish_output_event();
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+
+                    if settled && !should_notify {
+                        continue;
                     }
 
                     if should_notify
@@ -860,6 +935,7 @@ impl TerminalPane {
             is_selecting: false,
             ime_composing: false,
             wheel_scroll_line_remainder: 0.0,
+            last_user_input: None,
             pending_input: Vec::new(),
             pending_process_exit_status: None,
             glyph_cache: Default::default(),
@@ -1184,9 +1260,7 @@ impl TerminalPane {
                 // Don't register IME handler when input is suppressed
                 // (e.g., group editor overlay is open)
                 if !suppressed.load(Ordering::Relaxed) {
-                    if terminal_ime_trace_enabled() {
-                        log::debug!("IME_TERM register_input handler");
-                    }
+                    log::trace!("IME_TERM register_input handler");
                     let handler = ElementInputHandler::new(bounds, entity.clone());
                     window.handle_input(&focus, handler, cx);
                 }
@@ -1313,19 +1387,10 @@ impl TerminalPane {
                 None
             };
             #[cfg(target_os = "windows")]
-            if self.background_image_path.is_none()
-                && snapshot_can_present_natively(&render_snapshot)
             {
-                gpu_terminal_canvas(
-                    render_snapshot.clone(),
-                    cursor,
-                    selection,
-                    config,
-                    gpu.clone(),
-                    self.glyph_cache.clone(),
-                )
-                .into_any_element()
-            } else {
+                let _ = cursor;
+                let _ = snapshot_can_present_natively(&render_snapshot);
+                let _ = gpu_terminal_canvas;
                 gpu.lock().hide_native_presenter();
                 terminal_canvas(
                     render_snapshot.clone(),
@@ -1399,10 +1464,6 @@ impl Render for TerminalPane {
 }
 
 impl TerminalPane {
-    pub fn send_input(&self, data: &[u8]) -> std::io::Result<usize> {
-        self.surface.write_input(data)
-    }
-
     fn selection_range(&self) -> Option<(SelectionPoint, SelectionPoint)> {
         let start = self.selection_anchor?;
         let end = self.selection_head?;
@@ -1460,45 +1521,6 @@ impl TerminalPane {
         })
     }
 
-    fn selection_cols_for_row(&self, row: u16) -> Option<(u16, u16)> {
-        let (start, end) = self.selection_range()?;
-        if row < start.row || row > end.row {
-            return None;
-        }
-
-        let start_col = if row == start.row { start.col } else { 0 };
-        let end_col = if row == end.row {
-            end.col
-        } else {
-            self.term_cols
-        };
-
-        if start_col >= end_col {
-            None
-        } else {
-            Some((start_col, end_col.min(self.term_cols)))
-        }
-    }
-
-    fn selection_overlay(&self, row: u16, cell_w: f32, cell_h: f32) -> Option<Div> {
-        let (start_col, end_col) = self.selection_cols_for_row(row)?;
-        let width_cols = end_col.saturating_sub(start_col);
-        if width_cols == 0 {
-            return None;
-        }
-
-        Some(
-            div()
-                .absolute()
-                .top_0()
-                .left(px(HORIZONTAL_TEXT_PADDING + cell_w * start_col as f32))
-                .h(px(cell_h))
-                .w(px(cell_w * width_cols as f32))
-                .bg(rgba(((SELECTION_BG << 8) | 0x55) as u32))
-                .rounded(px(2.0)),
-        )
-    }
-
     fn selected_text(&self) -> Option<String> {
         let (start, end) = self.selection_range()?;
         let mut lines = Vec::new();
@@ -1542,11 +1564,51 @@ impl TerminalPane {
         }
     }
 
+    fn should_drop_duplicate_user_input(&mut self, source: UserInputSource, data: &[u8]) -> bool {
+        let now = Instant::now();
+        let duplicate = self
+            .last_user_input
+            .as_ref()
+            .is_some_and(|(previous_source, previous, at)| {
+                if previous != data {
+                    return false;
+                }
+
+                let elapsed = now.duration_since(*at);
+                if *previous_source != source {
+                    return elapsed <= Duration::from_millis(CROSS_ROUTE_DUPLICATE_WINDOW_MS);
+                }
+
+                source.is_commit_source()
+                    && elapsed <= Duration::from_millis(SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS)
+            });
+
+        self.last_user_input = Some((source, data.to_vec(), now));
+
+        if duplicate && terminal_ime_trace_enabled() {
+            log::debug!(
+                "IME_TERM dropped cross-route duplicate source={:?} bytes={:?}",
+                source as u8,
+                data
+            );
+        }
+
+        duplicate
+    }
+
+    fn write_user_input_bytes(&mut self, source: UserInputSource, data: &[u8]) {
+        if data.is_empty() || self.should_drop_duplicate_user_input(source, data) {
+            return;
+        }
+
+        self.write_terminal_bytes(data);
+    }
+
     fn flush_ime_endcomposition_queue(&mut self) {
         #[cfg(target_os = "windows")]
         {
             let texts = take_ime_endcomposition_texts();
-            if terminal_ime_trace_enabled() {
+            if !texts.is_empty() && terminal_ime_trace_enabled() {
                 log::debug!(
                     "IME_TERM flush queue: {} item(s) from IME end composition",
                     texts.len()
@@ -1559,11 +1621,15 @@ impl TerminalPane {
                 }
 
                 if terminal_ime_trace_enabled() {
-                    log::debug!("IME_TERM flush endcomposition text={:?}", text);
+                    log::debug!(
+                        "IME_TERM flush endcomposition text={:?} bytes={:?}",
+                        text,
+                        text.as_bytes()
+                    );
                 }
 
-                let bytes = normalize_terminal_newlines(&text);
-                self.write_terminal_bytes(&bytes);
+                // Forward to PTY — duplicates are suppressed by should_drop_duplicate_user_input
+                self.write_user_input_bytes(UserInputSource::ImeEndComposition, text.as_bytes());
             }
         }
 
@@ -1684,11 +1750,7 @@ impl TerminalPane {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
-        log_terminal_ime_keystroke(
-            "on_key_down",
-            &event.keystroke,
-            "terminal pane keydown",
-        );
+        log_terminal_ime_keystroke("on_key_down", &event.keystroke, "terminal pane keydown");
 
         if self.input_suppressed.load(Ordering::Relaxed) {
             return;
@@ -1717,6 +1779,13 @@ impl TerminalPane {
             return;
         }
 
+        if should_route_keystroke_via_text_input(&event.keystroke) {
+            if self.clear_selection() {
+                cx.notify();
+            }
+            return;
+        }
+
         let bytes = match Self::keystroke_to_bytes(&event.keystroke) {
             Some(b) => b,
             None => {
@@ -1735,7 +1804,7 @@ impl TerminalPane {
         match self.state {
             TerminalState::Running => {
                 let selection_changed = self.clear_selection();
-                let _ = self.surface.write_input(&bytes);
+                self.write_user_input_bytes(UserInputSource::KeyDown, &bytes);
                 if selection_changed {
                     cx.notify();
                 }
@@ -1882,7 +1951,8 @@ impl EntityInputHandler for TerminalPane {
         if terminal_ime_trace_enabled() {
             log::debug!(
                 "IME_TERM text_for_range called range={:?} adjusted={:?}",
-                _range, _adjusted
+                _range,
+                _adjusted
             );
         }
         None
@@ -1946,17 +2016,21 @@ impl EntityInputHandler for TerminalPane {
                 text.as_bytes()
             );
         }
+        let was_composing = self.ime_composing;
+        let should_forward = should_forward_replace_text_to_terminal(text, was_composing);
         self.ime_composing = false;
         IME_VK_PROCESSKEY.store(false, Ordering::Release);
-        match self.state {
-            TerminalState::Running => {
-                let _ = self.surface.write_input(text.as_bytes());
-            }
-            TerminalState::Pending => {
-                self.pending_input.extend_from_slice(text.as_bytes());
-            }
-            TerminalState::Failed(_) => {}
+        if terminal_ime_trace_enabled() {
+            log::debug!(
+                "IME_TERM replace_text_in_range forward={} composing_before_reset={}",
+                should_forward,
+                was_composing
+            );
         }
+        if !should_forward {
+            return;
+        }
+        self.write_user_input_bytes(UserInputSource::TextCommit, text.as_bytes());
     }
 
     /// Preedit (composing) text from IME — currently not displayed,
@@ -1993,7 +2067,8 @@ impl EntityInputHandler for TerminalPane {
         if terminal_ime_trace_enabled() {
             log::debug!(
                 "IME_TERM bounds_for_range called range={:?} composing={}",
-                _range, self.ime_composing
+                _range,
+                self.ime_composing
             );
         }
         if !self.ime_composing {
@@ -2045,8 +2120,9 @@ fn slice_text_by_cols(text: &str, start_col: usize, end_col: usize) -> String {
 #[cfg(test)]
 mod snapshot_tests {
     use super::{
-        scroll_lines_from_wheel_delta, should_defer_keystroke_to_ime, terminal_layout_size,
-        viewport_rows_to_refresh,
+        scroll_lines_from_wheel_delta, should_defer_keystroke_to_ime,
+        should_forward_replace_text_to_terminal, should_route_keystroke_via_text_input,
+        terminal_layout_size, viewport_rows_to_refresh,
     };
     use gpui::{Bounds, Keystroke, Modifiers, ScrollDelta, point, px, size};
 
@@ -2072,7 +2148,7 @@ mod snapshot_tests {
     }
 
     #[test]
-    fn should_defer_keystroke_to_ime_only_for_non_text_events() {
+    fn should_defer_keystroke_to_ime_handles_ascii_and_non_ascii() {
         let process_key = Keystroke {
             modifiers: Modifiers::default(),
             key: "ime-process".into(),
@@ -2083,10 +2159,67 @@ mod snapshot_tests {
             key: "a".into(),
             key_char: Some("a".into()),
         };
+        let non_ascii_key = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "a".into(),
+            key_char: Some("\u{3042}".into()), // あ
+        };
 
-        assert!(should_defer_keystroke_to_ime(&process_key, true));
-        assert!(!should_defer_keystroke_to_ime(&ascii_key, true));
+        // pending=false → always false
+        assert!(!should_defer_keystroke_to_ime(&process_key, false));
         assert!(!should_defer_keystroke_to_ime(&ascii_key, false));
+        assert!(!should_defer_keystroke_to_ime(&non_ascii_key, false));
+
+        // pending=true, no key_char → defer (IME still processing)
+        assert!(should_defer_keystroke_to_ime(&process_key, true));
+
+        // pending=true, ASCII key_char → defer (romaji input like a, k, i)
+        assert!(should_defer_keystroke_to_ime(&ascii_key, true));
+
+        // pending=true, non-ASCII key_char → don't defer (committed char like あ)
+        assert!(!should_defer_keystroke_to_ime(&non_ascii_key, true));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn printable_windows_keys_route_via_text_input() {
+        let printable_ascii = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "a".into(),
+            key_char: Some("a".into()),
+        };
+        let printable_non_ascii = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "ime".into(),
+            key_char: Some("あ".into()),
+        };
+        let ctrl = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                ..Modifiers::default()
+            },
+            key: "c".into(),
+            key_char: Some("c".into()),
+        };
+
+        assert!(!should_route_keystroke_via_text_input(&printable_ascii));
+        assert!(should_route_keystroke_via_text_input(&printable_non_ascii));
+        assert!(!should_route_keystroke_via_text_input(&ctrl));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn replace_text_in_range_forwards_text_commits_on_windows() {
+        assert!(should_forward_replace_text_to_terminal("a", false));
+        assert!(should_forward_replace_text_to_terminal("あ", false));
+        assert!(should_forward_replace_text_to_terminal("あ", true));
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn replace_text_in_range_keeps_text_commits_on_non_windows() {
+        assert!(should_forward_replace_text_to_terminal("a", false));
+        assert!(should_forward_replace_text_to_terminal("あ", false));
     }
 
     #[test]
