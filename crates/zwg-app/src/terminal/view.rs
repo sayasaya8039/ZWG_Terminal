@@ -246,13 +246,15 @@ fn read_ime_result_text(hwnd: windows::Win32::Foundation::HWND) -> Option<String
     ) -> Option<String> {
         use std::ffi::c_void;
 
-        let required_bytes = unsafe { ImmGetCompositionStringW(himc, kind, None, 0) as usize };
-        if required_bytes == 0 {
+        let required_bytes_raw =
+            unsafe { ImmGetCompositionStringW(himc, kind, None, 0) };
+        if required_bytes_raw <= 0 {
             if terminal_ime_trace_enabled() {
-                log::debug!("IME_TERM {} size=0", kind_name);
+                log::debug!("IME_TERM {} size={}", kind_name, required_bytes_raw);
             }
             return None;
         }
+        let required_bytes = required_bytes_raw as usize;
 
         let mut buffer = vec![0u8; required_bytes];
         let buffer_len = u32::try_from(buffer.len()).ok()?;
@@ -264,14 +266,15 @@ fn read_ime_result_text(hwnd: windows::Win32::Foundation::HWND) -> Option<String
                 buffer_len,
             )
         };
-        if written == 0 {
+        if written <= 0 {
             if terminal_ime_trace_enabled() {
-                log::debug!("IME_TERM {} written=0", kind_name);
+                log::debug!("IME_TERM {} written={}", kind_name, written);
             }
             return None;
         }
+        let written_len = (written as usize).min(buffer.len());
 
-        let bytes = Vec::from(&buffer[..written as usize]);
+        let bytes = Vec::from(&buffer[..written_len]);
         if bytes.is_empty() {
             if terminal_ime_trace_enabled() {
                 log::debug!("IME_TERM {} bytes empty", kind_name);
@@ -279,7 +282,7 @@ fn read_ime_result_text(hwnd: windows::Win32::Foundation::HWND) -> Option<String
             return None;
         }
 
-        if !bytes.len().is_multiple_of(2) {
+        if bytes.len() % 2 != 0 {
             if terminal_ime_trace_enabled() {
                 log::debug!(
                     "IME_TERM {} odd byte length for utf16-le: {}",
@@ -377,6 +380,7 @@ unsafe extern "system" fn ime_getmessage_hook_proc(
         CallNextHookEx, MSG, PM_REMOVE, TranslateMessage, WM_IME_COMPOSITION,
         WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
     };
+    use windows::Win32::UI::Input::Ime::{GCS_RESULTREADSTR, GCS_RESULTSTR};
 
     if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
         unsafe {
@@ -393,6 +397,14 @@ unsafe extern "system" fn ime_getmessage_hook_proc(
                     }
                 }
                 message if message == WM_IME_COMPOSITION => {
+                    // Read committed result text during composition — required for
+                    // multi-segment input (e.g. "今日は" typed as separate conversions).
+                    // WM_IME_ENDCOMPOSITION only returns the last segment, so we must
+                    // capture intermediate GCS_RESULTSTR results here.
+                    let composition_flags = msg.lParam.0 as u32;
+                    if (composition_flags & (GCS_RESULTSTR.0 | GCS_RESULTREADSTR.0)) != 0 {
+                        queue_ime_endcomposition_text(msg.hwnd);
+                    }
                     if terminal_ime_trace_enabled() {
                         log::debug!(
                             "IME_TERM_CMP message time={} wparam=0x{:X} lparam=0x{:X}",
@@ -1559,7 +1571,13 @@ impl TerminalPane {
             TerminalState::Running => {
                 let _ = self.surface.write_input(data);
             }
-            TerminalState::Pending => self.pending_input.extend_from_slice(data),
+            TerminalState::Pending => {
+                // Limit buffered input to prevent unbounded memory growth
+                const MAX_PENDING_INPUT: usize = 64 * 1024;
+                if self.pending_input.len() + data.len() <= MAX_PENDING_INPUT {
+                    self.pending_input.extend_from_slice(data);
+                }
+            }
             TerminalState::Failed(_) => {}
         }
     }
@@ -1811,9 +1829,9 @@ impl TerminalPane {
                 cx.stop_propagation();
             }
             TerminalState::Pending => {
-                // Buffer input while PTY is connecting
+                // Buffer input while PTY is connecting (capped)
+                self.write_terminal_bytes(&bytes);
                 let selection_changed = self.clear_selection();
-                self.pending_input.extend_from_slice(&bytes);
                 if selection_changed {
                     cx.notify();
                 }
