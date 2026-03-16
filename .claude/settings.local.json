@@ -1,0 +1,7 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -r \"error!\\\\|warn!\\\\|log\\\\|debug\\\\|panic\" crates/ghostty-app/src/terminal/*.rs)"
+    ]
+  }
+}
