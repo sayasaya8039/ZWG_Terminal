@@ -121,8 +121,10 @@ fn should_defer_snippet_keystroke_to_ime(keystroke: &Keystroke) -> bool {
         return false;
     }
 
-    if direct_text_from_snippet_keystroke(keystroke).is_some() {
-        return false;
+    if let Some(text) = direct_text_from_snippet_keystroke(keystroke) {
+        // Keep direct IME-resolved non-ASCII characters (e.g. あ, 漢字候補確定) in snippet inputs,
+        // but continue deferring ASCII keystrokes during IME processing.
+        return text.chars().all(|ch| ch.is_ascii());
     }
 
     !keystroke
@@ -10351,6 +10353,18 @@ mod tests {
 
         SNIPPET_IME_VK_PROCESSKEY.store(true, Ordering::Release);
         assert!(!should_defer_snippet_keystroke_to_ime(&keystroke));
+    }
+
+    #[test]
+    fn should_defer_snippet_keystroke_to_ime_defers_ascii_key_input() {
+        let keystroke = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "a".into(),
+            key_char: Some("a".into()),
+        };
+
+        SNIPPET_IME_VK_PROCESSKEY.store(true, Ordering::Release);
+        assert!(should_defer_snippet_keystroke_to_ime(&keystroke));
     }
 
     #[test]
