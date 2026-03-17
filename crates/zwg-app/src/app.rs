@@ -35,7 +35,9 @@ use crate::shell::{self, ShellType};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::terminal::TerminalSettings;
 use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
-use crate::{ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, OpenSettings, Quit, SplitDown, SplitRight};
+use crate::{
+    ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, OpenSettings, Quit, SplitDown, SplitRight,
+};
 
 const WINDOW_BG: u32 = 0x1C1C1E;
 const PANEL_BG: u32 = 0x323234;
@@ -65,8 +67,8 @@ unsafe extern "system" fn input_method_getmessage_hook_proc(
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
     use windows::Win32::UI::WindowsAndMessaging::{
-        CallNextHookEx, MSG, PM_REMOVE, WM_IME_COMPOSITION,
-        WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
+        CallNextHookEx, MSG, PM_REMOVE, WM_IME_COMPOSITION, WM_IME_ENDCOMPOSITION,
+        WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
     };
 
     if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
@@ -114,7 +116,9 @@ unsafe extern "system" fn input_method_getmessage_hook_proc(
                 }
                 if vk == 0xE5 {
                     if input_method_trace_enabled() {
-                        log::debug!("IME_HOOK VK_PROCESSKEY detected -> latch (flag only, no TranslateMessage)");
+                        log::debug!(
+                            "IME_HOOK VK_PROCESSKEY detected -> latch (flag only, no TranslateMessage)"
+                        );
                     }
                     // NOTE: TranslateMessage is called by the terminal IME hook
                     // (terminal/view.rs) only.  Calling it from both hooks causes
@@ -321,6 +325,64 @@ const THEME_PREVIEWS: [(&str, u32); 3] = [
 ];
 
 const APPEARANCE_FONT_FAMILIES: [&str; 3] = SUPPORTED_TERMINAL_FONT_FAMILIES;
+const SNIPPET_PANEL_MARGIN: f32 = 12.0;
+const SNIPPET_PANEL_TOP_OFFSET: f32 = 46.0;
+const SNIPPET_PANEL_MAX_WIDTH: f32 = 940.0;
+const SNIPPET_PANEL_MAX_HEIGHT: f32 = 560.0;
+
+const SNIPPET_TAG_EMAIL: &[&str] = &["メール", "仕事"];
+const SNIPPET_TAG_REACT: &[&str] = &["React", "コード", "テンプレート"];
+const SNIPPET_TAG_MEETING: &[&str] = &["会議", "ドキュメント"];
+const SNIPPET_TAG_ADDRESS: &[&str] = &["住所", "仕事"];
+const SNIPPET_TAG_GIT: &[&str] = &["Git", "開発"];
+
+const SNIPPET_PANEL_ITEMS: [SnippetPanelItem; 5] = [
+    SnippetPanelItem {
+        title: "メールの署名",
+        summary: "ビジネスメールの締めに使う定型の署名です。",
+        content: "よろしくお願いいたします。\n\n山田太郎\n〇〇株式会社 開発部\nEmail: yamada@example.com\nTel: 03-1234-5678",
+        tags: SNIPPET_TAG_EMAIL,
+        favorite: true,
+        updated_at: "3月16日 10:42",
+        source: "Mail",
+    },
+    SnippetPanelItem {
+        title: "React コンポーネントテンプレート",
+        summary: "関数コンポーネントを素早く起こすための雛形です。",
+        content: "import React from 'react';\n\ninterface Props {\n  // プロパティをここに定義\n}\n\nexport const ComponentName: React.FC<Props> = (props) => {\n  return (\n    <div>\n      {/* コンテンツ */}\n    </div>\n  );\n};",
+        tags: SNIPPET_TAG_REACT,
+        favorite: true,
+        updated_at: "3月15日 21:08",
+        source: "VS Code",
+    },
+    SnippetPanelItem {
+        title: "会議の議事録フォーマット",
+        summary: "議題、決定事項、TODO を揃えた議事録テンプレートです。",
+        content: "## 会議議事録\n\n**日時**:\n**参加者**:\n**議題**:\n\n### 決定事項\n- \n\n### 課題・TODO\n- \n\n### 次回予定\n- ",
+        tags: SNIPPET_TAG_MEETING,
+        favorite: false,
+        updated_at: "3月14日 18:20",
+        source: "Docs",
+    },
+    SnippetPanelItem {
+        title: "会社住所",
+        summary: "請求先や契約書にそのまま貼り付けられる住所です。",
+        content: "〒100-0001 東京都千代田区千代田1-1-1",
+        tags: SNIPPET_TAG_ADDRESS,
+        favorite: false,
+        updated_at: "3月13日 09:14",
+        source: "Contacts",
+    },
+    SnippetPanelItem {
+        title: "Git コミットテンプレート",
+        summary: "feat/fix 形式に揃えたコミットメッセージの下書きです。",
+        content: "feat: 新機能の追加\n\n- 変更内容の詳細1\n- 変更内容の詳細2\n\n関連Issue: #",
+        tags: SNIPPET_TAG_GIT,
+        favorite: false,
+        updated_at: "3月12日 22:05",
+        source: "Git",
+    },
+];
 
 fn cycle_string_option(current: &str, options: &[&str], delta: i32) -> String {
     if options.is_empty() {
@@ -480,6 +542,54 @@ struct AppNotice {
     duration_ms: u64,
 }
 
+#[derive(Clone, Copy)]
+struct SnippetPanelItem {
+    title: &'static str,
+    summary: &'static str,
+    content: &'static str,
+    tags: &'static [&'static str],
+    favorite: bool,
+    updated_at: &'static str,
+    source: &'static str,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct SnippetPanelFrame {
+    top: f32,
+    left: f32,
+    width: f32,
+    height: f32,
+}
+
+fn snippet_panel_frame(viewport_w: f32, viewport_h: f32) -> SnippetPanelFrame {
+    let width = (viewport_w - (SNIPPET_PANEL_MARGIN * 2.0))
+        .max(420.0)
+        .min(SNIPPET_PANEL_MAX_WIDTH);
+    let height = (viewport_h - SNIPPET_PANEL_TOP_OFFSET - 16.0)
+        .max(260.0)
+        .min(SNIPPET_PANEL_MAX_HEIGHT);
+    let left = (viewport_w - width - SNIPPET_PANEL_MARGIN).max(SNIPPET_PANEL_MARGIN);
+
+    SnippetPanelFrame {
+        top: SNIPPET_PANEL_TOP_OFFSET,
+        left,
+        width,
+        height,
+    }
+}
+
+fn next_filtered_index(current: Option<usize>, visible: &[usize], step: isize) -> Option<usize> {
+    if visible.is_empty() {
+        return None;
+    }
+
+    let current_position = current
+        .and_then(|value| visible.iter().position(|candidate| *candidate == value))
+        .unwrap_or(0);
+    let next_position = (current_position as isize + step).rem_euclid(visible.len() as isize);
+    visible.get(next_position as usize).copied()
+}
+
 fn byte_range_to_utf16_range(text: &str, range: &Range<usize>) -> Range<usize> {
     byte_index_to_utf16_offset(text, range.start)..byte_index_to_utf16_offset(text, range.end)
 }
@@ -554,7 +664,6 @@ enum AiSettingsImeTarget {
     Model,
 }
 
-
 /// Root view containing tab bar + split container + overlays.
 pub struct RootView {
     state: Entity<AppState>,
@@ -563,6 +672,9 @@ pub struct RootView {
     show_settings: bool,
     show_snippet_palette: bool,
     show_close_confirm: bool,
+    snippet_selected_index: usize,
+    snippet_favorites: Vec<bool>,
+    snippet_favorites_only: bool,
     keyboard_settings_active_text: Option<KeyboardSettingsTextField>,
     ai_settings_active_text: Option<AiSettingsTextField>,
     app_notice: Option<AppNotice>,
@@ -673,6 +785,12 @@ impl RootView {
             show_settings: false,
             show_snippet_palette: false,
             show_close_confirm: false,
+            snippet_selected_index: 0,
+            snippet_favorites: SNIPPET_PANEL_ITEMS
+                .iter()
+                .map(|item| item.favorite)
+                .collect(),
+            snippet_favorites_only: false,
             keyboard_settings_active_text: None,
             ai_settings_active_text: None,
             app_notice: None,
@@ -766,6 +884,7 @@ impl RootView {
 
     fn open_settings_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_shell_menu = false;
+        self.show_snippet_palette = false;
         self.show_settings = true;
         self.keyboard_settings_active_text = None;
         self.ai_settings_active_text = None;
@@ -974,6 +1093,7 @@ impl RootView {
         let should_confirm = config.confirm_on_close;
         if should_confirm {
             self.show_shell_menu = false;
+            self.show_snippet_palette = false;
             self.show_settings = false;
             self.show_close_confirm = true;
             cx.notify();
@@ -1332,7 +1452,7 @@ impl RootView {
     }
 
     fn shortcut_actions_blocked(&self) -> bool {
-        self.show_settings || self.show_close_confirm
+        self.show_settings || self.show_close_confirm || self.show_snippet_palette
     }
 
     pub fn focus_active_terminal(&self, window: &mut Window, cx: &Context<Self>) {
@@ -1345,11 +1465,152 @@ impl RootView {
     }
 
     fn sync_terminal_input_suppression(&self, cx: &Context<Self>) {
-        let suppressed = self.show_shell_menu || self.show_settings || self.show_close_confirm;
+        let suppressed = self.show_shell_menu
+            || self.show_settings
+            || self.show_close_confirm
+            || self.show_snippet_palette;
         self.state
             .read(cx)
             .terminal_input_suppressed
             .store(suppressed, Ordering::Relaxed);
+    }
+
+    fn filtered_snippet_indices(&self) -> Vec<usize> {
+        SNIPPET_PANEL_ITEMS
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                (!self.snippet_favorites_only || self.snippet_is_favorite(index)).then_some(index)
+            })
+            .collect()
+    }
+
+    fn snippet_is_favorite(&self, index: usize) -> bool {
+        self.snippet_favorites
+            .get(index)
+            .copied()
+            .unwrap_or_else(|| SNIPPET_PANEL_ITEMS[index].favorite)
+    }
+
+    fn selected_snippet_index(&self) -> Option<usize> {
+        let visible = self.filtered_snippet_indices();
+        if visible.contains(&self.snippet_selected_index) {
+            Some(self.snippet_selected_index)
+        } else {
+            visible.first().copied()
+        }
+    }
+
+    fn ensure_valid_snippet_selection(&mut self) {
+        if let Some(index) = self.selected_snippet_index() {
+            self.snippet_selected_index = index;
+        }
+    }
+
+    fn toggle_snippet_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let next_visible = !self.show_snippet_palette;
+        self.show_snippet_palette = next_visible;
+        self.show_shell_menu = false;
+        self.show_settings = false;
+        if next_visible {
+            self.ensure_valid_snippet_selection();
+            window.focus(&self.focus_handle);
+        }
+        cx.notify();
+    }
+
+    fn close_snippet_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.show_snippet_palette {
+            return;
+        }
+        self.show_snippet_palette = false;
+        cx.notify();
+        self.focus_active_terminal(window, cx);
+    }
+
+    fn select_snippet_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.snippet_selected_index = index;
+        self.ensure_valid_snippet_selection();
+        cx.notify();
+    }
+
+    fn move_snippet_selection(&mut self, step: isize, cx: &mut Context<Self>) {
+        let visible = self.filtered_snippet_indices();
+        if let Some(index) = next_filtered_index(self.selected_snippet_index(), &visible, step) {
+            self.snippet_selected_index = index;
+            cx.notify();
+        }
+    }
+
+    fn copy_selected_snippet(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.selected_snippet_index() else {
+            return;
+        };
+        let item = SNIPPET_PANEL_ITEMS[index];
+        cx.write_to_clipboard(ClipboardItem::new_string(item.content.to_string()));
+        self.show_app_notice(
+            "定型文をコピーしました",
+            format!("{} をクリップボードへ送信しました。", item.title),
+            2200,
+            cx,
+        );
+    }
+
+    fn toggle_selected_snippet_favorite(&mut self, cx: &mut Context<Self>) {
+        let Some(index) = self.selected_snippet_index() else {
+            return;
+        };
+        if let Some(favorite) = self.snippet_favorites.get_mut(index) {
+            *favorite = !*favorite;
+        }
+        self.ensure_valid_snippet_selection();
+        cx.notify();
+    }
+
+    fn toggle_snippet_favorites_only(&mut self, cx: &mut Context<Self>) {
+        self.snippet_favorites_only = !self.snippet_favorites_only;
+        self.ensure_valid_snippet_selection();
+        cx.notify();
+    }
+
+    fn show_snippet_stub_notice(
+        &mut self,
+        title: &'static str,
+        detail: &'static str,
+        cx: &mut Context<Self>,
+    ) {
+        self.show_app_notice(title, detail, 2200, cx);
+    }
+
+    fn handle_snippet_palette_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.show_snippet_palette {
+            return false;
+        }
+
+        match event.keystroke.key.as_ref() {
+            "escape" => {
+                self.close_snippet_palette(window, cx);
+                true
+            }
+            "up" => {
+                self.move_snippet_selection(-1, cx);
+                true
+            }
+            "down" => {
+                self.move_snippet_selection(1, cx);
+                true
+            }
+            "enter" => {
+                self.copy_selected_snippet(cx);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn handle_ai_settings_key(
@@ -1498,6 +1759,11 @@ impl RootView {
         }
 
         if self.handle_custom_ai_settings_hotkeys(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.handle_snippet_palette_key(event, window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -1839,6 +2105,586 @@ impl RootView {
                                 )
                                 .child(div().text_size(px(13.0)).text_color(rgb(MUTED)).child(">")),
                         ),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_snippet_palette(
+        &mut self,
+        viewport_w: f32,
+        viewport_h: f32,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.show_snippet_palette {
+            return None;
+        }
+
+        let frame = snippet_panel_frame(viewport_w, viewport_h);
+        let sidebar_w = (frame.width * 0.36).clamp(276.0, 332.0);
+        let visible = self.filtered_snippet_indices();
+        let selected_index = self.selected_snippet_index();
+        let favorite_count = self
+            .snippet_favorites
+            .iter()
+            .filter(|value| **value)
+            .count();
+
+        let list_items = if visible.is_empty() {
+            vec![
+                div()
+                    .w_full()
+                    .rounded(px(12.0))
+                    .border_1()
+                    .border_color(rgba(0xffffff10))
+                    .bg(rgba(0xffffff06))
+                    .p(px(16.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .font_family(UI_FONT)
+                            .text_size(px(13.0))
+                            .text_color(rgb(TEXT))
+                            .child("表示できる定型文がありません"),
+                    )
+                    .child(
+                        div()
+                            .font_family(UI_FONT)
+                            .text_size(px(11.0))
+                            .text_color(rgb(SUBTEXT1))
+                            .child("お気に入りフィルタを解除すると一覧に戻ります。"),
+                    )
+                    .into_any_element(),
+            ]
+        } else {
+            visible
+                .iter()
+                .map(|index| {
+                    let item = SNIPPET_PANEL_ITEMS[*index];
+                    let is_selected = selected_index == Some(*index);
+                    let is_favorite = self.snippet_is_favorite(*index);
+                    let row_index = *index;
+
+                    let mut row = div()
+                        .id(ElementId::Name(format!("snippet-item-{row_index}").into()))
+                        .w_full()
+                        .rounded(px(12.0))
+                        .border_1()
+                        .border_color(if is_selected {
+                            rgba(0x0A84FF66)
+                        } else {
+                            rgba(0xffffff00)
+                        })
+                        .bg(if is_selected {
+                            rgba(0x0A84FF18)
+                        } else {
+                            rgba(0xffffff00)
+                        })
+                        .px(px(12.0))
+                        .py(px(10.0))
+                        .cursor_pointer()
+                        .hover(|style| style.bg(rgba(0xffffff10)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                this.select_snippet_index(row_index, cx);
+                            }),
+                        )
+                        .flex()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .w(px(28.0))
+                                .h(px(28.0))
+                                .rounded(px(8.0))
+                                .bg(if is_selected {
+                                    rgba(0x0A84FF33)
+                                } else {
+                                    rgba(0xffffff10)
+                                })
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    svg()
+                                        .path("ui/snippet-palette.svg")
+                                        .size(px(14.0))
+                                        .text_color(rgb(if is_selected {
+                                            TEXT
+                                        } else {
+                                            TEXT_SOFT
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(13.0))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(rgb(TEXT))
+                                                .child(item.title),
+                                        )
+                                        .child(if is_favorite {
+                                            svg()
+                                                .path("ui/star-filled.svg")
+                                                .size(px(12.0))
+                                                .text_color(rgb(0xF5C542))
+                                                .into_any_element()
+                                        } else {
+                                            div().into_any_element()
+                                        }),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(if is_selected {
+                                            SUBTEXT0
+                                        } else {
+                                            SUBTEXT1
+                                        }))
+                                        .child(item.summary),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(10.0))
+                                                .text_color(rgb(MUTED))
+                                                .child(item.source),
+                                        )
+                                        .children(item.tags.iter().take(2).map(|tag| {
+                                            snippet_tag_chip(tag, is_selected).into_any_element()
+                                        })),
+                                ),
+                        );
+
+                    if is_selected {
+                        row = row.shadow_lg();
+                    }
+
+                    row.into_any_element()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let detail = if let Some(index) = selected_index {
+            let item = SNIPPET_PANEL_ITEMS[index];
+            let is_favorite = self.snippet_is_favorite(index);
+            let content_lines = item
+                .content
+                .lines()
+                .map(|line| {
+                    div()
+                        .font_family(MONO_FONT)
+                        .text_size(px(12.0))
+                        .text_color(rgb(TEXT))
+                        .child(if line.is_empty() {
+                            " ".to_string()
+                        } else {
+                            line.to_string()
+                        })
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
+
+            div()
+                .flex_1()
+                .min_w(px(0.0))
+                .bg(rgb(PANEL_BG))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(px(58.0))
+                        .px(px(18.0))
+                        .border_b_1()
+                        .border_color(rgba(0xffffff10))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(4.0))
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(15.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(TEXT))
+                                        .child(item.title),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(SUBTEXT1))
+                                        .child(format!(
+                                            "{} から更新  {}",
+                                            item.updated_at, item.source
+                                        )),
+                                ),
+                        )
+                        .child(
+                            panel_icon_button(
+                                "snippet-detail-favorite",
+                                "ui/star.svg",
+                                is_favorite,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    this.toggle_selected_snippet_favorite(cx);
+                                }),
+                            ),
+                        )
+                        .child(
+                            panel_icon_button("snippet-detail-copy", "ui/copy.svg", false)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.copy_selected_snippet(cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            panel_icon_button("snippet-detail-edit", "ui/edit.svg", false)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.show_snippet_stub_notice(
+                                            "編集 UI は次段で接続します",
+                                            "今回は Figma ベースの表示パネルを先行導入しています。",
+                                            cx,
+                                        );
+                                    }),
+                                ),
+                        )
+                        .child(
+                            panel_icon_button("snippet-detail-delete", "ui/trash.svg", false)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.show_snippet_stub_notice(
+                                            "削除導線は次段で接続します",
+                                            "今回の差分ではパネル配置と選択導線を優先しています。",
+                                            cx,
+                                        );
+                                    }),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(18.0))
+                        .py(px(14.0))
+                        .border_b_1()
+                        .border_color(rgba(0xffffff10))
+                        .flex()
+                        .flex_col()
+                        .gap(px(10.0))
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(12.0))
+                                .text_color(rgb(SUBTEXT0))
+                                .child(item.summary),
+                        )
+                        .child(
+                            div().flex().items_center().gap(px(8.0)).children(
+                                item.tags
+                                    .iter()
+                                    .map(|tag| snippet_tag_chip(tag, false).into_any_element()),
+                            ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("snippet-detail-scroll")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_scroll()
+                        .scrollbar_width(px(6.0))
+                        .child(
+                            div()
+                                .w_full()
+                                .px(px(18.0))
+                                .py(px(16.0))
+                                .rounded(px(12.0))
+                                .border_1()
+                                .border_color(rgba(0xffffff10))
+                                .bg(rgba(0xffffff06))
+                                .p(px(16.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .children(content_lines),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(42.0))
+                        .px(px(18.0))
+                        .border_t_1()
+                        .border_color(rgba(0xffffff10))
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(11.0))
+                                .text_color(rgb(SUBTEXT1))
+                                .child("Enter でコピー / ↑↓ で選択移動 / Esc で閉じる"),
+                        )
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(11.0))
+                                .text_color(rgb(MUTED))
+                                .child("CopyQ 風 UI"),
+                        ),
+                )
+                .into_any_element()
+        } else {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .font_family(UI_FONT)
+                        .text_size(px(13.0))
+                        .text_color(rgb(SUBTEXT1))
+                        .child("表示できる定型文がありません"),
+                )
+                .into_any_element()
+        };
+
+        Some(
+            div()
+                .id("snippet-panel")
+                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.close_snippet_palette(window, cx);
+                }))
+                .absolute()
+                .top(px(frame.top))
+                .left(px(frame.left))
+                .w(px(frame.width))
+                .h(px(frame.height))
+                .rounded(px(14.0))
+                .overflow_hidden()
+                .border_1()
+                .border_color(rgba(0xffffff18))
+                .bg(rgb(PANEL_BG))
+                .shadow_lg()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(px(52.0))
+                        .px(px(16.0))
+                        .border_b_1()
+                        .border_color(rgba(0xffffff10))
+                        .bg(linear_gradient(
+                            180.0,
+                            linear_color_stop(rgba(0x3B3B3DEB), 0.0),
+                            linear_color_stop(rgba(0x2F2F31F8), 1.0),
+                        ))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .w(px(30.0))
+                                .h(px(30.0))
+                                .rounded(px(9.0))
+                                .bg(rgba(0xffffff12))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    svg()
+                                        .path("ui/snippet-palette.svg")
+                                        .size(px(15.0))
+                                        .text_color(rgb(TEXT_SOFT)),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(TEXT))
+                                        .child("定型文ライブラリ"),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(11.0))
+                                        .text_color(rgb(SUBTEXT1))
+                                        .child(format!(
+                                            "{} 件 / お気に入り {} 件",
+                                            SNIPPET_PANEL_ITEMS.len(),
+                                            favorite_count
+                                        )),
+                                ),
+                        )
+                        .child(
+                            panel_icon_button(
+                                "snippet-panel-favorites",
+                                "ui/star.svg",
+                                self.snippet_favorites_only,
+                            )
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                    this.toggle_snippet_favorites_only(cx);
+                                }),
+                            ),
+                        )
+                        .child(
+                            panel_icon_button("snippet-panel-new", "ui/plus.svg", false)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.show_snippet_stub_notice(
+                                            "新規作成 UI は次段で接続します",
+                                            "Figma の追加ダイアログ導線を繋ぐ前にパネル全体を先に導入しています。",
+                                            cx,
+                                        );
+                                    }),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .flex()
+                        .child(
+                            div()
+                                .w(px(sidebar_w))
+                                .min_w(px(sidebar_w))
+                                .bg(rgb(PANEL_SIDEBAR_BG))
+                                .border_r_1()
+                                .border_color(rgba(0xffffff10))
+                                .flex()
+                                .flex_col()
+                                .child(
+                                    div()
+                                        .p(px(16.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(12.0))
+                                        .child(
+                                            div()
+                                                .h(px(34.0))
+                                                .rounded(px(10.0))
+                                                .bg(rgba(0xffffff0E))
+                                                .border_1()
+                                                .border_color(rgba(0xffffff10))
+                                                .px(px(12.0))
+                                                .flex()
+                                                .items_center()
+                                                .gap(px(8.0))
+                                                .child(
+                                                    svg()
+                                                        .path("ui/search.svg")
+                                                        .size(px(13.0))
+                                                        .text_color(rgb(SUBTEXT1)),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .font_family(UI_FONT)
+                                                        .text_size(px(12.0))
+                                                        .text_color(rgb(SUBTEXT1))
+                                                        .child("検索 (次段で接続)"),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(MUTED))
+                                                .child(if self.snippet_favorites_only {
+                                                    "お気に入りのみ表示中"
+                                                } else {
+                                                    "すべての定型文を表示中"
+                                                }),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("snippet-list-scroll")
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .overflow_scroll()
+                                        .scrollbar_width(px(6.0))
+                                        .child(
+                                            div()
+                                                .px(px(10.0))
+                                                .pb(px(10.0))
+                                                .flex()
+                                                .flex_col()
+                                                .gap(px(6.0))
+                                                .children(list_items),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .h(px(40.0))
+                                        .px(px(16.0))
+                                        .border_t_1()
+                                        .border_color(rgba(0xffffff10))
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(SUBTEXT1))
+                                                .child(format!("表示中 {} 件", visible.len())),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(MUTED))
+                                                .child("アンカード表示"),
+                                        ),
+                                ),
+                        )
+                        .child(detail),
                 )
                 .into_any_element(),
         )
@@ -3025,6 +3871,7 @@ impl Render for RootView {
                 MouseButton::Left,
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                     this.show_settings = false;
+                    this.show_snippet_palette = false;
                     this.show_shell_menu = true;
                     cx.notify();
                     cx.stop_propagation();
@@ -3035,6 +3882,7 @@ impl Render for RootView {
                     MouseButton::Left,
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                         this.show_settings = false;
+                        this.show_snippet_palette = false;
                         this.show_shell_menu = true;
                         cx.notify();
                         cx.stop_propagation();
@@ -3046,11 +3894,8 @@ impl Render for RootView {
             .child(
                 chrome_button("title-snippets", "ui/snippet-palette.svg").on_mouse_down(
                     MouseButton::Left,
-                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                        this.show_snippet_palette = !this.show_snippet_palette;
-                        this.show_settings = false;
-                        this.show_shell_menu = false;
-                        cx.notify();
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.toggle_snippet_palette(window, cx);
                         cx.stop_propagation();
                     }),
                 ),
@@ -3225,6 +4070,7 @@ impl Render for RootView {
                 &available_shells,
                 cx,
             ))
+            .children(self.render_snippet_palette(new_state.width, new_state.height, cx))
             .children(settings_backdrop)
             .children(self.render_settings_panel(new_state.width, new_state.height, window, cx))
             .children(render_app_notice(self.app_notice.as_ref()))
@@ -3622,7 +4468,10 @@ impl EntityInputHandler for RootView {
     }
 }
 
-fn ai_settings_ime_input_overlay(entity: Entity<RootView>, focus_handle: FocusHandle) -> AnyElement {
+fn ai_settings_ime_input_overlay(
+    entity: Entity<RootView>,
+    focus_handle: FocusHandle,
+) -> AnyElement {
     canvas(
         |_bounds, _window, _cx| {},
         move |bounds, _, window, cx| {
@@ -3661,6 +4510,37 @@ fn chrome_button(id: &'static str, icon_path: &'static str) -> Stateful<Div> {
                 .size(px(14.0))
                 .text_color(rgb(TEXT_SOFT)),
         )
+}
+
+fn panel_icon_button(id: &'static str, icon_path: &'static str, active: bool) -> Stateful<Div> {
+    let mut button = chrome_button(id, icon_path)
+        .w(px(28.0))
+        .min_w(px(28.0))
+        .h(px(28.0))
+        .rounded(px(8.0))
+        .bg(rgba(if active { 0x0A84FF33 } else { 0xffffff00 }));
+
+    if active {
+        button = button.border_1().border_color(rgba(0x0A84FF66));
+    }
+
+    button
+}
+
+fn snippet_tag_chip(label: &'static str, selected: bool) -> Div {
+    div()
+        .rounded(px(999.0))
+        .bg(if selected {
+            rgba(0xffffff20)
+        } else {
+            rgba(0xffffff10)
+        })
+        .px(px(7.0))
+        .py(px(3.0))
+        .font_family(UI_FONT)
+        .text_size(px(10.0))
+        .text_color(rgb(if selected { TEXT_SOFT } else { SUBTEXT0 }))
+        .child(label)
 }
 
 fn titlebar_actions_width() -> f32 {
@@ -4374,14 +5254,14 @@ fn color_dot(color: u32) -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        AiSettingsImeTarget, AiSettingsTextField, GlobalShortcutAction,
-        INPUT_METHOD_VK_PROCESSKEY, ZoomAction, active_ai_settings_ime_target, adjust_font_size_value,
+        AiSettingsImeTarget, AiSettingsTextField, GlobalShortcutAction, INPUT_METHOD_VK_PROCESSKEY,
+        ZoomAction, active_ai_settings_ime_target, adjust_font_size_value,
         byte_index_to_utf16_offset, byte_range_to_utf16_range, collect_global_hotkeys,
         configured_global_shortcut_action, current_text_for_ai_settings_ime_target,
         cycle_string_option, direct_text_from_input_keystroke, hotkey_binding_string,
-        hotkey_matches, hotkey_string_for_keystroke, process_completion_notice_detail,
-        replace_text_in_ai_settings_ime_target, should_defer_keystroke_to_input_method,
-        terminal_settings_from_config,
+        hotkey_matches, hotkey_string_for_keystroke, next_filtered_index,
+        process_completion_notice_detail, replace_text_in_ai_settings_ime_target,
+        should_defer_keystroke_to_input_method, snippet_panel_frame, terminal_settings_from_config,
         titlebar_actions_width, titlebar_side_cluster_width, traffic_lights_width,
         utf16_offset_to_byte_index, utf16_range_to_byte_range, zoom_action_for_window,
     };
@@ -4428,6 +5308,27 @@ mod tests {
         assert_eq!(traffic_lights_width(), 52.0);
         // Side cluster = max(actions=108, traffic_lights=52) = 108
         assert_eq!(titlebar_side_cluster_width(), 108.0);
+    }
+
+    #[test]
+    fn snippet_panel_frame_clamps_to_viewport() {
+        let frame = snippet_panel_frame(800.0, 620.0);
+        assert_eq!(frame.top, 46.0);
+        assert_eq!(frame.left, 12.0);
+        assert_eq!(frame.width, 776.0);
+        assert_eq!(frame.height, 558.0);
+    }
+
+    #[test]
+    fn next_filtered_index_wraps_in_both_directions() {
+        let visible = vec![0, 2, 4];
+        assert_eq!(next_filtered_index(Some(4), &visible, 1), Some(0));
+        assert_eq!(next_filtered_index(Some(0), &visible, -1), Some(4));
+    }
+
+    #[test]
+    fn next_filtered_index_returns_none_for_empty_list() {
+        assert_eq!(next_filtered_index(Some(0), &[], 1), None);
     }
 
     #[test]
@@ -4730,6 +5631,4 @@ mod tests {
         assert!(hotkey_matches(&event, "Ctrl+Alt+Comma"));
         assert!(!hotkey_matches(&event, "Ctrl+Comma"));
     }
-
 }
-
