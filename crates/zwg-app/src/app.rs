@@ -561,6 +561,7 @@ pub struct RootView {
     focus_handle: FocusHandle,
     show_shell_menu: bool,
     show_settings: bool,
+    show_snippet_palette: bool,
     show_close_confirm: bool,
     keyboard_settings_active_text: Option<KeyboardSettingsTextField>,
     ai_settings_active_text: Option<AiSettingsTextField>,
@@ -670,6 +671,7 @@ impl RootView {
             focus_handle: _cx.focus_handle(),
             show_shell_menu: false,
             show_settings: false,
+            show_snippet_palette: false,
             show_close_confirm: false,
             keyboard_settings_active_text: None,
             ai_settings_active_text: None,
@@ -3040,15 +3042,28 @@ impl Render for RootView {
                 ),
             );
 
-        titlebar_actions = titlebar_actions.child(
-            chrome_button("title-settings", "ui/settings.svg").on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    this.open_settings_panel(window, cx);
-                    cx.stop_propagation();
-                }),
-            ),
-        );
+        titlebar_actions = titlebar_actions
+            .child(
+                chrome_button("title-snippets", "ui/snippet-palette.svg").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                        this.show_snippet_palette = !this.show_snippet_palette;
+                        this.show_settings = false;
+                        this.show_shell_menu = false;
+                        cx.notify();
+                        cx.stop_propagation();
+                    }),
+                ),
+            )
+            .child(
+                chrome_button("title-settings", "ui/settings.svg").on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                        this.open_settings_panel(window, cx);
+                        cx.stop_propagation();
+                    }),
+                ),
+            );
 
         let chrome_radius = if new_state.maximized {
             px(0.0)
@@ -3649,7 +3664,7 @@ fn chrome_button(id: &'static str, icon_path: &'static str) -> Stateful<Div> {
 }
 
 fn titlebar_actions_width() -> f32 {
-    let action_slots: usize = 3;
+    let action_slots: usize = 4;
     let button_width = 24.0;
     let button_gap = 4.0;
 
@@ -4403,14 +4418,16 @@ mod tests {
     }
 
     #[test]
-    fn titlebar_actions_width_matches_three_button_layout() {
-        assert_eq!(titlebar_actions_width(), 80.0);
+    fn titlebar_actions_width_matches_four_button_layout() {
+        // 4 buttons × 24px + 3 gaps × 4px = 108px
+        assert_eq!(titlebar_actions_width(), 108.0);
     }
 
     #[test]
     fn titlebar_side_cluster_width_tracks_wider_control_group() {
         assert_eq!(traffic_lights_width(), 52.0);
-        assert_eq!(titlebar_side_cluster_width(), 80.0);
+        // Side cluster = max(actions=108, traffic_lights=52) = 108
+        assert_eq!(titlebar_side_cluster_width(), 108.0);
     }
 
     #[test]

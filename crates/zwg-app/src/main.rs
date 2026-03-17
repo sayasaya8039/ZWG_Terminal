@@ -18,7 +18,6 @@ mod ai;
 mod app;
 mod config;
 mod shell;
-mod snippets;
 mod split;
 mod terminal;
 mod wasm_runtime;
@@ -179,10 +178,10 @@ static EMBEDDED_UI_ASSETS: &[(&str, &[u8])] = &[
         )),
     ),
     (
-        "ui/snippets.svg",
+        "ui/snippet-palette.svg",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../../resources/ui/snippets.svg"
+            "/../../resources/ui/snippet-palette.svg"
         )),
     ),
     (
@@ -303,8 +302,6 @@ actions!(
         FocusNext,
         FocusPrev,
         OpenSettings,
-        ToggleSnippetPalette,
-        SnippetQueuePaste,
     ]
 );
 
