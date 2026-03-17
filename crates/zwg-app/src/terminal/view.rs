@@ -33,6 +33,11 @@ const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
 const MAX_FRAME_COALESCE_MICROS: u64 = 1_667;
 const ASYNC_PARSE_SETTLE_MILLIS: u64 = 2;
 const ASYNC_PARSE_RETRY_LIMIT: usize = 4;
+/// After detecting a change, sweep up to this many additional times while the
+/// async parser still reports pending data.  PSReadLine typically emits 3-5
+/// chunks per keystroke (echo + highlight + prediction + cursor restore), so
+/// 6 extra sweeps with a 2 ms gap covers the full burst within ~12 ms.
+const ASYNC_PARSE_POST_CHANGE_SWEEPS: usize = 6;
 const CROSS_ROUTE_DUPLICATE_WINDOW_MS: u64 = 250;
 const SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS: u64 = 30;
 /// Fallback values — replaced at runtime by measured font metrics
@@ -781,6 +786,11 @@ impl TerminalPane {
 
                     let mut should_notify = false;
                     let mut settled = false;
+
+                    // Phase 1: Poll until the first change is detected (or we
+                    // exhaust the retry budget).  This handles the common case
+                    // where the PTY event fires slightly before the async Zig
+                    // parser finishes processing the chunk.
                     for attempt in 0..ASYNC_PARSE_RETRY_LIMIT {
                         let changed = match this.update(cx, |pane: &mut TerminalPane, _cx| {
                             pane.refresh_snapshot(false)
@@ -798,26 +808,44 @@ impl TerminalPane {
                             break;
                         }
 
-                        // When we detect changes, do one more check after a short
-                        // settle to catch remaining async parser output (e.g. the
-                        // tail of a BS-SPACE-BS sequence split across chunks).
-                        // When no changes yet, keep polling.
                         if should_notify {
-                            cx.background_executor()
-                                .timer(std::time::Duration::from_millis(ASYNC_PARSE_SETTLE_MILLIS))
-                                .await;
-                            // Final sweep — pick up any trailing dirty rows
-                            should_notify |= this
-                                .update(cx, |pane: &mut TerminalPane, _cx| {
-                                    pane.refresh_snapshot(false)
-                                })
-                                .unwrap_or(false);
                             break;
                         }
 
                         cx.background_executor()
                             .timer(std::time::Duration::from_millis(ASYNC_PARSE_SETTLE_MILLIS))
                             .await;
+                    }
+
+                    // Phase 2: After the first change, do additional sweeps to
+                    // capture the full PSReadLine VT burst (echo + syntax
+                    // highlight + prediction text + cursor restore).  We keep
+                    // sweeping while has_pending_data() reports true, with a
+                    // hard cap to avoid unbounded loops during sustained output.
+                    if should_notify && !settled {
+                        for _sweep in 0..ASYNC_PARSE_POST_CHANGE_SWEEPS {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(ASYNC_PARSE_SETTLE_MILLIS))
+                                .await;
+
+                            let sweep_changed = this
+                                .update(cx, |pane: &mut TerminalPane, _cx| {
+                                    pane.refresh_snapshot(false)
+                                })
+                                .unwrap_or(false);
+                            should_notify |= sweep_changed;
+
+                            // Check if the async parser still has data in its
+                            // ring buffer.  If not, one final sweep was enough.
+                            let still_pending = this
+                                .update(cx, |pane: &mut TerminalPane, _cx| {
+                                    pane.surface.has_pending_data()
+                                })
+                                .unwrap_or(false);
+                            if !still_pending && !sweep_changed {
+                                break;
+                            }
+                        }
                     }
 
                     if this

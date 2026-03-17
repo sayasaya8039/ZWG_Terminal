@@ -7,14 +7,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 
-use super::pty::{ConPtyConfig, PtyPair, spawn_pty};
+use super::pty::PtyPair;
 use super::{DEFAULT_BG, DEFAULT_FG};
 
 /// Events emitted by the terminal
 #[derive(Debug)]
 pub enum TerminalEvent {
     OutputReceived,
-    TitleChanged(String),
     ProcessExited(i32),
 }
 
@@ -146,14 +145,15 @@ mod backend {
             self.terminal.start_async().is_ok()
         }
 
-        /// Stop async I/O mode.
-        pub fn stop_async(&mut self) {
-            self.terminal.stop_async();
-        }
-
         /// Raw terminal handle as usize (for async feeding without Rust mutex).
         pub fn terminal_raw_ptr(&self) -> usize {
             self.terminal.raw_ptr() as usize
+        }
+
+        /// Check if the async parser has processed new data since the last call.
+        /// Returns false when async I/O is not active.
+        pub fn has_new_data(&self) -> bool {
+            self.terminal.has_new_data()
         }
     }
 }
@@ -247,6 +247,7 @@ pub struct TerminalSurface {
     pub backend: Arc<Mutex<TerminalBackend>>,
     event_rx: Option<Receiver<TerminalEvent>>,
     event_tx: Sender<TerminalEvent>,
+    output_event_pending: Arc<AtomicBool>,
     pty: Option<Arc<PtyPair>>,
     reader_handle: Option<std::thread::JoinHandle<()>>,
     // H2: stop flag for clean reader thread shutdown
@@ -265,6 +266,7 @@ impl TerminalSurface {
             ))),
             event_rx: Some(event_rx),
             event_tx,
+            output_event_pending: Arc::new(AtomicBool::new(false)),
             pty: None,
             reader_handle: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -281,86 +283,21 @@ impl TerminalSurface {
         self.backend.lock().clear_history();
     }
 
-    /// Spawn a shell and start reading PTY output
-    pub fn spawn(&mut self, shell: &str) -> std::io::Result<()> {
-        let (cols, rows) = {
-            let b = self.backend.lock();
-            (b.cols, b.rows)
-        };
-        let config = ConPtyConfig {
-            shell: shell.to_string(),
-            cols,
-            rows,
-            ..Default::default()
-        };
+    pub fn finish_output_event(&self) {
+        self.output_event_pending.store(false, Ordering::Release);
+    }
 
-        let pty = Arc::new(spawn_pty(config)?);
-        self.pty = Some(pty.clone());
+    /// Check if the async parser still has unprocessed data in its ring buffer.
+    /// Used by the settle loop to wait for PSReadLine's multi-chunk VT bursts.
+    #[cfg(feature = "ghostty_vt")]
+    pub fn has_pending_data(&self) -> bool {
+        self.backend.lock().has_new_data()
+    }
 
-        // Start reader thread
-        let reader = pty.reader();
-        let backend = self.backend.clone();
-        let event_tx = self.event_tx.clone();
-        let stop_flag = self.stop_flag.clone();
-
-        // Enable async I/O: PTY reader → ring buffer (lock-free) → Zig parser thread
-        #[cfg(feature = "ghostty_vt")]
-        let async_ptr: Option<usize> = {
-            let mut b = backend.lock();
-            if b.start_async() {
-                log::info!("Async I/O enabled: PTY reader → ring buffer → parser thread");
-                Some(b.terminal_raw_ptr())
-            } else {
-                log::warn!("Async I/O init failed, using sync mode");
-                None
-            }
-        };
-        #[cfg(not(feature = "ghostty_vt"))]
-        let async_ptr: Option<usize> = None;
-
-        let handle = std::thread::Builder::new()
-            .name("zwg-pty-reader".into())
-            .spawn(move || {
-                // Perf: 128KB read buffer — fewer syscalls, better batch coalescing
-                let mut buf = [0u8; 131_072];
-                loop {
-                    // H2: check stop flag before blocking read
-                    if stop_flag.load(Ordering::Relaxed) {
-                        break;
-                    }
-
-                    let n = {
-                        let mut guard = reader.lock();
-                        match guard.read(&mut buf) {
-                            Ok(0) => break,
-                            Ok(n) => n,
-                            Err(_) => break,
-                        }
-                    };
-
-                    if let Some(raw_ptr) = async_ptr {
-                        // Async: lock-free push to ring buffer (no Rust mutex contention)
-                        #[cfg(feature = "ghostty_vt")]
-                        unsafe {
-                            feed_async_raw(raw_ptr, &buf[..n]);
-                        }
-                    } else {
-                        // Sync fallback: lock backend, parse under lock
-                        let mut b = backend.lock();
-                        b.feed(&buf[..n]);
-                    }
-
-                    // H1: try_send on bounded channel — drop if full (already notified)
-                    let _ = event_tx.try_send(TerminalEvent::OutputReceived);
-                }
-
-                log::debug!("PTY reader thread exiting");
-                // H3/L2: notify process exit
-                let _ = event_tx.try_send(TerminalEvent::ProcessExited(0));
-            })?;
-
-        self.reader_handle = Some(handle);
-        Ok(())
+    /// Fallback: no async parser, so never pending.
+    #[cfg(not(feature = "ghostty_vt"))]
+    pub fn has_pending_data(&self) -> bool {
+        false
     }
 
     /// Write input to the PTY
@@ -391,6 +328,7 @@ impl TerminalSurface {
         let reader = pty.reader();
         let backend = self.backend.clone();
         let event_tx = self.event_tx.clone();
+        let output_event_pending = self.output_event_pending.clone();
         let stop_flag = self.stop_flag.clone();
 
         // Enable async I/O for attach_pty path
@@ -434,10 +372,18 @@ impl TerminalSurface {
                         let mut b = backend.lock();
                         b.feed(&buf[..n]);
                     }
-                    let _ = event_tx.try_send(TerminalEvent::OutputReceived);
+                    if output_event_pending
+                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        if event_tx.try_send(TerminalEvent::OutputReceived).is_err() {
+                            output_event_pending.store(false, Ordering::Release);
+                        }
+                    }
                 }
                 log::debug!("PTY reader thread exiting");
-                let _ = event_tx.try_send(TerminalEvent::ProcessExited(0));
+                output_event_pending.store(false, Ordering::Release);
+                let _ = event_tx.send(TerminalEvent::ProcessExited(0));
             })?;
 
         self.reader_handle = Some(handle);
@@ -462,11 +408,6 @@ impl TerminalSurface {
 
     pub fn set_default_colors(&self, fg_rgb: u32, bg_rgb: u32) {
         self.backend.lock().set_default_colors(fg_rgb, bg_rgb);
-    }
-
-    /// Check if the PTY is connected
-    pub fn is_connected(&self) -> bool {
-        self.pty.is_some()
     }
 }
 
