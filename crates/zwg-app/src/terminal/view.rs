@@ -1231,17 +1231,20 @@ impl TerminalPane {
             }
 
             let cached_row = &mut self.snapshot.rows[index];
-            // Force full redraw for all rows after viewport scroll — cached row
-            // data is stale because row indices shifted, and damage-based patching
-            // against the old cache would miss cells that were present in the
-            // previous viewport position but absent in the new one.
+            // Force full redraw when:
+            //  - explicit force_full (resize, config change)
+            //  - viewport scrolled (row indices shifted, cache is stale)
+            //  - this is the cursor row (most frequent updates from shell
+            //    input echo, PSReadLine predictions, etc. — damage-based
+            //    patching against async-parsed data is unreliable here)
+            let is_cursor_row = row_update.row == cursor_y;
             let row_changed = apply_ghostty_row_update(
                 cached_row,
                 row_update,
                 self.term_cols,
                 self.fg_color,
                 self.bg_color,
-                force_full || scrolled,
+                force_full || scrolled || is_cursor_row,
             );
             changed |= row_changed;
             if row_changed {
