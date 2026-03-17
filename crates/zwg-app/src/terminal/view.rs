@@ -782,22 +782,36 @@ impl TerminalPane {
                     let mut should_notify = false;
                     let mut settled = false;
                     for attempt in 0..ASYNC_PARSE_RETRY_LIMIT {
-                        should_notify = match this.update(cx, |pane: &mut TerminalPane, _cx| {
+                        let changed = match this.update(cx, |pane: &mut TerminalPane, _cx| {
                             pane.refresh_snapshot(false)
                         }) {
-                            Ok(should_notify) => should_notify,
+                            Ok(changed) => changed,
                             Err(_) => {
                                 settled = true;
                                 break;
                             }
                         };
-
-                        if should_notify {
-                            break;
-                        }
+                        should_notify |= changed;
 
                         if attempt + 1 == ASYNC_PARSE_RETRY_LIMIT {
                             settled = true;
+                            break;
+                        }
+
+                        // When we detect changes, do one more check after a short
+                        // settle to catch remaining async parser output (e.g. the
+                        // tail of a BS-SPACE-BS sequence split across chunks).
+                        // When no changes yet, keep polling.
+                        if should_notify {
+                            cx.background_executor()
+                                .timer(std::time::Duration::from_millis(ASYNC_PARSE_SETTLE_MILLIS))
+                                .await;
+                            // Final sweep — pick up any trailing dirty rows
+                            should_notify |= this
+                                .update(cx, |pane: &mut TerminalPane, _cx| {
+                                    pane.refresh_snapshot(false)
+                                })
+                                .unwrap_or(false);
                             break;
                         }
 
@@ -1114,7 +1128,7 @@ impl TerminalPane {
     fn refresh_snapshot(&mut self, force_full: bool) -> bool {
         self.snapshot.damaged_rows.clear();
         #[cfg(feature = "ghostty_vt")]
-        let (rows, cursor_x, cursor_y, cursor_visible, row_updates) = {
+        let (rows, cursor_x, cursor_y, cursor_visible, row_updates, scrolled) = {
             let mut backend = self.surface.backend.lock();
             let rows = backend.rows;
             let pos = backend.cursor_position();
@@ -1124,6 +1138,7 @@ impl TerminalPane {
             } else {
                 backend.terminal.take_viewport_scroll_delta()
             };
+            let scrolled = scroll_delta != 0;
             let dirty_rows = viewport_rows_to_refresh(
                 rows,
                 force_full,
@@ -1150,6 +1165,7 @@ impl TerminalPane {
                 pos.1.saturating_sub(1),
                 cursor_visible,
                 row_updates,
+                scrolled,
             )
         };
 
@@ -1215,13 +1231,17 @@ impl TerminalPane {
             }
 
             let cached_row = &mut self.snapshot.rows[index];
+            // Force full redraw for all rows after viewport scroll — cached row
+            // data is stale because row indices shifted, and damage-based patching
+            // against the old cache would miss cells that were present in the
+            // previous viewport position but absent in the new one.
             let row_changed = apply_ghostty_row_update(
                 cached_row,
                 row_update,
                 self.term_cols,
                 self.fg_color,
                 self.bg_color,
-                force_full,
+                force_full || scrolled,
             );
             changed |= row_changed;
             if row_changed {
