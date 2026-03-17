@@ -1234,17 +1234,20 @@ impl TerminalPane {
             // Force full redraw when:
             //  - explicit force_full (resize, config change)
             //  - viewport scrolled (row indices shifted, cache is stale)
-            //  - this is the cursor row (most frequent updates from shell
-            //    input echo, PSReadLine predictions, etc. — damage-based
-            //    patching against async-parsed data is unreliable here)
-            let is_cursor_row = row_update.row == cursor_y;
+            //  - row text or style_runs actually changed — this catches
+            //    residual glyphs from async-parsed partial VT responses
+            //    (e.g. PSReadLine prediction ghost chars after Backspace)
+            //    without falsely signalling the settle loop like a
+            //    blanket cursor-row force_full would.
+            let text_changed = cached_row.text.as_ref() != row_update.text.as_str()
+                || cached_row.style_runs != row_update.style_runs;
             let row_changed = apply_ghostty_row_update(
                 cached_row,
                 row_update,
                 self.term_cols,
                 self.fg_color,
                 self.bg_color,
-                force_full || scrolled || is_cursor_row,
+                force_full || scrolled || text_changed,
             );
             changed |= row_changed;
             if row_changed {
