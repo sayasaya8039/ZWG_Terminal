@@ -460,7 +460,7 @@ fn adjust_font_size_value(current: f32, delta: i32) -> f32 {
 fn snippet_primary_action_for_section(section: SnippetSection) -> SnippetPrimaryAction {
     match section {
         SnippetSection::History => SnippetPrimaryAction::PasteToTerminal,
-        SnippetSection::Template => SnippetPrimaryAction::CopyToClipboard,
+        SnippetSection::Template => SnippetPrimaryAction::PasteToTerminal,
     }
 }
 
@@ -1666,16 +1666,17 @@ impl RootView {
                 );
             }
             SnippetPrimaryAction::PasteToTerminal => {
+                let section_label = self.snippet_palette.active_section().title();
                 if self.paste_snippet_into_active_terminal(&item.content, window, cx) {
                     self.show_app_notice(
-                        "履歴をターミナルへ貼り付けました",
+                        format!("{section_label}をターミナルへ貼り付けました"),
                         format!("{} をアクティブなターミナルへ送信しました。", item.title),
                         2200,
                         cx,
                     );
                 } else {
                     self.show_app_notice(
-                        "履歴を貼り付けできませんでした",
+                        format!("{section_label}を貼り付けできませんでした"),
                         "アクティブなターミナルが見つかりません。".to_string(),
                         2200,
                         cx,
@@ -2824,7 +2825,7 @@ impl RootView {
                                 ),
                         )
                         .child(
-                            panel_icon_button("snippet-detail-copy", "ui/copy.svg", false)
+                            panel_icon_button("snippet-detail-paste", "ui/settings-terminal.svg", false)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _: &MouseDownEvent, window, cx| {
