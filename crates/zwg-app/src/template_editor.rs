@@ -140,6 +140,7 @@ pub(crate) struct TemplateEditorModal {
     preedit_text: String,
     marked_range: Option<Range<usize>>,
     pending_outcome: Option<TemplateEditorOutcome>,
+    needs_focus: bool,
 }
 
 impl TemplateEditorModal {
@@ -151,6 +152,7 @@ impl TemplateEditorModal {
             preedit_text: String::new(),
             marked_range: None,
             pending_outcome: None,
+            needs_focus: true,
         }
     }
 
@@ -494,6 +496,13 @@ impl EntityInputHandler for TemplateEditorModal {
 
 impl Render for TemplateEditorModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Deferred focus: open_template_editor() calls focus() before the first render,
+        // but gpui's mouse event processing steals focus back to the clicked element.
+        // We re-apply focus on the first render when the element tree is ready.
+        if self.needs_focus {
+            self.needs_focus = false;
+            self.focus_handle.focus(_window);
+        }
         debug_write(format!(
             "[RENDER] TemplateEditorModal focused={} field={:?} text={:?}\n",
             self.focus_handle.is_focused(_window),
