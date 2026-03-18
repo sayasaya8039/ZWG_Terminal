@@ -1022,7 +1022,8 @@ fn template_editor_text_area(
 
     div()
         .w_full()
-        .h(px(height))
+        .min_h(px(height))
+        .max_h(px(320.0))
         .rounded(px(12.0))
         .border_1()
         .border_color(if active {
@@ -1031,14 +1032,23 @@ fn template_editor_text_area(
             rgba(0xffffff10)
         })
         .bg(rgb(FIELD_BG))
-        .p(px(16.0))
         .cursor_text()
         .hover(|style| style.bg(rgb(0x1A1A1C)))
         .on_mouse_down(MouseButton::Left, listener)
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .children(lines)
+        .overflow_hidden()
+        .child(
+            div()
+                .id("template-content-scroll")
+                .w_full()
+                .h_full()
+                .overflow_y_scroll()
+                .scrollbar_width(px(4.0))
+                .p(px(16.0))
+                .flex()
+                .flex_col()
+                .gap(px(6.0))
+                .children(lines),
+        )
 }
 
 
