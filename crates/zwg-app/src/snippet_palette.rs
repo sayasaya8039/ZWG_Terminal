@@ -44,6 +44,13 @@ pub struct SnippetRecord {
     pub pinned: bool,
     pub source: String,
     pub created_label: String,
+    pub captured_minutes_ago: Option<u32>,
+}
+
+impl SnippetRecord {
+    pub fn relative_created_label(&self) -> Option<String> {
+        self.captured_minutes_ago.map(format_relative_minutes)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -447,8 +454,9 @@ fn demo_snippets() -> Vec<SnippetRecord> {
             note: Some("CopyQ の履歴タブを意識して、直近でよく再利用する通知文として配置。".into()),
             tags: vec!["release".into(), "mail".into(), "team".into()],
             pinned: true,
-            source: "Clipboard".into(),
+            source: "Slack / #release".into(),
             created_label: "2026年3月18日 18:30".into(),
+            captured_minutes_ago: Some(12),
         },
         SnippetRecord {
             id: "clipboard-bug-template".into(),
@@ -459,8 +467,9 @@ fn demo_snippets() -> Vec<SnippetRecord> {
             note: Some("サポート返信の初動で使う。".into()),
             tags: vec!["support".into(), "bug".into()],
             pinned: false,
-            source: "Clipboard".into(),
+            source: "Outlook / サポート窓口".into(),
             created_label: "2026年3月18日 17:08".into(),
+            captured_minutes_ago: Some(94),
         },
         SnippetRecord {
             id: "notes-weekly".into(),
@@ -473,6 +482,7 @@ fn demo_snippets() -> Vec<SnippetRecord> {
             pinned: true,
             source: "Editor".into(),
             created_label: "2026年3月17日 09:10".into(),
+            captured_minutes_ago: None,
         },
         SnippetRecord {
             id: "notes-followup".into(),
@@ -485,6 +495,7 @@ fn demo_snippets() -> Vec<SnippetRecord> {
             pinned: false,
             source: "Mail".into(),
             created_label: "2026年3月16日 14:22".into(),
+            captured_minutes_ago: None,
         },
         SnippetRecord {
             id: "commands-build".into(),
@@ -497,6 +508,7 @@ fn demo_snippets() -> Vec<SnippetRecord> {
             pinned: true,
             source: "Terminal".into(),
             created_label: "2026年3月18日 19:02".into(),
+            captured_minutes_ago: None,
         },
         SnippetRecord {
             id: "commands-review".into(),
@@ -509,6 +521,7 @@ fn demo_snippets() -> Vec<SnippetRecord> {
             pinned: false,
             source: "Terminal".into(),
             created_label: "2026年3月18日 18:55".into(),
+            captured_minutes_ago: None,
         },
         SnippetRecord {
             id: "links-copyq".into(),
@@ -519,8 +532,9 @@ fn demo_snippets() -> Vec<SnippetRecord> {
             note: Some("Tabs, items, pinning, search の挙動参照用。".into()),
             tags: vec!["copyq".into(), "reference".into()],
             pinned: true,
-            source: "Browser".into(),
+            source: "Chrome / GitHub".into(),
             created_label: "2026年3月18日 16:40".into(),
+            captured_minutes_ago: Some(122),
         },
         SnippetRecord {
             id: "links-figma".into(),
@@ -531,10 +545,19 @@ fn demo_snippets() -> Vec<SnippetRecord> {
             note: Some("トップバー配下のアンカード配置を合わせるためのデザインソース。".into()),
             tags: vec!["figma".into(), "ui".into()],
             pinned: false,
-            source: "Figma".into(),
+            source: "Figma Make".into(),
             created_label: "2026年3月18日 15:55".into(),
+            captured_minutes_ago: Some(167),
         },
     ]
+}
+
+fn format_relative_minutes(minutes: u32) -> String {
+    match minutes {
+        0..=59 => format!("{minutes}分前"),
+        60..=1439 => format!("{}時間前", minutes / 60),
+        _ => format!("{}日前", minutes / 1440),
+    }
 }
 
 #[cfg(test)]
@@ -646,5 +669,25 @@ mod tests {
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
             Some("clipboard-bug-template")
         );
+    }
+
+    #[test]
+    fn relative_created_label_formats_minutes_hours_and_days() {
+        let model = SnippetPaletteModel::new();
+        let snippets = model.snippets();
+
+        assert_eq!(
+            snippets[0].relative_created_label().as_deref(),
+            Some("12分前")
+        );
+        assert_eq!(
+            snippets[1].relative_created_label().as_deref(),
+            Some("1時間前")
+        );
+        assert_eq!(
+            snippets[7].relative_created_label().as_deref(),
+            Some("2時間前")
+        );
+        assert_eq!(snippets[2].relative_created_label(), None);
     }
 }

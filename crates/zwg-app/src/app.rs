@@ -2210,11 +2210,60 @@ impl RootView {
                 .map(|item| {
                     let item_id = item.id.clone();
                     let is_selected = selected_id.as_deref() == Some(item.id.as_str());
+                    let relative_created_label = item.relative_created_label();
                     let tab_title = self
                         .snippet_palette
                         .tab_title_for(&item.tab_id)
                         .unwrap_or("Clipboard")
                         .to_string();
+                    let meta_row = if active_section == SnippetSection::History {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(8.0))
+                            .child(snippet_tag_chip(tab_title.clone(), is_selected))
+                            .children(relative_created_label.clone().into_iter().map(|label| {
+                                div()
+                                    .font_family(UI_FONT)
+                                    .text_size(px(10.0))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(rgb(if is_selected { TEXT_SOFT } else { SUBTEXT0 }))
+                                    .child(label)
+                                    .into_any_element()
+                            }))
+                            .child(
+                                div()
+                                    .font_family(UI_FONT)
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("{} から取得", item.source)),
+                            )
+                            .children(item.tags.iter().take(1).map(|tag| {
+                                snippet_tag_chip(tag.clone(), is_selected).into_any_element()
+                            }))
+                    } else {
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .font_family(UI_FONT)
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(MUTED))
+                                    .child(tab_title.clone()),
+                            )
+                            .child(
+                                div()
+                                    .font_family(UI_FONT)
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(MUTED))
+                                    .child(item.source.clone()),
+                            )
+                            .children(item.tags.iter().take(2).map(|tag| {
+                                snippet_tag_chip(tag.clone(), is_selected).into_any_element()
+                            }))
+                    };
 
                     let mut row = div()
                         .id(ElementId::Name(format!("snippet-item-{}", item.id).into()))
@@ -2307,30 +2356,7 @@ impl RootView {
                                         }))
                                         .child(item.summary.clone()),
                                 )
-                                .child(
-                                    div()
-                                        .flex()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(
-                                            div()
-                                                .font_family(UI_FONT)
-                                                .text_size(px(10.0))
-                                                .text_color(rgb(MUTED))
-                                                .child(tab_title),
-                                        )
-                                        .child(
-                                            div()
-                                                .font_family(UI_FONT)
-                                                .text_size(px(10.0))
-                                                .text_color(rgb(MUTED))
-                                                .child(item.source.clone()),
-                                        )
-                                        .children(item.tags.iter().take(2).map(|tag| {
-                                            snippet_tag_chip(tag.clone(), is_selected)
-                                                .into_any_element()
-                                        })),
-                                ),
+                                .child(meta_row),
                         );
 
                     if is_selected {
@@ -2348,6 +2374,24 @@ impl RootView {
                 .tab_title_for(&item.tab_id)
                 .unwrap_or("Clipboard")
                 .to_string();
+            let detail_meta = if active_section == SnippetSection::History {
+                if let Some(relative_label) = item.relative_created_label() {
+                    format!(
+                        "{}  /  {}  /  {} から取得  /  {}",
+                        tab_title, relative_label, item.source, item.created_label
+                    )
+                } else {
+                    format!(
+                        "{}  /  {}  /  {}",
+                        tab_title, item.created_label, item.source
+                    )
+                }
+            } else {
+                format!(
+                    "{}  /  {}  /  {}",
+                    tab_title, item.created_label, item.source
+                )
+            };
             let content_lines = item
                 .content
                 .lines()
@@ -2400,10 +2444,7 @@ impl RootView {
                                             .font_family(UI_FONT)
                                             .text_size(px(11.0))
                                             .text_color(rgb(SUBTEXT1))
-                                            .child(format!(
-                                                "{}  /  {}  /  {}",
-                                                tab_title, item.created_label, item.source
-                                            )),
+                                            .child(detail_meta),
                                     ),
                             )
                             .child(
