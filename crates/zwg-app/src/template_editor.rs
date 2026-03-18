@@ -496,11 +496,9 @@ impl EntityInputHandler for TemplateEditorModal {
 
 impl Render for TemplateEditorModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Deferred focus: open_template_editor() calls focus() before the first render,
-        // but gpui's mouse event processing steals focus back to the clicked element.
-        // We re-apply focus on the first render when the element tree is ready.
-        if self.needs_focus {
-            self.needs_focus = false;
+        // gpui steals focus when mouse events are processed on parent elements.
+        // Re-apply focus every render to ensure on_key_down always fires.
+        if !self.focus_handle.is_focused(_window) {
             self.focus_handle.focus(_window);
         }
         debug_write(format!(
