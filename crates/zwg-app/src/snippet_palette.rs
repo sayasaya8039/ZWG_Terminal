@@ -36,6 +36,7 @@ pub struct SnippetTab {
 pub struct SnippetRecord {
     pub id: String,
     pub tab_id: String,
+    pub kind_label: String,
     pub title: String,
     pub summary: String,
     pub content: String,
@@ -261,6 +262,73 @@ impl SnippetPaletteModel {
         Some(pinned)
     }
 
+    pub fn create_new_item(&mut self) -> Option<String> {
+        let target_tab = self
+            .tabs
+            .iter()
+            .find(|tab| tab.section == self.active_section)?
+            .id
+            .clone();
+        let section_key = match self.active_section {
+            SnippetSection::History => "history",
+            SnippetSection::Template => "template",
+        };
+        let next_index = self
+            .snippets
+            .iter()
+            .filter(|snippet| {
+                self.tab_for_id(&snippet.tab_id)
+                    .map(|tab| tab.section == self.active_section)
+                    .unwrap_or(false)
+            })
+            .count()
+            + 1;
+        let new_id = format!("{section_key}-new-{next_index}");
+        let new_item = match self.active_section {
+            SnippetSection::History => SnippetRecord {
+                id: new_id.clone(),
+                tab_id: target_tab,
+                kind_label: "TEXT".into(),
+                title: "検索".into(),
+                summary: "Safari でコピーした新規履歴".into(),
+                content: "text".into(),
+                note: None,
+                tags: Vec::new(),
+                pinned: false,
+                source: "Safari".into(),
+                created_label: "たった今".into(),
+                captured_minutes_ago: Some(0),
+            },
+            SnippetSection::Template => SnippetRecord {
+                id: new_id.clone(),
+                tab_id: target_tab,
+                kind_label: "TEXT".into(),
+                title: "新規".into(),
+                summary: "text".into(),
+                content: "text".into(),
+                note: None,
+                tags: Vec::new(),
+                pinned: false,
+                source: "手動作成".into(),
+                created_label: "たった今".into(),
+                captured_minutes_ago: None,
+            },
+        };
+        let insert_at = self
+            .snippets
+            .iter()
+            .position(|snippet| {
+                self.tab_for_id(&snippet.tab_id)
+                    .map(|tab| tab.section == self.active_section)
+                    .unwrap_or(false)
+            })
+            .unwrap_or(self.snippets.len());
+        self.snippets.insert(insert_at, new_item);
+        self.selected_snippet_id = Some(new_id.clone());
+        self.sync_selection();
+        Some(new_id)
+    }
+
     pub fn remove_selected(&mut self) -> bool {
         let Some(selected_id) = self.selected_snippet_id.clone() else {
             return false;
@@ -368,32 +436,35 @@ fn demo_snippets() -> Vec<SnippetRecord> {
         SnippetRecord {
             id: "clipboard-release-mail".into(),
             tab_id: "clipboard".into(),
-            title: "リリース連絡メール".into(),
-            summary: "社内向けにそのまま流せる短い完了報告です。".into(),
-            content: "本日の配布版を反映しました。\n\n- 反映環境: production\n- 反映時刻: 18:30 JST\n- 監視: 主要導線の疎通確認済み\n\n不具合があればこのスレッドへ返信してください。".into(),
-            note: Some("CopyQ の履歴タブを意識して、直近でよく再利用する通知文として配置。".into()),
-            tags: vec!["release".into(), "mail".into(), "team".into()],
+            kind_label: "TEXT".into(),
+            title: "CopyQはクリップボード管理ツールです。テキスト、画像、その他のデータをコピーすると…".into(),
+            summary: "テキスト、画像、その他のデータをコピーすると、自動的に履歴に保存されます。".into(),
+            content: "CopyQはクリップボード管理ツールです。テキスト、画像、その他のデータをコピーすると、自動的に履歴に保存されます。".into(),
+            note: Some("Safari でコピーした説明文のサンプル。".into()),
+            tags: vec!["browser".into()],
             pinned: true,
-            source: "Slack / #release".into(),
-            created_label: "2026年3月18日 18:30".into(),
-            captured_minutes_ago: Some(12),
+            source: "Safari".into(),
+            created_label: "2026年3月18日 09:46:34".into(),
+            captured_minutes_ago: Some(5),
         },
         SnippetRecord {
             id: "clipboard-bug-template".into(),
             tab_id: "clipboard".into(),
-            title: "不具合再現依頼".into(),
-            summary: "再現手順の回収に使う定型質問です。".into(),
-            content: "以下 4 点を共有してください。\n1. 実行したコマンド\n2. 期待した結果\n3. 実際の結果\n4. 可能ならスクリーンショット".into(),
-            note: Some("サポート返信の初動で使う。".into()),
-            tags: vec!["support".into(), "bug".into()],
+            kind_label: "CODE".into(),
+            title: "function fibonacci(n) { if (n <= 1) return n; return fibonacci(n - 1)…".into(),
+            summary: "return n; return fibonacci(n - 1)…".into(),
+            content: "function fibonacci(n) {\n  if (n <= 1) return n;\n  return fibonacci(n - 1) + fibonacci(n - 2);\n}".into(),
+            note: Some("VS Code からコピーしたコード断片のサンプル。".into()),
+            tags: vec!["code".into(), "javascript".into()],
             pinned: false,
-            source: "Outlook / サポート窓口".into(),
-            created_label: "2026年3月18日 17:08".into(),
-            captured_minutes_ago: Some(94),
+            source: "VS Code".into(),
+            created_label: "2026年3月18日 09:36:34".into(),
+            captured_minutes_ago: Some(15),
         },
         SnippetRecord {
             id: "notes-weekly".into(),
             tab_id: "notes".into(),
+            kind_label: "TEXT".into(),
             title: "週次メモの雛形".into(),
             summary: "決定事項、課題、次週の 3 ブロックに絞った簡易ノートです。".into(),
             content: "## Weekly Update\n\n### Done\n- \n\n### Risks\n- \n\n### Next\n- ".into(),
@@ -407,6 +478,7 @@ fn demo_snippets() -> Vec<SnippetRecord> {
         SnippetRecord {
             id: "notes-followup".into(),
             tab_id: "notes".into(),
+            kind_label: "TEXT".into(),
             title: "打ち合わせ後のフォロー".into(),
             summary: "議事録共有前に送る軽いフォロー文です。".into(),
             content: "本日はありがとうございました。\n議事メモを整理して別途共有します。\n先に認識差があればこの返信で教えてください。".into(),
@@ -420,6 +492,7 @@ fn demo_snippets() -> Vec<SnippetRecord> {
         SnippetRecord {
             id: "commands-build".into(),
             tab_id: "commands".into(),
+            kind_label: "CODE".into(),
             title: "ZWG ビルド確認".into(),
             summary: "変更後の標準ビルド確認セットです。".into(),
             content: "cargo fmt --all\ncargo test -p zwg\ncargo build -p zwg\ncargo build -p zwg --release".into(),
@@ -433,6 +506,7 @@ fn demo_snippets() -> Vec<SnippetRecord> {
         SnippetRecord {
             id: "commands-review".into(),
             tab_id: "commands".into(),
+            kind_label: "CODE".into(),
             title: "差分確認".into(),
             summary: "作業前後の状態を崩さず確認するための定番コマンドです。".into(),
             content: "git status --short\ngit diff -- crates/zwg-app/src/app.rs\nrg -n \"snippet|clipboard|copyq\" crates/zwg-app/src".into(),
@@ -446,28 +520,72 @@ fn demo_snippets() -> Vec<SnippetRecord> {
         SnippetRecord {
             id: "links-copyq".into(),
             tab_id: "links".into(),
-            title: "CopyQ Repository".into(),
-            summary: "移植元として参照する公式リポジトリ。".into(),
-            content: "https://github.com/hluk/CopyQ".into(),
-            note: Some("Tabs, items, pinning, search の挙動参照用。".into()),
-            tags: vec!["copyq".into(), "reference".into()],
+            kind_label: "MAIL".into(),
+            title: "hello@example.com".into(),
+            summary: "".into(),
+            content: "hello@example.com".into(),
+            note: Some("メールアドレスの履歴サンプル。".into()),
+            tags: vec!["mail".into()],
             pinned: true,
-            source: "Chrome / GitHub".into(),
-            created_label: "2026年3月18日 16:40".into(),
-            captured_minutes_ago: Some(122),
+            source: "Mail".into(),
+            created_label: "2026年3月18日 09:21:34".into(),
+            captured_minutes_ago: Some(30),
         },
         SnippetRecord {
             id: "links-figma".into(),
             tab_id: "links".into(),
-            title: "CopyQ 風 UI Figma".into(),
-            summary: "今回のパネル配置と見た目のベース。".into(),
-            content: "https://www.figma.com/make/hEbX0XvRtTkJy5s2CpfPf6/CopyQ%E9%A2%A8UI%E4%BD%9C%E6%88%90?t=XHTxOigxfFfGa9if-1".into(),
-            note: Some("トップバー配下のアンカード配置を合わせるためのデザインソース。".into()),
-            tags: vec!["figma".into(), "ui".into()],
+            kind_label: "HTML".into(),
+            title: "<div class=\"container\"><h1>Hello World</h1><p>This is a sample…".into(),
+            summary: "".into(),
+            content: "<div class=\"container\">\n  <h1>Hello World</h1>\n  <p>This is a sample page.</p>\n</div>".into(),
+            note: Some("HTML 断片の履歴サンプル。".into()),
+            tags: vec!["html".into()],
             pinned: false,
-            source: "Figma Make".into(),
-            created_label: "2026年3月18日 15:55".into(),
-            captured_minutes_ago: Some(167),
+            source: "Chrome".into(),
+            created_label: "2026年3月18日 08:51:34".into(),
+            captured_minutes_ago: Some(60),
+        },
+        SnippetRecord {
+            id: "clipboard-calendar".into(),
+            tab_id: "clipboard".into(),
+            kind_label: "DATE".into(),
+            title: "2026年3月16日（月）".into(),
+            summary: "".into(),
+            content: "2026年3月16日（月）".into(),
+            note: Some("カレンダーの履歴サンプル。".into()),
+            tags: vec!["date".into()],
+            pinned: false,
+            source: "Calendar".into(),
+            created_label: "2026年3月18日 08:46:34".into(),
+            captured_minutes_ago: Some(60),
+        },
+        SnippetRecord {
+            id: "clipboard-sql".into(),
+            tab_id: "clipboard".into(),
+            kind_label: "SQL".into(),
+            title: "SELECT users.name, orders.total FROM users INNER JOIN orders…".into(),
+            summary: "".into(),
+            content: "SELECT users.name, orders.total\nFROM users\nINNER JOIN orders ON orders.user_id = users.id;".into(),
+            note: Some("DataGrip からコピーしたクエリ。".into()),
+            tags: vec!["sql".into()],
+            pinned: false,
+            source: "DataGrip".into(),
+            created_label: "2026年3月18日 07:46:34".into(),
+            captured_minutes_ago: Some(120),
+        },
+        SnippetRecord {
+            id: "clipboard-url".into(),
+            tab_id: "clipboard".into(),
+            kind_label: "LINK".into(),
+            title: "https://www.example.com/article/how-clipboard-managers-work".into(),
+            summary: "".into(),
+            content: "https://www.example.com/article/how-clipboard-managers-work".into(),
+            note: Some("URL の履歴サンプル。".into()),
+            tags: vec!["link".into()],
+            pinned: false,
+            source: "Safari".into(),
+            created_label: "2026年3月18日 07:16:34".into(),
+            captured_minutes_ago: Some(150),
         },
     ]
 }
@@ -493,7 +611,7 @@ mod tests {
             Some("clipboard-release-mail")
         );
         assert_eq!(model.active_section(), SnippetSection::History);
-        assert_eq!(model.visible_count(), 4);
+        assert_eq!(model.visible_count(), 7);
     }
 
     #[test]
@@ -502,10 +620,10 @@ mod tests {
         let snippets = model.snippets();
 
         assert_eq!(filter_snippets(snippets, "validation").len(), 1);
-        assert_eq!(filter_snippets(snippets, "Figma").len(), 1);
+        assert_eq!(filter_snippets(snippets, "DataGrip").len(), 1);
         assert_eq!(filter_snippets(snippets, "議事").len(), 1);
-        assert_eq!(filter_snippets(snippets, "support").len(), 1);
-        assert_eq!(filter_snippets(snippets, "production").len(), 1);
+        assert_eq!(filter_snippets(snippets, "javascript").len(), 1);
+        assert_eq!(filter_snippets(snippets, "fibonacci").len(), 1);
     }
 
     #[test]
@@ -575,12 +693,31 @@ mod tests {
     fn search_query_filters_and_retargets_selection() {
         let mut model = SnippetPaletteModel::new();
 
-        model.set_search_query("support");
+        model.set_search_query("VS Code");
 
         assert_eq!(model.visible_count(), 1);
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
             Some("clipboard-bug-template")
+        );
+    }
+
+    #[test]
+    fn create_new_item_selects_inserted_record() {
+        let mut model = SnippetPaletteModel::new();
+
+        let new_id = model.create_new_item();
+
+        assert_eq!(new_id.as_deref(), Some("history-new-8"));
+        assert_eq!(
+            model.selected_snippet().map(|snippet| snippet.id.as_str()),
+            Some("history-new-8")
+        );
+        assert_eq!(
+            model
+                .selected_snippet()
+                .map(|snippet| snippet.source.as_str()),
+            Some("Safari")
         );
     }
 
@@ -591,14 +728,14 @@ mod tests {
 
         assert_eq!(
             snippets[0].relative_created_label().as_deref(),
-            Some("12分前")
+            Some("5分前")
         );
         assert_eq!(
             snippets[1].relative_created_label().as_deref(),
-            Some("1時間前")
+            Some("15分前")
         );
         assert_eq!(
-            snippets[7].relative_created_label().as_deref(),
+            snippets[9].relative_created_label().as_deref(),
             Some("2時間前")
         );
         assert_eq!(snippets[2].relative_created_label(), None);

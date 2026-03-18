@@ -1457,6 +1457,19 @@ impl RootView {
         }
     }
 
+    fn create_new_snippet_item(&mut self, cx: &mut Context<Self>) {
+        let section_label = self.snippet_palette.active_section().title().to_string();
+        if self.snippet_palette.create_new_item().is_some() {
+            self.show_app_notice(
+                format!("{section_label}に新規項目を追加しました"),
+                "追加した項目を選択しています。".to_string(),
+                1800,
+                cx,
+            );
+            cx.notify();
+        }
+    }
+
     fn cycle_snippet_sections(&mut self, step: isize, cx: &mut Context<Self>) {
         if self.snippet_palette.cycle_sections(step) {
             cx.notify();
@@ -2195,12 +2208,18 @@ impl RootView {
                             .flex()
                             .items_center()
                             .gap(px(8.0))
+                            .child(
+                                svg()
+                                    .path("ui/clock.svg")
+                                    .size(px(11.0))
+                                    .text_color(rgb(if is_selected { 0xffffff } else { MUTED })),
+                            )
                             .children(relative_created_label.clone().into_iter().map(|label| {
                                 div()
                                     .font_family(UI_FONT)
                                     .text_size(px(10.0))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(rgb(if is_selected { TEXT_SOFT } else { SUBTEXT0 }))
+                                    .text_color(rgb(if is_selected { 0xffffff } else { SUBTEXT0 }))
                                     .child(label)
                                     .into_any_element()
                             }))
@@ -2208,8 +2227,15 @@ impl RootView {
                                 div()
                                     .font_family(UI_FONT)
                                     .text_size(px(10.0))
-                                    .text_color(rgb(MUTED))
-                                    .child(format!("{} から取得", item.source)),
+                                    .text_color(rgb(if is_selected { 0xffffff } else { MUTED }))
+                                    .child("•"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(UI_FONT)
+                                    .text_size(px(10.0))
+                                    .text_color(rgb(if is_selected { 0xffffff } else { MUTED }))
+                                    .child(item.source.clone()),
                             )
                             .into_any_element()
                     } else {
@@ -2222,12 +2248,12 @@ impl RootView {
                         .rounded(px(12.0))
                         .border_1()
                         .border_color(if is_selected {
-                            rgba(0x0A84FF66)
+                            rgba(0x3B82F6FF)
                         } else {
                             rgba(0xffffff00)
                         })
                         .bg(if is_selected {
-                            rgba(0x0A84FF18)
+                            rgba(0x2563EBFF)
                         } else {
                             rgba(0xffffff00)
                         })
@@ -2249,7 +2275,7 @@ impl RootView {
                                 .h(px(28.0))
                                 .rounded(px(8.0))
                                 .bg(if is_selected {
-                                    rgba(0x0A84FF33)
+                                    rgba(0xffffff1F)
                                 } else {
                                     rgba(0xffffff10)
                                 })
@@ -2261,7 +2287,7 @@ impl RootView {
                                         .path("ui/snippet-palette.svg")
                                         .size(px(14.0))
                                         .text_color(rgb(if is_selected {
-                                            TEXT
+                                            0xffffff
                                         } else {
                                             TEXT_SOFT
                                         })),
@@ -2283,7 +2309,11 @@ impl RootView {
                                                 .font_family(UI_FONT)
                                                 .text_size(px(13.0))
                                                 .font_weight(FontWeight::MEDIUM)
-                                                .text_color(rgb(TEXT))
+                                                .text_color(rgb(if is_selected {
+                                                    0xffffff
+                                                } else {
+                                                    TEXT
+                                                }))
                                                 .child(item.title.clone()),
                                         )
                                         .child(if item.pinned {
@@ -2296,17 +2326,20 @@ impl RootView {
                                             div().into_any_element()
                                         }),
                                 )
-                                .child(
+                                .child(if item.summary.is_empty() {
+                                    div().into_any_element()
+                                } else {
                                     div()
                                         .font_family(UI_FONT)
                                         .text_size(px(11.0))
                                         .text_color(rgb(if is_selected {
-                                            SUBTEXT0
+                                            0xDBEAFE
                                         } else {
                                             SUBTEXT1
                                         }))
-                                        .child(item.summary.clone()),
-                                )
+                                        .child(item.summary.clone())
+                                        .into_any_element()
+                                })
                                 .child(meta_row),
                         );
 
@@ -2320,18 +2353,7 @@ impl RootView {
         };
 
         let detail = if let Some(item) = self.snippet_palette.selected_snippet().cloned() {
-            let detail_meta = if active_section == SnippetSection::History {
-                if let Some(relative_label) = item.relative_created_label() {
-                    format!(
-                        "{}  /  {} から取得  /  {}",
-                        relative_label, item.source, item.created_label
-                    )
-                } else {
-                    format!("{}  /  {}", item.source, item.created_label)
-                }
-            } else {
-                item.created_label.clone()
-            };
+            let detail_meta = format!("{} • {}", item.kind_label, item.source);
             let content_lines = item
                 .content
                 .lines()
@@ -2350,171 +2372,104 @@ impl RootView {
                 .collect::<Vec<_>>();
 
             div()
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .bg(rgb(PANEL_BG))
-                    .flex()
-                    .flex_col()
-                    .child(
-                        div()
-                            .h(px(58.0))
-                            .px(px(18.0))
-                            .border_b_1()
-                            .border_color(rgba(0xffffff10))
-                            .flex()
-                            .items_center()
-                            .gap(px(12.0))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(4.0))
-                                    .child(
-                                        div()
-                                            .font_family(UI_FONT)
-                                            .text_size(px(15.0))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(rgb(TEXT))
-                                            .child(item.title.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .font_family(UI_FONT)
-                                            .text_size(px(11.0))
-                                            .text_color(rgb(SUBTEXT1))
-                                            .child(detail_meta),
-                                    ),
-                            )
-                            .child(
-                                panel_icon_button("snippet-detail-pin", "ui/star.svg", item.pinned)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.toggle_selected_snippet_pin(cx);
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                panel_icon_button("snippet-detail-copy", "ui/copy.svg", false)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.copy_selected_snippet(cx);
-                                        }),
-                                    ),
-                            )
-                            .child(
-                                panel_icon_button("snippet-detail-delete", "ui/trash.svg", false)
-                                    .on_mouse_down(
-                                        MouseButton::Left,
-                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                            this.delete_selected_snippet(cx);
-                                        }),
-                                    ),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .px(px(18.0))
-                            .py(px(14.0))
-                            .border_b_1()
-                            .border_color(rgba(0xffffff10))
-                            .flex()
-                            .flex_col()
-                            .gap(px(10.0))
-                            .child(
-                                div()
-                                    .font_family(UI_FONT)
-                                    .text_size(px(12.0))
-                                    .text_color(rgb(SUBTEXT0))
-                                    .child(item.summary.clone()),
-                            )
-                            .child(div().flex().items_center().gap(px(8.0)).children(
-                                item.tags.iter().map(|tag| {
-                                    snippet_tag_chip(tag.clone(), false).into_any_element()
-                                }),
-                            ))
-                            .child(if let Some(note) = item.note.clone() {
-                                div()
-                                    .rounded(px(10.0))
-                                    .border_1()
-                                    .border_color(rgba(0xffffff10))
-                                    .bg(rgba(0xffffff08))
-                                    .p(px(12.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(4.0))
-                                    .child(
-                                        div()
-                                            .font_family(UI_FONT)
-                                            .text_size(px(10.0))
-                                            .text_color(rgb(MUTED))
-                                            .child("Note"),
-                                    )
-                                    .child(
-                                        div()
-                                            .font_family(UI_FONT)
-                                            .text_size(px(11.0))
-                                            .text_color(rgb(SUBTEXT0))
-                                            .child(note),
-                                    )
-                                    .into_any_element()
-                            } else {
-                                div().into_any_element()
-                            }),
-                    )
-                    .child(
-                        div()
-                            .id("snippet-detail-scroll")
-                            .flex_1()
-                            .min_h(px(0.0))
-                            .overflow_scroll()
-                            .scrollbar_width(px(6.0))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .px(px(18.0))
-                                    .py(px(16.0))
-                                    .rounded(px(12.0))
-                                    .border_1()
-                                    .border_color(rgba(0xffffff10))
-                                    .bg(rgba(0xffffff06))
-                                    .p(px(16.0))
-                                    .flex()
-                                    .flex_col()
-                                    .gap(px(6.0))
-                                    .children(content_lines),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .h(px(42.0))
-                            .px(px(18.0))
-                            .border_t_1()
-                            .border_color(rgba(0xffffff10))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .font_family(UI_FONT)
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(SUBTEXT1))
-                                    .child(
-                                        "タイプで絞り込み / Tab・←→ で履歴と定型文を切替 / Enter でコピー",
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .font_family(UI_FONT)
-                                    .text_size(px(11.0))
-                                    .text_color(rgb(MUTED))
-                                    .child("Delete で削除 / Ctrl+P でピン"),
-                            ),
-                    )
-                    .into_any_element()
+                .flex_1()
+                .min_w(px(0.0))
+                .bg(rgb(PANEL_BG))
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(px(58.0))
+                        .px(px(18.0))
+                        .border_b_1()
+                        .border_color(rgba(0xffffff10))
+                        .flex()
+                        .items_center()
+                        .gap(px(12.0))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0))
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(13.0))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(rgb(SUBTEXT0))
+                                        .child(detail_meta),
+                                ),
+                        )
+                        .child(
+                            panel_icon_button("snippet-detail-pin", "ui/star.svg", item.pinned)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.toggle_selected_snippet_pin(cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            panel_icon_button("snippet-detail-copy", "ui/copy.svg", false)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.copy_selected_snippet(cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            panel_icon_button("snippet-detail-delete", "ui/trash.svg", false)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.delete_selected_snippet(cx);
+                                    }),
+                                ),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("snippet-detail-scroll")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .overflow_scroll()
+                        .scrollbar_width(px(6.0))
+                        .child(
+                            div()
+                                .w_full()
+                                .px(px(18.0))
+                                .py(px(16.0))
+                                .rounded(px(12.0))
+                                .border_1()
+                                .border_color(rgba(0xffffff10))
+                                .bg(rgba(0xffffff06))
+                                .p(px(16.0))
+                                .flex()
+                                .flex_col()
+                                .gap(px(6.0))
+                                .children(content_lines),
+                        ),
+                )
+                .child(
+                    div()
+                        .h(px(42.0))
+                        .px(px(18.0))
+                        .border_t_1()
+                        .border_color(rgba(0xffffff10))
+                        .flex()
+                        .items_center()
+                        .child(
+                            div()
+                                .font_family(UI_FONT)
+                                .text_size(px(11.0))
+                                .text_color(rgb(SUBTEXT1))
+                                .child(item.created_label.clone()),
+                        ),
+                )
+                .into_any_element()
         } else {
             div()
                 .flex_1()
@@ -2592,7 +2547,7 @@ impl RootView {
                                         .text_size(px(13.0))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(rgb(TEXT))
-                                        .child("CopyQ ライクパネル"),
+                                        .child("クリップボードマネージャー"),
                                 )
                                 .child(
                                     div()
@@ -2606,33 +2561,20 @@ impl RootView {
                                 ),
                         )
                         .child(
-                            panel_icon_button(
-                                "snippet-panel-pinned-filter",
-                                "ui/star.svg",
-                                pinned_only,
-                            )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                    this.toggle_snippet_pinned_only(cx);
-                                }),
-                            ),
-                        )
-                        .child(
-                            panel_icon_button("snippet-panel-copy", "ui/copy.svg", false)
+                            panel_text_button("snippet-panel-new", "ui/plus.svg", "新規")
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                        this.copy_selected_snippet(cx);
+                                        this.create_new_snippet_item(cx);
                                     }),
                                 ),
                         )
                         .child(
-                            panel_icon_button("snippet-panel-delete", "ui/trash.svg", false)
+                            panel_icon_button("snippet-panel-settings", "ui/settings.svg", false)
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                        this.delete_selected_snippet(cx);
+                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                        this.open_settings_panel(window, cx);
                                     }),
                                 ),
                         ),
@@ -2657,6 +2599,14 @@ impl RootView {
                                         .flex()
                                         .flex_col()
                                         .gap(px(12.0))
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(11.0))
+                                                .font_weight(FontWeight::MEDIUM)
+                                                .text_color(rgb(MUTED))
+                                                .child("検索"),
+                                        )
                                         .child(
                                             div()
                                                 .h(px(34.0))
@@ -2684,7 +2634,7 @@ impl RootView {
                                                             rgb(TEXT)
                                                         })
                                                         .child(if search_query.is_empty() {
-                                                            format!("{active_section_label}を検索")
+                                                            "検索".to_string()
                                                         } else {
                                                             search_query.clone()
                                                         }),
@@ -2770,14 +2720,7 @@ impl RootView {
                                                 .child(if pinned_only {
                                                     format!("{active_section_label}のピン留めのみ表示中")
                                                 } else {
-                                                    format!(
-                                                        "{} と定型文は上のボタンで切り替えます。",
-                                                        if active_section == SnippetSection::History {
-                                                            "履歴"
-                                                        } else {
-                                                            "定型文"
-                                                        }
-                                                    )
+                                                    "Tab・←→ で履歴と定型文を切り替えます。".to_string()
                                                 }),
                                         ),
                                 )
@@ -4670,21 +4613,38 @@ fn panel_icon_button(id: &'static str, icon_path: &'static str, active: bool) ->
     button
 }
 
-fn snippet_tag_chip(label: impl Into<String>, selected: bool) -> Div {
-    let label = label.into();
+fn panel_text_button(
+    id: &'static str,
+    icon_path: &'static str,
+    label: &'static str,
+) -> Stateful<Div> {
     div()
-        .rounded(px(999.0))
-        .bg(if selected {
-            rgba(0xffffff20)
-        } else {
-            rgba(0xffffff10)
-        })
-        .px(px(7.0))
-        .py(px(3.0))
-        .font_family(UI_FONT)
-        .text_size(px(10.0))
-        .text_color(rgb(if selected { TEXT_SOFT } else { SUBTEXT0 }))
-        .child(label)
+        .id(id)
+        .h(px(28.0))
+        .rounded(px(8.0))
+        .px(px(10.0))
+        .bg(rgba(0xffffff10))
+        .border_1()
+        .border_color(rgba(0xffffff12))
+        .cursor_pointer()
+        .flex()
+        .items_center()
+        .gap(px(6.0))
+        .hover(|style| style.bg(rgba(0xffffff18)))
+        .child(
+            svg()
+                .path(icon_path)
+                .size(px(12.0))
+                .text_color(rgb(TEXT_SOFT)),
+        )
+        .child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(12.0))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(rgb(TEXT))
+                .child(label),
+        )
 }
 
 fn titlebar_actions_width() -> f32 {
