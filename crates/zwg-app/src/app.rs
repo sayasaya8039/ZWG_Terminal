@@ -1685,29 +1685,153 @@ impl RootView {
         text: &str,
         cx: &mut Context<Self>,
     ) {
+        self.insert_template_editor_at_cursor(field, text, cx);
+    }
+
+    /// Get cursor byte offset for the current template editor field.
+    fn template_editor_cursor(&self, field: TemplateEditorField) -> usize {
+        let text_len = match field {
+            TemplateEditorField::Name => self.template_editor_draft.name.len(),
+            TemplateEditorField::Content => self.template_editor_draft.content.len(),
+            TemplateEditorField::Note => self.template_editor_draft.note.len(),
+            TemplateEditorField::Tags => self.template_editor_draft.tags.len(),
+        };
+        self.root_ime_selected_range
+            .as_ref()
+            .map(|r| r.start.min(text_len))
+            .unwrap_or(text_len)
+    }
+
+    /// Insert text at cursor position, update cursor after insertion.
+    fn insert_template_editor_at_cursor(
+        &mut self,
+        field: TemplateEditorField,
+        text: &str,
+        cx: &mut Context<Self>,
+    ) {
         if text.is_empty() {
             return;
         }
-
-        match field {
-            TemplateEditorField::Name => self.template_editor_draft.name.push_str(text),
-            TemplateEditorField::Content => self.template_editor_draft.content.push_str(text),
-            TemplateEditorField::Note => self.template_editor_draft.note.push_str(text),
-            TemplateEditorField::Tags => self.template_editor_draft.tags.push_str(text),
-        }
-        cx.notify();
-    }
-
-    fn pop_template_editor_text(&mut self, field: TemplateEditorField, cx: &mut Context<Self>) {
-        let value = match field {
-            TemplateEditorField::Name => &mut self.template_editor_draft.name,
-            TemplateEditorField::Content => &mut self.template_editor_draft.content,
-            TemplateEditorField::Note => &mut self.template_editor_draft.note,
-            TemplateEditorField::Tags => &mut self.template_editor_draft.tags,
-        };
-        if value.pop().is_some() {
+        let cursor = self.template_editor_cursor(field);
+        if let Some(inserted) = replace_text_in_template_editor_field(
+            &mut self.template_editor_draft,
+            field,
+            cursor..cursor,
+            text,
+        ) {
+            self.root_ime_selected_range = Some(inserted.end..inserted.end);
             cx.notify();
         }
+    }
+
+    /// Delete one character before cursor (Backspace).
+    fn backspace_template_editor_at_cursor(
+        &mut self,
+        field: TemplateEditorField,
+        cx: &mut Context<Self>,
+    ) {
+        let prev = {
+            let text = match field {
+                TemplateEditorField::Name => &self.template_editor_draft.name,
+                TemplateEditorField::Content => &self.template_editor_draft.content,
+                TemplateEditorField::Note => &self.template_editor_draft.note,
+                TemplateEditorField::Tags => &self.template_editor_draft.tags,
+            };
+            let cursor = self.root_ime_selected_range
+                .as_ref()
+                .map(|r| r.start.min(text.len()))
+                .unwrap_or(text.len());
+            if cursor == 0 {
+                return;
+            }
+            text[..cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| (i, cursor))
+        };
+        if let Some((prev, cursor)) = prev {
+            if let Some(inserted) = replace_text_in_template_editor_field(
+                &mut self.template_editor_draft,
+                field,
+                prev..cursor,
+                "",
+            ) {
+                self.root_ime_selected_range = Some(inserted.start..inserted.start);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Delete one character after cursor (Delete key).
+    fn delete_template_editor_at_cursor(
+        &mut self,
+        field: TemplateEditorField,
+        cx: &mut Context<Self>,
+    ) {
+        let range = {
+            let text = match field {
+                TemplateEditorField::Name => &self.template_editor_draft.name,
+                TemplateEditorField::Content => &self.template_editor_draft.content,
+                TemplateEditorField::Note => &self.template_editor_draft.note,
+                TemplateEditorField::Tags => &self.template_editor_draft.tags,
+            };
+            let cursor = self.root_ime_selected_range
+                .as_ref()
+                .map(|r| r.start.min(text.len()))
+                .unwrap_or(text.len());
+            if cursor >= text.len() {
+                return;
+            }
+            let next = text[cursor..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| cursor + i)
+                .unwrap_or(text.len());
+            cursor..next
+        };
+        if let Some(_) = replace_text_in_template_editor_field(
+            &mut self.template_editor_draft,
+            field,
+            range.clone(),
+            "",
+        ) {
+            self.root_ime_selected_range = Some(range.start..range.start);
+            cx.notify();
+        }
+    }
+
+    /// Move cursor left or right by one character.
+    fn move_template_editor_cursor(&mut self, direction: isize, cx: &mut Context<Self>) {
+        let field = self
+            .template_editor_active_field
+            .unwrap_or(TemplateEditorField::Name);
+        let new_cursor = {
+            let text = match field {
+                TemplateEditorField::Name => &self.template_editor_draft.name,
+                TemplateEditorField::Content => &self.template_editor_draft.content,
+                TemplateEditorField::Note => &self.template_editor_draft.note,
+                TemplateEditorField::Tags => &self.template_editor_draft.tags,
+            };
+            let cursor = self.root_ime_selected_range
+                .as_ref()
+                .map(|r| r.start.min(text.len()))
+                .unwrap_or(text.len());
+            if direction < 0 {
+                text[..cursor]
+                    .char_indices()
+                    .last()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            } else {
+                text[cursor..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| cursor + i)
+                    .unwrap_or(text.len())
+            }
+        };
+        self.root_ime_selected_range = Some(new_cursor..new_cursor);
+        cx.notify();
     }
 
     fn toggle_template_editor_favorite(&mut self, cx: &mut Context<Self>) {
@@ -2207,8 +2331,36 @@ impl RootView {
                 }
                 return true;
             }
-            "backspace" | "delete" => {
-                self.pop_template_editor_text(active_field, cx);
+            "backspace" => {
+                self.backspace_template_editor_at_cursor(active_field, cx);
+                return true;
+            }
+            "delete" => {
+                self.delete_template_editor_at_cursor(active_field, cx);
+                return true;
+            }
+            "left" if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.move_template_editor_cursor(-1, cx);
+                return true;
+            }
+            "right" if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.move_template_editor_cursor(1, cx);
+                return true;
+            }
+            "home" => {
+                self.root_ime_selected_range = Some(0..0);
+                cx.notify();
+                return true;
+            }
+            "end" => {
+                let len = match active_field {
+                    TemplateEditorField::Name => self.template_editor_draft.name.len(),
+                    TemplateEditorField::Content => self.template_editor_draft.content.len(),
+                    TemplateEditorField::Note => self.template_editor_draft.note.len(),
+                    TemplateEditorField::Tags => self.template_editor_draft.tags.len(),
+                };
+                self.root_ime_selected_range = Some(len..len);
+                cx.notify();
                 return true;
             }
             "v" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
@@ -3433,6 +3585,11 @@ impl RootView {
                                             self.template_editor_draft.name.clone(),
                                             "例: メールの署名",
                                             active_field == TemplateEditorField::Name,
+                                            if active_field == TemplateEditorField::Name {
+                                                Some(self.template_editor_cursor(TemplateEditorField::Name))
+                                            } else {
+                                                None
+                                            },
                                             cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                                 this.focus_template_editor_field(
                                                     TemplateEditorField::Name,
@@ -3492,6 +3649,11 @@ impl RootView {
                                             self.template_editor_draft.note.clone(),
                                             "この定型文の用途",
                                             active_field == TemplateEditorField::Note,
+                                            if active_field == TemplateEditorField::Note {
+                                                Some(self.template_editor_cursor(TemplateEditorField::Note))
+                                            } else {
+                                                None
+                                            },
                                             cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                                 this.focus_template_editor_field(
                                                     TemplateEditorField::Note,
@@ -3521,6 +3683,11 @@ impl RootView {
                                             self.template_editor_draft.tags.clone(),
                                             "タグをカンマ区切りで入力: 仕事,メール",
                                             active_field == TemplateEditorField::Tags,
+                                            if active_field == TemplateEditorField::Tags {
+                                                Some(self.template_editor_cursor(TemplateEditorField::Tags))
+                                            } else {
+                                                None
+                                            },
                                             cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                                 this.focus_template_editor_field(
                                                     TemplateEditorField::Tags,
@@ -6128,15 +6295,11 @@ fn template_editor_input_box(
     value: String,
     placeholder: &'static str,
     active: bool,
+    cursor_byte: Option<usize>,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let display = if value.is_empty() {
-        placeholder.to_string()
-    } else {
-        value
-    };
-
-    div()
+    let is_empty = value.is_empty();
+    let mut container = div()
         .w_full()
         .h(px(52.0))
         .rounded(px(12.0))
@@ -6153,17 +6316,87 @@ fn template_editor_input_box(
         .on_mouse_down(MouseButton::Left, listener)
         .flex()
         .items_center()
-        .child(
+        .overflow_hidden();
+
+    if is_empty && !active {
+        // Placeholder only
+        container = container.child(
             div()
                 .font_family(UI_FONT)
                 .text_size(px(13.0))
-                .text_color(rgb(if display == placeholder {
-                    SUBTEXT1
-                } else {
-                    TEXT
-                }))
-                .child(display),
-        )
+                .text_color(rgb(SUBTEXT1))
+                .child(placeholder),
+        );
+    } else if is_empty && active {
+        // Empty + active: show placeholder with cursor at start
+        container = container
+            .child(
+                div()
+                    .w(px(1.5))
+                    .h(px(18.0))
+                    .bg(rgb(ACCENT))
+                    .flex_shrink_0(),
+            )
+            .child(
+                div()
+                    .font_family(UI_FONT)
+                    .text_size(px(13.0))
+                    .text_color(rgb(SUBTEXT1))
+                    .child(placeholder),
+            );
+    } else if let Some(cursor) = cursor_byte.filter(|_| active) {
+        // Active with cursor: split text at cursor position
+        let cursor = cursor.min(value.len());
+        // Ensure cursor is at a char boundary
+        let cursor = if cursor == 0 || cursor >= value.len() {
+            cursor
+        } else {
+            value[..cursor]
+                .char_indices()
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(cursor)
+        };
+        let before = &value[..cursor];
+        let after = &value[cursor..];
+
+        let mut row = div().flex().items_center().font_family(UI_FONT).text_size(px(13.0));
+
+        if !before.is_empty() {
+            row = row.child(
+                div()
+                    .text_color(rgb(TEXT))
+                    .child(before.to_string()),
+            );
+        }
+        // Cursor caret
+        row = row.child(
+            div()
+                .w(px(1.5))
+                .h(px(18.0))
+                .bg(rgb(ACCENT))
+                .flex_shrink_0(),
+        );
+        if !after.is_empty() {
+            row = row.child(
+                div()
+                    .text_color(rgb(TEXT))
+                    .child(after.to_string()),
+            );
+        }
+        container = container.child(row);
+    } else {
+        // Inactive with text: show text only
+        container = container.child(
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(13.0))
+                .text_color(rgb(TEXT))
+                .child(value),
+        );
+    }
+
+    container
 }
 
 fn template_editor_text_area(
