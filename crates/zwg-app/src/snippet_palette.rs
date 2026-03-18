@@ -333,6 +333,33 @@ impl SnippetPaletteModel {
         Some(new_id)
     }
 
+    pub fn update_template_item(
+        &mut self,
+        id: &str,
+        title: String,
+        content: String,
+        note: Option<String>,
+        tags: Vec<String>,
+        favorite: bool,
+    ) -> bool {
+        let Some(snippet) = self.snippets.iter_mut().find(|s| s.id == id) else {
+            return false;
+        };
+        let cleaned_note = note.and_then(|v| {
+            let t = v.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        });
+        snippet.title = title.trim().to_string();
+        snippet.summary = template_summary(cleaned_note.as_deref(), &content);
+        snippet.content = content.trim_end().to_string();
+        snippet.note = cleaned_note;
+        snippet.tags = tags;
+        snippet.pinned = favorite;
+        snippet.kind_label = template_kind_label(&snippet.content).to_string();
+        self.persist_templates();
+        true
+    }
+
     pub fn ingest_clipboard_capture(&mut self, capture: ClipboardCapture) -> bool {
         if capture.content.trim().is_empty() {
             return false;

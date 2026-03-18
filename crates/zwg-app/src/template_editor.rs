@@ -109,6 +109,7 @@ impl TemplateEditorDraft {
         let note = self.note.trim();
 
         Some(TemplateEditorSubmission {
+            editing_id: None, // set by request_submit
             name: self.name.trim().to_string(),
             content: self.content.trim_end().to_string(),
             note: (!note.is_empty()).then(|| note.to_string()),
@@ -120,6 +121,7 @@ impl TemplateEditorDraft {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TemplateEditorSubmission {
+    pub(crate) editing_id: Option<String>,
     pub(crate) name: String,
     pub(crate) content: String,
     pub(crate) note: Option<String>,
@@ -135,6 +137,7 @@ pub(crate) enum TemplateEditorOutcome {
 
 pub(crate) struct TemplateEditorModal {
     focus_handle: FocusHandle,
+    editing_id: Option<String>,
     draft: TemplateEditorDraft,
     active_field: TemplateEditorField,
     cursor: usize, // byte offset into active field
@@ -148,9 +151,39 @@ impl TemplateEditorModal {
     pub(crate) fn new(cx: &mut Context<Self>) -> Self {
         Self {
             focus_handle: cx.focus_handle(),
+            editing_id: None,
             draft: TemplateEditorDraft::default(),
             active_field: TemplateEditorField::Name,
             cursor: 0,
+            preedit_text: String::new(),
+            marked_range: None,
+            pending_outcome: None,
+            needs_focus: true,
+        }
+    }
+
+    pub(crate) fn new_edit(
+        id: String,
+        name: String,
+        content: String,
+        note: String,
+        tags: String,
+        favorite: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let cursor = name.len();
+        Self {
+            focus_handle: cx.focus_handle(),
+            editing_id: Some(id),
+            draft: TemplateEditorDraft {
+                name,
+                content,
+                note,
+                tags,
+                favorite,
+            },
+            active_field: TemplateEditorField::Name,
+            cursor,
             preedit_text: String::new(),
             marked_range: None,
             pending_outcome: None,
@@ -198,7 +231,8 @@ impl TemplateEditorModal {
     }
 
     fn request_submit(&mut self, cx: &mut Context<Self>) {
-        if let Some(submission) = self.draft.submission() {
+        if let Some(mut submission) = self.draft.submission() {
+            submission.editing_id = self.editing_id.clone();
             self.pending_outcome = Some(TemplateEditorOutcome::Submitted(submission));
             cx.notify();
         }
@@ -628,7 +662,11 @@ impl Render for TemplateEditorModal {
                                     .text_size(px(18.0))
                                     .font_weight(FontWeight::SEMIBOLD)
                                     .text_color(rgb(TEXT))
-                                    .child("新しい定型文を追加"),
+                                    .child(if self.editing_id.is_some() {
+                                        "定型文を編集"
+                                    } else {
+                                        "新しい定型文を追加"
+                                    }),
                             )
                             .child(
                                 div()
@@ -730,7 +768,7 @@ impl Render for TemplateEditorModal {
                                 }),
                             ))
                             .child(template_editor_footer_button(
-                                "追加",
+                                if self.editing_id.is_some() { "保存" } else { "追加" },
                                 true,
                                 can_submit,
                                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {

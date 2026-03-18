@@ -1640,6 +1640,31 @@ impl RootView {
         cx.notify();
     }
 
+    fn open_template_editor_for_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.snippet_palette.selected_snippet().cloned() else {
+            return;
+        };
+        if item.section != SnippetSection::Template {
+            return;
+        }
+        let tags_str = item.tags.join(", ");
+        let note_str = item.note.clone().unwrap_or_default();
+        let editor = cx.new(|cx| {
+            TemplateEditorModal::new_edit(
+                item.id.clone(),
+                item.title.clone(),
+                item.content.clone(),
+                note_str,
+                tags_str,
+                item.pinned,
+                cx,
+            )
+        });
+        editor.read(cx).focus(window);
+        self.template_editor = Some(editor);
+        cx.notify();
+    }
+
     fn move_snippet_selection(&mut self, step: isize, cx: &mut Context<Self>) {
         if self.snippet_palette.move_selection(step) {
             cx.notify();
@@ -1755,20 +1780,37 @@ impl RootView {
                 cx.notify();
             }
             TemplateEditorOutcome::Submitted(submission) => {
-                let created = self.snippet_palette.create_template_item(
-                    submission.name,
-                    submission.content,
-                    submission.note,
-                    submission.tags,
-                    submission.favorite,
-                );
+                let success = if let Some(editing_id) = &submission.editing_id {
+                    self.snippet_palette.update_template_item(
+                        editing_id,
+                        submission.name.clone(),
+                        submission.content.clone(),
+                        submission.note.clone(),
+                        submission.tags.clone(),
+                        submission.favorite,
+                    )
+                } else {
+                    self.snippet_palette.create_template_item(
+                        submission.name.clone(),
+                        submission.content.clone(),
+                        submission.note.clone(),
+                        submission.tags.clone(),
+                        submission.favorite,
+                    )
+                    .is_some()
+                };
+                let is_edit = submission.editing_id.is_some();
 
-                if created.is_some() {
+                if success {
                     self.template_editor = None;
                     window.focus(&self.focus_handle);
                     self.show_app_notice(
-                        "定型文を追加しました",
-                        "新しい定型文を選択しています。".to_string(),
+                        if is_edit { "定型文を更新しました" } else { "定型文を追加しました" },
+                        if is_edit {
+                            format!("{} を保存しました。", submission.name)
+                        } else {
+                            "新しい定型文を選択しています。".to_string()
+                        },
                         1800,
                         cx,
                     );
@@ -2821,6 +2863,15 @@ impl RootView {
                                     MouseButton::Left,
                                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                                         this.toggle_selected_snippet_pin(cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            panel_icon_button("snippet-detail-edit", "ui/settings.svg", false)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                        this.open_template_editor_for_edit(window, cx);
                                     }),
                                 ),
                         )
