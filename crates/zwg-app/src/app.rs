@@ -2161,7 +2161,9 @@ impl RootView {
         );
 
         if self.template_editor.is_some() {
-            cx.stop_propagation();
+            // Template editor has its own on_key_down handler via track_focus.
+            // Don't stop propagation here — let unhandled keys fall through
+            // so EntityInputHandler (IME/text input) can process them.
             return;
         }
 
