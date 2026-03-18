@@ -263,6 +263,12 @@ enum ZoomAction {
     Restore,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SnippetPrimaryAction {
+    CopyToClipboard,
+    PasteToTerminal,
+}
+
 fn zoom_action_for_window(is_maximized: bool) -> ZoomAction {
     if is_maximized {
         ZoomAction::Restore
@@ -351,6 +357,13 @@ fn cycle_string_option(current: &str, options: &[&str], delta: i32) -> String {
 
 fn adjust_font_size_value(current: f32, delta: i32) -> f32 {
     (current + delta as f32).clamp(6.0, 72.0)
+}
+
+fn snippet_primary_action_for_section(section: SnippetSection) -> SnippetPrimaryAction {
+    match section {
+        SnippetSection::History => SnippetPrimaryAction::PasteToTerminal,
+        SnippetSection::Template => SnippetPrimaryAction::CopyToClipboard,
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -1480,18 +1493,72 @@ impl RootView {
         }
     }
 
-    fn copy_selected_snippet(&mut self, cx: &mut Context<Self>) {
-        let Some(item) = self.snippet_palette.selected_snippet() else {
+    fn trigger_selected_snippet_primary_action(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(item) = self.snippet_palette.selected_snippet().cloned() else {
             return;
         };
-        let section_label = self.snippet_palette.active_section().title();
-        cx.write_to_clipboard(ClipboardItem::new_string(item.content.clone()));
-        self.show_app_notice(
-            format!("{section_label}をコピーしました"),
-            format!("{} をクリップボードへ送信しました。", item.title),
-            2200,
-            cx,
-        );
+        match snippet_primary_action_for_section(self.snippet_palette.active_section()) {
+            SnippetPrimaryAction::CopyToClipboard => {
+                let section_label = self.snippet_palette.active_section().title();
+                cx.write_to_clipboard(ClipboardItem::new_string(item.content.clone()));
+                self.show_app_notice(
+                    format!("{section_label}をコピーしました"),
+                    format!("{} をクリップボードへ送信しました。", item.title),
+                    2200,
+                    cx,
+                );
+            }
+            SnippetPrimaryAction::PasteToTerminal => {
+                if self.paste_snippet_into_active_terminal(&item.content, window, cx) {
+                    self.show_app_notice(
+                        "履歴をターミナルへ貼り付けました",
+                        format!("{} をアクティブなターミナルへ送信しました。", item.title),
+                        2200,
+                        cx,
+                    );
+                } else {
+                    self.show_app_notice(
+                        "履歴を貼り付けできませんでした",
+                        "アクティブなターミナルが見つかりません。".to_string(),
+                        2200,
+                        cx,
+                    );
+                }
+            }
+        }
+    }
+
+    fn paste_snippet_into_active_terminal(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let split = self.state.read(cx).active_split().cloned();
+        let Some(split) = split else {
+            return false;
+        };
+        let Some(terminal) = split.read(cx).focused_terminal() else {
+            return false;
+        };
+
+        let pasted = terminal.update(cx, |pane, cx| {
+            let pasted = pane.paste_text(text);
+            if pasted {
+                cx.notify();
+            }
+            pasted
+        });
+        if !pasted {
+            return false;
+        }
+
+        self.close_snippet_palette(window, cx);
+        true
     }
 
     fn select_snippet(&mut self, snippet_id: &str, cx: &mut Context<Self>) {
@@ -1700,7 +1767,7 @@ impl RootView {
                 true
             }
             "enter" => {
-                self.copy_selected_snippet(cx);
+                self.trigger_selected_snippet_primary_action(window, cx);
                 true
             }
             "backspace" => {
@@ -2528,8 +2595,8 @@ impl RootView {
                             panel_icon_button("snippet-detail-copy", "ui/copy.svg", false)
                                 .on_mouse_down(
                                     MouseButton::Left,
-                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                        this.copy_selected_snippet(cx);
+                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                        this.trigger_selected_snippet_primary_action(window, cx);
                                     }),
                                 ),
                         )
@@ -5546,12 +5613,13 @@ mod tests {
         cycle_string_option, direct_text_from_input_keystroke, hotkey_binding_string,
         hotkey_matches, hotkey_string_for_keystroke, next_filtered_index,
         process_completion_notice_detail, replace_text_in_ai_settings_ime_target,
-        should_defer_keystroke_to_input_method, snippet_panel_frame, terminal_settings_from_config,
-        titlebar_actions_width, titlebar_side_cluster_width, traffic_lights_width,
-        utf16_offset_to_byte_index, utf16_range_to_byte_range, wrap_sidebar_preview,
-        zoom_action_for_window,
+        should_defer_keystroke_to_input_method, snippet_panel_frame,
+        snippet_primary_action_for_section, terminal_settings_from_config, titlebar_actions_width,
+        titlebar_side_cluster_width, traffic_lights_width, utf16_offset_to_byte_index,
+        utf16_range_to_byte_range, wrap_sidebar_preview, zoom_action_for_window,
     };
     use crate::config::AppConfig;
+    use crate::snippet_palette::SnippetSection;
     use gpui::{KeyDownEvent, Keystroke, Modifiers};
     use std::sync::{
         Arc,
@@ -5615,6 +5683,18 @@ mod tests {
 
         assert!(wrapped.contains('\n'));
         assert!(wrapped.ends_with("..."));
+    }
+
+    #[test]
+    fn history_primary_action_pastes_and_template_copies() {
+        assert_eq!(
+            snippet_primary_action_for_section(SnippetSection::History),
+            super::SnippetPrimaryAction::PasteToTerminal
+        );
+        assert_eq!(
+            snippet_primary_action_for_section(SnippetSection::Template),
+            super::SnippetPrimaryAction::CopyToClipboard
+        );
     }
 
     #[test]

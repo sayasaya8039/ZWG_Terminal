@@ -251,8 +251,7 @@ fn read_ime_result_text(hwnd: windows::Win32::Foundation::HWND) -> Option<String
     ) -> Option<String> {
         use std::ffi::c_void;
 
-        let required_bytes_raw =
-            unsafe { ImmGetCompositionStringW(himc, kind, None, 0) };
+        let required_bytes_raw = unsafe { ImmGetCompositionStringW(himc, kind, None, 0) };
         if required_bytes_raw <= 0 {
             if terminal_ime_trace_enabled() {
                 log::debug!("IME_TERM {} size={}", kind_name, required_bytes_raw);
@@ -381,11 +380,11 @@ unsafe extern "system" fn ime_getmessage_hook_proc(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
+    use windows::Win32::UI::Input::Ime::{GCS_RESULTREADSTR, GCS_RESULTSTR};
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, MSG, PM_REMOVE, TranslateMessage, WM_IME_COMPOSITION,
         WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
     };
-    use windows::Win32::UI::Input::Ime::{GCS_RESULTREADSTR, GCS_RESULTSTR};
 
     if code >= 0 && wparam.0 == PM_REMOVE.0 as usize {
         unsafe {
@@ -585,7 +584,9 @@ fn should_defer_keystroke_to_ime(ks: &Keystroke, ime_processkey_pending: bool) -
             if terminal_ime_trace_enabled() {
                 log::debug!(
                     "IME_TERM should_defer key_char={:?} all_ascii={} -> defer={}",
-                    key_char, defer, defer
+                    key_char,
+                    defer,
+                    defer
                 );
             }
             return defer;
@@ -1651,19 +1652,22 @@ impl TerminalPane {
         // Check against ALL recent inputs, not just the last one.
         // This prevents delayed ImeEndComposition flushes from escaping
         // duplicate detection when subsequent keystrokes have updated the history.
-        let duplicate = self.recent_user_inputs.iter().any(|(prev_source, prev_data, at)| {
-            if prev_data != data {
-                return false;
-            }
+        let duplicate = self
+            .recent_user_inputs
+            .iter()
+            .any(|(prev_source, prev_data, at)| {
+                if prev_data != data {
+                    return false;
+                }
 
-            let elapsed = now.duration_since(*at);
-            if *prev_source != source {
-                return elapsed <= Duration::from_millis(CROSS_ROUTE_DUPLICATE_WINDOW_MS);
-            }
+                let elapsed = now.duration_since(*at);
+                if *prev_source != source {
+                    return elapsed <= Duration::from_millis(CROSS_ROUTE_DUPLICATE_WINDOW_MS);
+                }
 
-            source.is_commit_source()
-                && elapsed <= Duration::from_millis(SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS)
-        });
+                source.is_commit_source()
+                    && elapsed <= Duration::from_millis(SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS)
+            });
 
         // Cap the deque to prevent unbounded growth
         const MAX_RECENT_ENTRIES: usize = 32;
@@ -1725,19 +1729,23 @@ impl TerminalPane {
         {}
     }
 
+    pub fn paste_text(&mut self, text: &str) -> bool {
+        let bytes = normalize_terminal_newlines(text);
+        if bytes.is_empty() {
+            return false;
+        }
+
+        self.clear_selection();
+        self.write_terminal_bytes(&bytes);
+        true
+    }
+
     fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return false;
         };
 
-        let bytes = normalize_terminal_newlines(&text);
-        if bytes.is_empty() {
-            return false;
-        }
-
-        let selection_changed = self.clear_selection();
-        self.write_terminal_bytes(&bytes);
-        selection_changed
+        self.paste_text(&text)
     }
 
     fn on_external_paths_drop(
