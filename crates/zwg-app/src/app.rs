@@ -2203,6 +2203,12 @@ impl RootView {
                     let item_id = item.id.clone();
                     let is_selected = selected_id.as_deref() == Some(item.id.as_str());
                     let relative_created_label = item.relative_created_label();
+                    let wrapped_title = wrap_sidebar_preview(&item.title, 24.0, 2);
+                    let wrapped_summary = if item.summary.is_empty() {
+                        None
+                    } else {
+                        Some(wrap_sidebar_preview(&item.summary, 28.0, 2))
+                    };
                     let meta_row = if active_section == SnippetSection::History {
                         div()
                             .flex()
@@ -2268,6 +2274,7 @@ impl RootView {
                             }),
                         )
                         .flex()
+                        .items_start()
                         .gap(px(10.0))
                         .child(
                             div()
@@ -2296,16 +2303,19 @@ impl RootView {
                         .child(
                             div()
                                 .flex_1()
+                                .min_w(px(0.0))
                                 .flex()
                                 .flex_col()
                                 .gap(px(4.0))
                                 .child(
                                     div()
                                         .flex()
-                                        .items_center()
+                                        .items_start()
                                         .gap(px(6.0))
                                         .child(
                                             div()
+                                                .flex_1()
+                                                .min_w(px(0.0))
                                                 .font_family(UI_FONT)
                                                 .text_size(px(13.0))
                                                 .font_weight(FontWeight::MEDIUM)
@@ -2314,7 +2324,7 @@ impl RootView {
                                                 } else {
                                                     TEXT
                                                 }))
-                                                .child(item.title.clone()),
+                                                .child(wrapped_title),
                                         )
                                         .child(if item.pinned {
                                             svg()
@@ -2326,9 +2336,7 @@ impl RootView {
                                             div().into_any_element()
                                         }),
                                 )
-                                .child(if item.summary.is_empty() {
-                                    div().into_any_element()
-                                } else {
+                                .child(if let Some(summary) = wrapped_summary {
                                     div()
                                         .font_family(UI_FONT)
                                         .text_size(px(11.0))
@@ -2337,8 +2345,10 @@ impl RootView {
                                         } else {
                                             SUBTEXT1
                                         }))
-                                        .child(item.summary.clone())
+                                        .child(summary)
                                         .into_any_element()
+                                } else {
+                                    div().into_any_element()
                                 })
                                 .child(meta_row),
                         );
@@ -4647,6 +4657,74 @@ fn panel_text_button(
         )
 }
 
+fn wrap_sidebar_preview(text: &str, max_units_per_line: f32, max_lines: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() || max_lines == 0 {
+        return String::new();
+    }
+
+    let mut lines: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut current_units = 0.0_f32;
+    let mut chars = trimmed.chars().peekable();
+    let mut truncated = false;
+
+    while let Some(ch) = chars.next() {
+        if ch == '\n' {
+            if !current.trim().is_empty() {
+                lines.push(current.trim_end().to_string());
+                if lines.len() == max_lines {
+                    truncated = chars.peek().is_some();
+                    break;
+                }
+            }
+            current.clear();
+            current_units = 0.0;
+            continue;
+        }
+
+        let ch_units = sidebar_preview_char_units(ch);
+        if current_units + ch_units > max_units_per_line && !current.is_empty() {
+            lines.push(current.trim_end().to_string());
+            if lines.len() == max_lines {
+                truncated = true;
+                break;
+            }
+            current.clear();
+            current_units = 0.0;
+        }
+
+        current.push(ch);
+        current_units += ch_units;
+    }
+
+    if !current.trim().is_empty() && lines.len() < max_lines {
+        lines.push(current.trim_end().to_string());
+    }
+
+    if truncated {
+        if let Some(last) = lines.last_mut() {
+            if !last.ends_with("...") {
+                last.push_str("...");
+            }
+        }
+    }
+
+    lines.join("\n")
+}
+
+fn sidebar_preview_char_units(ch: char) -> f32 {
+    if ch.is_ascii_whitespace() {
+        0.35
+    } else if ch.is_ascii_punctuation() {
+        0.45
+    } else if ch.is_ascii() {
+        0.58
+    } else {
+        1.0
+    }
+}
+
 fn titlebar_actions_width() -> f32 {
     let action_slots: usize = 4;
     let button_width = 24.0;
@@ -5367,7 +5445,8 @@ mod tests {
         process_completion_notice_detail, replace_text_in_ai_settings_ime_target,
         should_defer_keystroke_to_input_method, snippet_panel_frame, terminal_settings_from_config,
         titlebar_actions_width, titlebar_side_cluster_width, traffic_lights_width,
-        utf16_offset_to_byte_index, utf16_range_to_byte_range, zoom_action_for_window,
+        utf16_offset_to_byte_index, utf16_range_to_byte_range, wrap_sidebar_preview,
+        zoom_action_for_window,
     };
     use crate::config::AppConfig;
     use gpui::{KeyDownEvent, Keystroke, Modifiers};
@@ -5421,6 +5500,18 @@ mod tests {
         assert_eq!(frame.left, 12.0);
         assert_eq!(frame.width, 776.0);
         assert_eq!(frame.height, 558.0);
+    }
+
+    #[test]
+    fn wrap_sidebar_preview_inserts_breaks_for_long_text() {
+        let wrapped = wrap_sidebar_preview(
+            "CopyQはクリップボード管理ツールです。テキスト、画像、その他のデータをコピーすると自動的に保存されます。",
+            24.0,
+            2,
+        );
+
+        assert!(wrapped.contains('\n'));
+        assert!(wrapped.ends_with("..."));
     }
 
     #[test]
