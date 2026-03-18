@@ -18,6 +18,7 @@ mod ai;
 mod app;
 mod config;
 mod shell;
+mod snippet_palette;
 mod split;
 mod terminal;
 mod wasm_runtime;

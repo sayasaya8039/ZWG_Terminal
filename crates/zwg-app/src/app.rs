@@ -32,6 +32,7 @@ use crate::config::{
     SUPPORTED_TERMINAL_FONT_FAMILIES, WindowState, set_launch_on_login,
 };
 use crate::shell::{self, ShellType};
+use crate::snippet_palette::SnippetPaletteModel;
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::terminal::TerminalSettings;
 use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
@@ -330,60 +331,6 @@ const SNIPPET_PANEL_TOP_OFFSET: f32 = 46.0;
 const SNIPPET_PANEL_MAX_WIDTH: f32 = 940.0;
 const SNIPPET_PANEL_MAX_HEIGHT: f32 = 560.0;
 
-const SNIPPET_TAG_EMAIL: &[&str] = &["メール", "仕事"];
-const SNIPPET_TAG_REACT: &[&str] = &["React", "コード", "テンプレート"];
-const SNIPPET_TAG_MEETING: &[&str] = &["会議", "ドキュメント"];
-const SNIPPET_TAG_ADDRESS: &[&str] = &["住所", "仕事"];
-const SNIPPET_TAG_GIT: &[&str] = &["Git", "開発"];
-
-const SNIPPET_PANEL_ITEMS: [SnippetPanelItem; 5] = [
-    SnippetPanelItem {
-        title: "メールの署名",
-        summary: "ビジネスメールの締めに使う定型の署名です。",
-        content: "よろしくお願いいたします。\n\n山田太郎\n〇〇株式会社 開発部\nEmail: yamada@example.com\nTel: 03-1234-5678",
-        tags: SNIPPET_TAG_EMAIL,
-        favorite: true,
-        updated_at: "3月16日 10:42",
-        source: "Mail",
-    },
-    SnippetPanelItem {
-        title: "React コンポーネントテンプレート",
-        summary: "関数コンポーネントを素早く起こすための雛形です。",
-        content: "import React from 'react';\n\ninterface Props {\n  // プロパティをここに定義\n}\n\nexport const ComponentName: React.FC<Props> = (props) => {\n  return (\n    <div>\n      {/* コンテンツ */}\n    </div>\n  );\n};",
-        tags: SNIPPET_TAG_REACT,
-        favorite: true,
-        updated_at: "3月15日 21:08",
-        source: "VS Code",
-    },
-    SnippetPanelItem {
-        title: "会議の議事録フォーマット",
-        summary: "議題、決定事項、TODO を揃えた議事録テンプレートです。",
-        content: "## 会議議事録\n\n**日時**:\n**参加者**:\n**議題**:\n\n### 決定事項\n- \n\n### 課題・TODO\n- \n\n### 次回予定\n- ",
-        tags: SNIPPET_TAG_MEETING,
-        favorite: false,
-        updated_at: "3月14日 18:20",
-        source: "Docs",
-    },
-    SnippetPanelItem {
-        title: "会社住所",
-        summary: "請求先や契約書にそのまま貼り付けられる住所です。",
-        content: "〒100-0001 東京都千代田区千代田1-1-1",
-        tags: SNIPPET_TAG_ADDRESS,
-        favorite: false,
-        updated_at: "3月13日 09:14",
-        source: "Contacts",
-    },
-    SnippetPanelItem {
-        title: "Git コミットテンプレート",
-        summary: "feat/fix 形式に揃えたコミットメッセージの下書きです。",
-        content: "feat: 新機能の追加\n\n- 変更内容の詳細1\n- 変更内容の詳細2\n\n関連Issue: #",
-        tags: SNIPPET_TAG_GIT,
-        favorite: false,
-        updated_at: "3月12日 22:05",
-        source: "Git",
-    },
-];
-
 fn cycle_string_option(current: &str, options: &[&str], delta: i32) -> String {
     if options.is_empty() {
         return current.to_string();
@@ -542,17 +489,6 @@ struct AppNotice {
     duration_ms: u64,
 }
 
-#[derive(Clone, Copy)]
-struct SnippetPanelItem {
-    title: &'static str,
-    summary: &'static str,
-    content: &'static str,
-    tags: &'static [&'static str],
-    favorite: bool,
-    updated_at: &'static str,
-    source: &'static str,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct SnippetPanelFrame {
     top: f32,
@@ -578,6 +514,7 @@ fn snippet_panel_frame(viewport_w: f32, viewport_h: f32) -> SnippetPanelFrame {
     }
 }
 
+#[cfg(test)]
 fn next_filtered_index(current: Option<usize>, visible: &[usize], step: isize) -> Option<usize> {
     if visible.is_empty() {
         return None;
@@ -672,9 +609,7 @@ pub struct RootView {
     show_settings: bool,
     show_snippet_palette: bool,
     show_close_confirm: bool,
-    snippet_selected_index: usize,
-    snippet_favorites: Vec<bool>,
-    snippet_favorites_only: bool,
+    snippet_palette: SnippetPaletteModel,
     keyboard_settings_active_text: Option<KeyboardSettingsTextField>,
     ai_settings_active_text: Option<AiSettingsTextField>,
     app_notice: Option<AppNotice>,
@@ -785,12 +720,7 @@ impl RootView {
             show_settings: false,
             show_snippet_palette: false,
             show_close_confirm: false,
-            snippet_selected_index: 0,
-            snippet_favorites: SNIPPET_PANEL_ITEMS
-                .iter()
-                .map(|item| item.favorite)
-                .collect(),
-            snippet_favorites_only: false,
+            snippet_palette: SnippetPaletteModel::new(),
             keyboard_settings_active_text: None,
             ai_settings_active_text: None,
             app_notice: None,
@@ -1475,45 +1405,12 @@ impl RootView {
             .store(suppressed, Ordering::Relaxed);
     }
 
-    fn filtered_snippet_indices(&self) -> Vec<usize> {
-        SNIPPET_PANEL_ITEMS
-            .iter()
-            .enumerate()
-            .filter_map(|(index, _)| {
-                (!self.snippet_favorites_only || self.snippet_is_favorite(index)).then_some(index)
-            })
-            .collect()
-    }
-
-    fn snippet_is_favorite(&self, index: usize) -> bool {
-        self.snippet_favorites
-            .get(index)
-            .copied()
-            .unwrap_or_else(|| SNIPPET_PANEL_ITEMS[index].favorite)
-    }
-
-    fn selected_snippet_index(&self) -> Option<usize> {
-        let visible = self.filtered_snippet_indices();
-        if visible.contains(&self.snippet_selected_index) {
-            Some(self.snippet_selected_index)
-        } else {
-            visible.first().copied()
-        }
-    }
-
-    fn ensure_valid_snippet_selection(&mut self) {
-        if let Some(index) = self.selected_snippet_index() {
-            self.snippet_selected_index = index;
-        }
-    }
-
     fn toggle_snippet_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let next_visible = !self.show_snippet_palette;
         self.show_snippet_palette = next_visible;
         self.show_shell_menu = false;
         self.show_settings = false;
         if next_visible {
-            self.ensure_valid_snippet_selection();
             window.focus(&self.focus_handle);
         }
         cx.notify();
@@ -1528,58 +1425,114 @@ impl RootView {
         self.focus_active_terminal(window, cx);
     }
 
-    fn select_snippet_index(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.snippet_selected_index = index;
-        self.ensure_valid_snippet_selection();
-        cx.notify();
-    }
-
     fn move_snippet_selection(&mut self, step: isize, cx: &mut Context<Self>) {
-        let visible = self.filtered_snippet_indices();
-        if let Some(index) = next_filtered_index(self.selected_snippet_index(), &visible, step) {
-            self.snippet_selected_index = index;
+        if self.snippet_palette.move_selection(step) {
             cx.notify();
         }
     }
 
     fn copy_selected_snippet(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.selected_snippet_index() else {
+        let Some(item) = self.snippet_palette.selected_snippet() else {
             return;
         };
-        let item = SNIPPET_PANEL_ITEMS[index];
-        cx.write_to_clipboard(ClipboardItem::new_string(item.content.to_string()));
+        cx.write_to_clipboard(ClipboardItem::new_string(item.content.clone()));
         self.show_app_notice(
-            "定型文をコピーしました",
+            "CopyQ 項目をコピーしました",
             format!("{} をクリップボードへ送信しました。", item.title),
             2200,
             cx,
         );
     }
 
-    fn toggle_selected_snippet_favorite(&mut self, cx: &mut Context<Self>) {
-        let Some(index) = self.selected_snippet_index() else {
+    fn select_snippet(&mut self, snippet_id: &str, cx: &mut Context<Self>) {
+        if self.snippet_palette.select(snippet_id) {
+            cx.notify();
+        }
+    }
+
+    fn select_snippet_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
+        if self.snippet_palette.select_tab(tab_id) {
+            cx.notify();
+        }
+    }
+
+    fn cycle_snippet_tabs(&mut self, step: isize, cx: &mut Context<Self>) {
+        if self.snippet_palette.cycle_tabs(step) {
+            cx.notify();
+        }
+    }
+
+    fn append_snippet_search_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.snippet_palette.append_search_query(text);
+        cx.notify();
+    }
+
+    fn paste_into_snippet_search(&mut self, cx: &mut Context<Self>) {
+        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
-        if let Some(favorite) = self.snippet_favorites.get_mut(index) {
-            *favorite = !*favorite;
+        self.snippet_palette.append_search_query(&text);
+        cx.notify();
+    }
+
+    fn pop_snippet_search_text(&mut self, cx: &mut Context<Self>) {
+        if self.snippet_palette.pop_search_query() {
+            cx.notify();
         }
-        self.ensure_valid_snippet_selection();
+    }
+
+    fn clear_snippet_search_text(&mut self, cx: &mut Context<Self>) {
+        if self.snippet_palette.clear_search_query() {
+            cx.notify();
+        }
+    }
+
+    fn toggle_selected_snippet_pin(&mut self, cx: &mut Context<Self>) {
+        let Some(title) = self
+            .snippet_palette
+            .selected_snippet()
+            .map(|item| item.title.clone())
+        else {
+            return;
+        };
+        let Some(pinned) = self.snippet_palette.toggle_selected_pinned() else {
+            return;
+        };
+        self.show_app_notice(
+            if pinned {
+                "項目をピン留めしました"
+            } else {
+                "ピン留めを解除しました"
+            },
+            format!("{title} の優先表示状態を更新しました。"),
+            1800,
+            cx,
+        );
         cx.notify();
     }
 
-    fn toggle_snippet_favorites_only(&mut self, cx: &mut Context<Self>) {
-        self.snippet_favorites_only = !self.snippet_favorites_only;
-        self.ensure_valid_snippet_selection();
+    fn toggle_snippet_pinned_only(&mut self, cx: &mut Context<Self>) {
+        self.snippet_palette.toggle_pinned_only();
         cx.notify();
     }
 
-    fn show_snippet_stub_notice(
-        &mut self,
-        title: &'static str,
-        detail: &'static str,
-        cx: &mut Context<Self>,
-    ) {
-        self.show_app_notice(title, detail, 2200, cx);
+    fn delete_selected_snippet(&mut self, cx: &mut Context<Self>) {
+        let Some(title) = self
+            .snippet_palette
+            .selected_snippet()
+            .map(|item| item.title.clone())
+        else {
+            return;
+        };
+        if self.snippet_palette.remove_selected() {
+            self.show_app_notice(
+                "履歴項目を削除しました",
+                format!("{title} を現在の一覧から取り除きました。"),
+                1800,
+                cx,
+            );
+            cx.notify();
+        }
     }
 
     fn handle_snippet_palette_key(
@@ -1590,6 +1543,10 @@ impl RootView {
     ) -> bool {
         if !self.show_snippet_palette {
             return false;
+        }
+
+        if should_defer_keystroke_to_input_method(&event.keystroke) {
+            return true;
         }
 
         match event.keystroke.key.as_ref() {
@@ -1605,11 +1562,61 @@ impl RootView {
                 self.move_snippet_selection(1, cx);
                 true
             }
+            "tab" => {
+                self.cycle_snippet_tabs(
+                    if event.keystroke.modifiers.shift {
+                        -1
+                    } else {
+                        1
+                    },
+                    cx,
+                );
+                true
+            }
             "enter" => {
                 self.copy_selected_snippet(cx);
                 true
             }
-            _ => false,
+            "backspace" => {
+                self.pop_snippet_search_text(cx);
+                true
+            }
+            "delete" => {
+                self.delete_selected_snippet(cx);
+                true
+            }
+            "v" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.paste_into_snippet_search(cx);
+                true
+            }
+            "insert"
+                if event.keystroke.modifiers.shift
+                    && !event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt =>
+            {
+                self.paste_into_snippet_search(cx);
+                true
+            }
+            "l" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.clear_snippet_search_text(cx);
+                true
+            }
+            "p" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.toggle_selected_snippet_pin(cx);
+                true
+            }
+            "f" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.toggle_snippet_pinned_only(cx);
+                true
+            }
+            _ => {
+                if let Some(text) = direct_text_from_input_keystroke(&event.keystroke) {
+                    self.append_snippet_search_text(&text, cx);
+                    true
+                } else {
+                    false
+                }
+            }
         }
     }
 
@@ -2122,13 +2129,16 @@ impl RootView {
 
         let frame = snippet_panel_frame(viewport_w, viewport_h);
         let sidebar_w = (frame.width * 0.36).clamp(276.0, 332.0);
-        let visible = self.filtered_snippet_indices();
-        let selected_index = self.selected_snippet_index();
-        let favorite_count = self
-            .snippet_favorites
-            .iter()
-            .filter(|value| **value)
-            .count();
+        let visible = self.snippet_palette.visible_snippets();
+        let selected_id = self
+            .snippet_palette
+            .selected_snippet()
+            .map(|snippet| snippet.id.clone());
+        let search_query = self.snippet_palette.search_query().to_string();
+        let pinned_only = self.snippet_palette.pinned_only();
+        let total_count = self.snippet_palette.total_count();
+        let pinned_count = self.snippet_palette.pinned_count();
+        let active_tab_title = self.snippet_palette.active_tab_title().to_string();
 
         let list_items = if visible.is_empty() {
             vec![
@@ -2147,28 +2157,35 @@ impl RootView {
                             .font_family(UI_FONT)
                             .text_size(px(13.0))
                             .text_color(rgb(TEXT))
-                            .child("表示できる定型文がありません"),
+                            .child("このタブに表示できる項目がありません"),
                     )
                     .child(
                         div()
                             .font_family(UI_FONT)
                             .text_size(px(11.0))
                             .text_color(rgb(SUBTEXT1))
-                            .child("お気に入りフィルタを解除すると一覧に戻ります。"),
+                            .child(if search_query.is_empty() {
+                                "フィルタを解除するか、別タブへ切り替えてください。"
+                            } else {
+                                "検索語を短くするか、Ctrl+L で検索をクリアしてください。"
+                            }),
                     )
                     .into_any_element(),
             ]
         } else {
             visible
                 .iter()
-                .map(|index| {
-                    let item = SNIPPET_PANEL_ITEMS[*index];
-                    let is_selected = selected_index == Some(*index);
-                    let is_favorite = self.snippet_is_favorite(*index);
-                    let row_index = *index;
+                .map(|item| {
+                    let item_id = item.id.clone();
+                    let is_selected = selected_id.as_deref() == Some(item.id.as_str());
+                    let tab_title = self
+                        .snippet_palette
+                        .tab_title_for(&item.tab_id)
+                        .unwrap_or("Clipboard")
+                        .to_string();
 
                     let mut row = div()
-                        .id(ElementId::Name(format!("snippet-item-{row_index}").into()))
+                        .id(ElementId::Name(format!("snippet-item-{}", item.id).into()))
                         .w_full()
                         .rounded(px(12.0))
                         .border_1()
@@ -2189,7 +2206,7 @@ impl RootView {
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                this.select_snippet_index(row_index, cx);
+                                this.select_snippet(&item_id, cx);
                             }),
                         )
                         .flex()
@@ -2235,9 +2252,9 @@ impl RootView {
                                                 .text_size(px(13.0))
                                                 .font_weight(FontWeight::MEDIUM)
                                                 .text_color(rgb(TEXT))
-                                                .child(item.title),
+                                                .child(item.title.clone()),
                                         )
-                                        .child(if is_favorite {
+                                        .child(if item.pinned {
                                             svg()
                                                 .path("ui/star-filled.svg")
                                                 .size(px(12.0))
@@ -2256,7 +2273,7 @@ impl RootView {
                                         } else {
                                             SUBTEXT1
                                         }))
-                                        .child(item.summary),
+                                        .child(item.summary.clone()),
                                 )
                                 .child(
                                     div()
@@ -2268,10 +2285,18 @@ impl RootView {
                                                 .font_family(UI_FONT)
                                                 .text_size(px(10.0))
                                                 .text_color(rgb(MUTED))
-                                                .child(item.source),
+                                                .child(tab_title),
+                                        )
+                                        .child(
+                                            div()
+                                                .font_family(UI_FONT)
+                                                .text_size(px(10.0))
+                                                .text_color(rgb(MUTED))
+                                                .child(item.source.clone()),
                                         )
                                         .children(item.tags.iter().take(2).map(|tag| {
-                                            snippet_tag_chip(tag, is_selected).into_any_element()
+                                            snippet_tag_chip(tag.clone(), is_selected)
+                                                .into_any_element()
                                         })),
                                 ),
                         );
@@ -2285,203 +2310,212 @@ impl RootView {
                 .collect::<Vec<_>>()
         };
 
-        let detail = if let Some(index) = selected_index {
-            let item = SNIPPET_PANEL_ITEMS[index];
-            let is_favorite = self.snippet_is_favorite(index);
-            let content_lines = item
-                .content
-                .lines()
-                .map(|line| {
-                    div()
-                        .font_family(MONO_FONT)
-                        .text_size(px(12.0))
-                        .text_color(rgb(TEXT))
-                        .child(if line.is_empty() {
-                            " ".to_string()
-                        } else {
-                            line.to_string()
-                        })
-                        .into_any_element()
-                })
-                .collect::<Vec<_>>();
+        let detail =
+            if let Some(item) = self.snippet_palette.selected_snippet().cloned() {
+                let tab_title = self
+                    .snippet_palette
+                    .tab_title_for(&item.tab_id)
+                    .unwrap_or("Clipboard")
+                    .to_string();
+                let content_lines = item
+                    .content
+                    .lines()
+                    .map(|line| {
+                        div()
+                            .font_family(MONO_FONT)
+                            .text_size(px(12.0))
+                            .text_color(rgb(TEXT))
+                            .child(if line.is_empty() {
+                                " ".to_string()
+                            } else {
+                                line.to_string()
+                            })
+                            .into_any_element()
+                    })
+                    .collect::<Vec<_>>();
 
-            div()
-                .flex_1()
-                .min_w(px(0.0))
-                .bg(rgb(PANEL_BG))
-                .flex()
-                .flex_col()
-                .child(
-                    div()
-                        .h(px(58.0))
-                        .px(px(18.0))
-                        .border_b_1()
-                        .border_color(rgba(0xffffff10))
-                        .flex()
-                        .items_center()
-                        .gap(px(12.0))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .flex()
-                                .flex_col()
-                                .gap(px(4.0))
-                                .child(
-                                    div()
-                                        .font_family(UI_FONT)
-                                        .text_size(px(15.0))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(rgb(TEXT))
-                                        .child(item.title),
-                                )
-                                .child(
-                                    div()
-                                        .font_family(UI_FONT)
-                                        .text_size(px(11.0))
-                                        .text_color(rgb(SUBTEXT1))
-                                        .child(format!(
-                                            "{} から更新  {}",
-                                            item.updated_at, item.source
-                                        )),
-                                ),
-                        )
-                        .child(
-                            panel_icon_button(
-                                "snippet-detail-favorite",
-                                "ui/star.svg",
-                                is_favorite,
+                div()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .bg(rgb(PANEL_BG))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .h(px(58.0))
+                            .px(px(18.0))
+                            .border_b_1()
+                            .border_color(rgba(0xffffff10))
+                            .flex()
+                            .items_center()
+                            .gap(px(12.0))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .font_family(UI_FONT)
+                                            .text_size(px(15.0))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(rgb(TEXT))
+                                            .child(item.title.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(UI_FONT)
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(SUBTEXT1))
+                                            .child(format!(
+                                                "{}  /  {}  /  {}",
+                                                tab_title, item.created_label, item.source
+                                            )),
+                                    ),
                             )
-                            .on_mouse_down(
-                                MouseButton::Left,
-                                cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                    this.toggle_selected_snippet_favorite(cx);
+                            .child(
+                                panel_icon_button("snippet-detail-pin", "ui/star.svg", item.pinned)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.toggle_selected_snippet_pin(cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                panel_icon_button("snippet-detail-copy", "ui/copy.svg", false)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.copy_selected_snippet(cx);
+                                        }),
+                                    ),
+                            )
+                            .child(
+                                panel_icon_button("snippet-detail-delete", "ui/trash.svg", false)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                            this.delete_selected_snippet(cx);
+                                        }),
+                                    ),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .px(px(18.0))
+                            .py(px(14.0))
+                            .border_b_1()
+                            .border_color(rgba(0xffffff10))
+                            .flex()
+                            .flex_col()
+                            .gap(px(10.0))
+                            .child(
+                                div()
+                                    .font_family(UI_FONT)
+                                    .text_size(px(12.0))
+                                    .text_color(rgb(SUBTEXT0))
+                                    .child(item.summary.clone()),
+                            )
+                            .child(div().flex().items_center().gap(px(8.0)).children(
+                                item.tags.iter().map(|tag| {
+                                    snippet_tag_chip(tag.clone(), false).into_any_element()
                                 }),
+                            ))
+                            .child(if let Some(note) = item.note.clone() {
+                                div()
+                                    .rounded(px(10.0))
+                                    .border_1()
+                                    .border_color(rgba(0xffffff10))
+                                    .bg(rgba(0xffffff08))
+                                    .p(px(12.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(4.0))
+                                    .child(
+                                        div()
+                                            .font_family(UI_FONT)
+                                            .text_size(px(10.0))
+                                            .text_color(rgb(MUTED))
+                                            .child("Note"),
+                                    )
+                                    .child(
+                                        div()
+                                            .font_family(UI_FONT)
+                                            .text_size(px(11.0))
+                                            .text_color(rgb(SUBTEXT0))
+                                            .child(note),
+                                    )
+                                    .into_any_element()
+                            } else {
+                                div().into_any_element()
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("snippet-detail-scroll")
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .overflow_scroll()
+                            .scrollbar_width(px(6.0))
+                            .child(
+                                div()
+                                    .w_full()
+                                    .px(px(18.0))
+                                    .py(px(16.0))
+                                    .rounded(px(12.0))
+                                    .border_1()
+                                    .border_color(rgba(0xffffff10))
+                                    .bg(rgba(0xffffff06))
+                                    .p(px(16.0))
+                                    .flex()
+                                    .flex_col()
+                                    .gap(px(6.0))
+                                    .children(content_lines),
                             ),
-                        )
-                        .child(
-                            panel_icon_button("snippet-detail-copy", "ui/copy.svg", false)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                        this.copy_selected_snippet(cx);
-                                    }),
-                                ),
-                        )
-                        .child(
-                            panel_icon_button("snippet-detail-edit", "ui/edit.svg", false)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                        this.show_snippet_stub_notice(
-                                            "編集 UI は次段で接続します",
-                                            "今回は Figma ベースの表示パネルを先行導入しています。",
-                                            cx,
-                                        );
-                                    }),
-                                ),
-                        )
-                        .child(
-                            panel_icon_button("snippet-detail-delete", "ui/trash.svg", false)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                        this.show_snippet_stub_notice(
-                                            "削除導線は次段で接続します",
-                                            "今回の差分ではパネル配置と選択導線を優先しています。",
-                                            cx,
-                                        );
-                                    }),
-                                ),
-                        ),
-                )
-                .child(
-                    div()
-                        .px(px(18.0))
-                        .py(px(14.0))
-                        .border_b_1()
-                        .border_color(rgba(0xffffff10))
-                        .flex()
-                        .flex_col()
-                        .gap(px(10.0))
-                        .child(
-                            div()
-                                .font_family(UI_FONT)
-                                .text_size(px(12.0))
-                                .text_color(rgb(SUBTEXT0))
-                                .child(item.summary),
-                        )
-                        .child(
-                            div().flex().items_center().gap(px(8.0)).children(
-                                item.tags
-                                    .iter()
-                                    .map(|tag| snippet_tag_chip(tag, false).into_any_element()),
+                    )
+                    .child(
+                        div()
+                            .h(px(42.0))
+                            .px(px(18.0))
+                            .border_t_1()
+                            .border_color(rgba(0xffffff10))
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .font_family(UI_FONT)
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(SUBTEXT1))
+                                    .child("タイプで絞り込み / Tab でタブ切替 / Enter でコピー"),
+                            )
+                            .child(
+                                div()
+                                    .font_family(UI_FONT)
+                                    .text_size(px(11.0))
+                                    .text_color(rgb(MUTED))
+                                    .child("Delete で削除 / Ctrl+P でピン"),
                             ),
-                        ),
-                )
-                .child(
-                    div()
-                        .id("snippet-detail-scroll")
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .overflow_scroll()
-                        .scrollbar_width(px(6.0))
-                        .child(
-                            div()
-                                .w_full()
-                                .px(px(18.0))
-                                .py(px(16.0))
-                                .rounded(px(12.0))
-                                .border_1()
-                                .border_color(rgba(0xffffff10))
-                                .bg(rgba(0xffffff06))
-                                .p(px(16.0))
-                                .flex()
-                                .flex_col()
-                                .gap(px(6.0))
-                                .children(content_lines),
-                        ),
-                )
-                .child(
-                    div()
-                        .h(px(42.0))
-                        .px(px(18.0))
-                        .border_t_1()
-                        .border_color(rgba(0xffffff10))
-                        .flex()
-                        .items_center()
-                        .justify_between()
-                        .child(
-                            div()
-                                .font_family(UI_FONT)
-                                .text_size(px(11.0))
-                                .text_color(rgb(SUBTEXT1))
-                                .child("Enter でコピー / ↑↓ で選択移動 / Esc で閉じる"),
-                        )
-                        .child(
-                            div()
-                                .font_family(UI_FONT)
-                                .text_size(px(11.0))
-                                .text_color(rgb(MUTED))
-                                .child("CopyQ 風 UI"),
-                        ),
-                )
-                .into_any_element()
-        } else {
-            div()
-                .flex_1()
-                .flex()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .font_family(UI_FONT)
-                        .text_size(px(13.0))
-                        .text_color(rgb(SUBTEXT1))
-                        .child("表示できる定型文がありません"),
-                )
-                .into_any_element()
-        };
+                    )
+                    .into_any_element()
+            } else {
+                div()
+                    .flex_1()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(
+                        div()
+                            .font_family(UI_FONT)
+                            .text_size(px(13.0))
+                            .text_color(rgb(SUBTEXT1))
+                            .child("CopyQ ライク項目がありません"),
+                    )
+                    .into_any_element()
+            };
 
         Some(
             div()
@@ -2544,7 +2578,7 @@ impl RootView {
                                         .text_size(px(13.0))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(rgb(TEXT))
-                                        .child("定型文ライブラリ"),
+                                        .child("CopyQ ライク履歴"),
                                 )
                                 .child(
                                     div()
@@ -2552,35 +2586,39 @@ impl RootView {
                                         .text_size(px(11.0))
                                         .text_color(rgb(SUBTEXT1))
                                         .child(format!(
-                                            "{} 件 / お気に入り {} 件",
-                                            SNIPPET_PANEL_ITEMS.len(),
-                                            favorite_count
+                                            "{} 件 / ピン留め {} 件 / 現在 {}",
+                                            total_count, pinned_count, active_tab_title
                                         )),
                                 ),
                         )
                         .child(
                             panel_icon_button(
-                                "snippet-panel-favorites",
+                                "snippet-panel-pinned-filter",
                                 "ui/star.svg",
-                                self.snippet_favorites_only,
+                                pinned_only,
                             )
                             .on_mouse_down(
                                 MouseButton::Left,
                                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                    this.toggle_snippet_favorites_only(cx);
+                                    this.toggle_snippet_pinned_only(cx);
                                 }),
                             ),
                         )
                         .child(
-                            panel_icon_button("snippet-panel-new", "ui/plus.svg", false)
+                            panel_icon_button("snippet-panel-copy", "ui/copy.svg", false)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                        this.show_snippet_stub_notice(
-                                            "新規作成 UI は次段で接続します",
-                                            "Figma の追加ダイアログ導線を繋ぐ前にパネル全体を先に導入しています。",
-                                            cx,
-                                        );
+                                        this.copy_selected_snippet(cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            panel_icon_button("snippet-panel-delete", "ui/trash.svg", false)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.delete_selected_snippet(cx);
                                     }),
                                 ),
                         ),
@@ -2626,8 +2664,104 @@ impl RootView {
                                                     div()
                                                         .font_family(UI_FONT)
                                                         .text_size(px(12.0))
-                                                        .text_color(rgb(SUBTEXT1))
-                                                        .child("検索 (次段で接続)"),
+                                                        .text_color(if search_query.is_empty() {
+                                                            rgb(SUBTEXT1)
+                                                        } else {
+                                                            rgb(TEXT)
+                                                        })
+                                                        .child(if search_query.is_empty() {
+                                                            "Search CopyQ items".to_string()
+                                                        } else {
+                                                            search_query.clone()
+                                                        }),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .gap(px(8.0))
+                                                .children(
+                                                    self.snippet_palette
+                                                        .tabs()
+                                                        .iter()
+                                                        .map(|tab| {
+                                                            let tab_id = tab.id.clone();
+                                                            let active = self
+                                                                .snippet_palette
+                                                                .active_tab()
+                                                                .map(|active_tab| active_tab.id == tab.id)
+                                                                .unwrap_or(false);
+                                                            let shortcut_hint =
+                                                                tab.shortcut_hint.clone();
+
+                                                            div()
+                                                                .id(ElementId::Name(
+                                                                    format!("snippet-tab-{}", tab.id)
+                                                                        .into(),
+                                                                ))
+                                                                .rounded(px(999.0))
+                                                                .border_1()
+                                                                .border_color(if active {
+                                                                    rgba(0x0A84FF88)
+                                                                } else {
+                                                                    rgba(0xffffff10)
+                                                                })
+                                                                .bg(if active {
+                                                                    rgba(0x0A84FF22)
+                                                                } else {
+                                                                    rgba(0xffffff08)
+                                                                })
+                                                                .px(px(10.0))
+                                                                .py(px(6.0))
+                                                                .cursor_pointer()
+                                                                .hover(|style| {
+                                                                    style.bg(rgba(0xffffff14))
+                                                                })
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    cx.listener(
+                                                                        move |this,
+                                                                              _: &MouseDownEvent,
+                                                                              _window,
+                                                                              cx| {
+                                                                            this.select_snippet_tab(
+                                                                                &tab_id,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap(px(6.0))
+                                                                .child(
+                                                                    div()
+                                                                        .font_family(UI_FONT)
+                                                                        .text_size(px(11.0))
+                                                                        .font_weight(
+                                                                            FontWeight::MEDIUM,
+                                                                        )
+                                                                        .text_color(rgb(if active {
+                                                                            TEXT
+                                                                        } else {
+                                                                            SUBTEXT0
+                                                                        }))
+                                                                        .child(tab.title.clone()),
+                                                                )
+                                                                .child(if let Some(shortcut) =
+                                                                    shortcut_hint
+                                                                {
+                                                                    div()
+                                                                        .font_family(UI_FONT)
+                                                                        .text_size(px(10.0))
+                                                                        .text_color(rgb(MUTED))
+                                                                        .child(shortcut)
+                                                                        .into_any_element()
+                                                                } else {
+                                                                    div().into_any_element()
+                                                                })
+                                                                .into_any_element()
+                                                        }),
                                                 ),
                                         )
                                         .child(
@@ -2635,10 +2769,10 @@ impl RootView {
                                                 .font_family(UI_FONT)
                                                 .text_size(px(11.0))
                                                 .text_color(rgb(MUTED))
-                                                .child(if self.snippet_favorites_only {
-                                                    "お気に入りのみ表示中"
+                                                .child(if pinned_only {
+                                                    "ピン留めのみ表示中"
                                                 } else {
-                                                    "すべての定型文を表示中"
+                                                    "タイプ入力で即時フィルタ。Ctrl+F 相当は不要です。"
                                                 }),
                                         ),
                                 )
@@ -2680,7 +2814,11 @@ impl RootView {
                                                 .font_family(UI_FONT)
                                                 .text_size(px(11.0))
                                                 .text_color(rgb(MUTED))
-                                                .child("アンカード表示"),
+                                                .child(if search_query.is_empty() {
+                                                    "アンカード表示"
+                                                } else {
+                                                    "Ctrl+L で検索クリア"
+                                                }),
                                         ),
                                 ),
                         )
@@ -4527,7 +4665,8 @@ fn panel_icon_button(id: &'static str, icon_path: &'static str, active: bool) ->
     button
 }
 
-fn snippet_tag_chip(label: &'static str, selected: bool) -> Div {
+fn snippet_tag_chip(label: impl Into<String>, selected: bool) -> Div {
+    let label = label.into();
     div()
         .rounded(px(999.0))
         .bg(if selected {
