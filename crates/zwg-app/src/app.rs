@@ -40,6 +40,7 @@ use crate::snippet_palette::{SnippetPaletteModel, SnippetSection};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::terminal::TerminalSettings;
 use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
+use crate::text_input::ImeTextBuffer;
 use crate::{
     ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, OpenSettings, Quit, SplitDown, SplitRight,
 };
@@ -601,18 +602,48 @@ impl TemplateEditorField {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 struct TemplateEditorDraft {
-    name: String,
-    content: String,
-    note: String,
-    tags: String,
+    name: ImeTextBuffer,
+    content: ImeTextBuffer,
+    note: ImeTextBuffer,
+    tags: ImeTextBuffer,
     favorite: bool,
+}
+
+impl Default for TemplateEditorDraft {
+    fn default() -> Self {
+        Self {
+            name: ImeTextBuffer::default(),
+            content: ImeTextBuffer::default(),
+            note: ImeTextBuffer::default(),
+            tags: ImeTextBuffer::default(),
+            favorite: false,
+        }
+    }
 }
 
 impl TemplateEditorDraft {
     fn can_submit(&self) -> bool {
-        !self.name.trim().is_empty() && !self.content.trim().is_empty()
+        !self.name.text().trim().is_empty() && !self.content.text().trim().is_empty()
+    }
+
+    fn field(&self, field: TemplateEditorField) -> &ImeTextBuffer {
+        match field {
+            TemplateEditorField::Name => &self.name,
+            TemplateEditorField::Content => &self.content,
+            TemplateEditorField::Note => &self.note,
+            TemplateEditorField::Tags => &self.tags,
+        }
+    }
+
+    fn field_mut(&mut self, field: TemplateEditorField) -> &mut ImeTextBuffer {
+        match field {
+            TemplateEditorField::Name => &mut self.name,
+            TemplateEditorField::Content => &mut self.content,
+            TemplateEditorField::Note => &mut self.note,
+            TemplateEditorField::Tags => &mut self.tags,
+        }
     }
 }
 
@@ -735,18 +766,6 @@ fn current_text_for_ai_settings_ime_target(
     }
 }
 
-fn current_text_for_template_editor_field(
-    draft: &TemplateEditorDraft,
-    field: TemplateEditorField,
-) -> String {
-    match field {
-        TemplateEditorField::Name => draft.name.clone(),
-        TemplateEditorField::Content => draft.content.clone(),
-        TemplateEditorField::Note => draft.note.clone(),
-        TemplateEditorField::Tags => draft.tags.clone(),
-    }
-}
-
 fn replace_text_in_ai_settings_ime_target(
     config: &mut AppConfig,
     target: AiSettingsImeTarget,
@@ -756,24 +775,6 @@ fn replace_text_in_ai_settings_ime_target(
     let value = match target {
         AiSettingsImeTarget::ApiKey => &mut config.ai_api_key,
         AiSettingsImeTarget::Model => &mut config.ai_model,
-    };
-
-    let range = range.start.min(value.len())..range.end.min(value.len());
-    value.replace_range(range.clone(), text);
-    Some(range.start..range.start + text.len())
-}
-
-fn replace_text_in_template_editor_field(
-    draft: &mut TemplateEditorDraft,
-    field: TemplateEditorField,
-    range: Range<usize>,
-    text: &str,
-) -> Option<Range<usize>> {
-    let value = match field {
-        TemplateEditorField::Name => &mut draft.name,
-        TemplateEditorField::Content => &mut draft.content,
-        TemplateEditorField::Note => &mut draft.note,
-        TemplateEditorField::Tags => &mut draft.tags,
     };
 
     let range = range.start.min(value.len())..range.end.min(value.len());
@@ -988,15 +989,35 @@ impl RootView {
     fn sync_root_ime_target(&mut self) {
         let target = self.compute_root_ime_target();
         if self.root_ime_target != target {
+            if let Some(previous_target) = self.root_ime_target {
+                self.clear_root_ime_state_for(previous_target);
+            }
             self.root_ime_target = target;
-            self.root_ime_marked_range = None;
-            self.root_ime_selected_range = None;
         }
     }
 
     fn clear_root_ime_state(&mut self) {
-        self.root_ime_marked_range = None;
-        self.root_ime_selected_range = None;
+        let Some(target) = self.root_ime_target else {
+            self.root_ime_marked_range = None;
+            self.root_ime_selected_range = None;
+            return;
+        };
+
+        self.clear_root_ime_state_for(target);
+    }
+
+    fn clear_root_ime_state_for(&mut self, target: RootImeTarget) {
+        match target {
+            RootImeTarget::AiSettings(_) => {
+                self.root_ime_marked_range = None;
+                self.root_ime_selected_range = None;
+            }
+            RootImeTarget::TemplateEditor(field) => {
+                self.template_editor_draft
+                    .field_mut(field)
+                    .clear_marked_range();
+            }
+        }
     }
 
     fn current_root_ime_text(&self, target: RootImeTarget, cx: &Context<Self>) -> Option<String> {
@@ -1004,10 +1025,9 @@ impl RootView {
             RootImeTarget::AiSettings(target) => {
                 current_text_for_ai_settings_ime_target(&self.state.read(cx).config, target)
             }
-            RootImeTarget::TemplateEditor(field) => Some(current_text_for_template_editor_field(
-                &self.template_editor_draft,
-                field,
-            )),
+            RootImeTarget::TemplateEditor(field) => {
+                Some(self.template_editor_draft.field(field).text().to_string())
+            }
         }
     }
 
@@ -1016,14 +1036,49 @@ impl RootView {
         target: RootImeTarget,
         cx: &Context<Self>,
     ) -> Option<Range<usize>> {
-        if let Some(range) = self.root_ime_selected_range.clone() {
-            return Some(range);
+        match target {
+            RootImeTarget::AiSettings(_) => self.root_ime_selected_range.clone().or_else(|| {
+                self.current_root_ime_text(target, cx).map(|text| {
+                    let len = text.len();
+                    len..len
+                })
+            }),
+            RootImeTarget::TemplateEditor(field) => {
+                Some(self.template_editor_draft.field(field).selection())
+            }
         }
+    }
 
-        self.current_root_ime_text(target, cx).map(|text| {
-            let len = text.len();
-            len..len
-        })
+    fn current_root_ime_marked_range(&self, target: RootImeTarget) -> Option<Range<usize>> {
+        match target {
+            RootImeTarget::AiSettings(_) => self.root_ime_marked_range.clone(),
+            RootImeTarget::TemplateEditor(field) => {
+                self.template_editor_draft.field(field).marked_range()
+            }
+        }
+    }
+
+    fn set_root_ime_state(
+        &mut self,
+        target: RootImeTarget,
+        marked_range: Option<Range<usize>>,
+        selection_range: Option<Range<usize>>,
+    ) {
+        match target {
+            RootImeTarget::AiSettings(_) => {
+                self.root_ime_marked_range = marked_range;
+                if let Some(selection_range) = selection_range {
+                    self.root_ime_selected_range = Some(selection_range);
+                }
+            }
+            RootImeTarget::TemplateEditor(field) => {
+                let buffer = self.template_editor_draft.field_mut(field);
+                buffer.set_marked_range(marked_range);
+                if let Some(selection_range) = selection_range {
+                    buffer.set_selection(selection_range);
+                }
+            }
+        }
     }
 
     fn replace_text_in_active_root_ime_target(
@@ -1044,15 +1099,10 @@ impl RootView {
                 });
                 Some(inserted)
             }
-            RootImeTarget::TemplateEditor(field) => {
-                let inserted = replace_text_in_template_editor_field(
-                    &mut self.template_editor_draft,
-                    field,
-                    range,
-                    text,
-                )?;
-                Some(inserted)
-            }
+            RootImeTarget::TemplateEditor(field) => self
+                .template_editor_draft
+                .field_mut(field)
+                .replace_range(range, text),
         }
     }
 
@@ -1728,20 +1778,6 @@ impl RootView {
         self.insert_template_editor_at_cursor(field, text, cx);
     }
 
-    /// Get cursor byte offset for the current template editor field.
-    fn template_editor_cursor(&self, field: TemplateEditorField) -> usize {
-        let text_len = match field {
-            TemplateEditorField::Name => self.template_editor_draft.name.len(),
-            TemplateEditorField::Content => self.template_editor_draft.content.len(),
-            TemplateEditorField::Note => self.template_editor_draft.note.len(),
-            TemplateEditorField::Tags => self.template_editor_draft.tags.len(),
-        };
-        self.root_ime_selected_range
-            .as_ref()
-            .map(|r| r.start.min(text_len))
-            .unwrap_or(text_len)
-    }
-
     /// Insert text at cursor position, update cursor after insertion.
     fn insert_template_editor_at_cursor(
         &mut self,
@@ -1752,14 +1788,12 @@ impl RootView {
         if text.is_empty() {
             return;
         }
-        let cursor = self.template_editor_cursor(field);
-        if let Some(inserted) = replace_text_in_template_editor_field(
-            &mut self.template_editor_draft,
-            field,
-            cursor..cursor,
-            text,
-        ) {
-            self.root_ime_selected_range = Some(inserted.end..inserted.end);
+        if self
+            .template_editor_draft
+            .field_mut(field)
+            .replace_selection(text)
+            .is_some()
+        {
             cx.notify();
         }
     }
@@ -1770,36 +1804,12 @@ impl RootView {
         field: TemplateEditorField,
         cx: &mut Context<Self>,
     ) {
-        let prev = {
-            let text = match field {
-                TemplateEditorField::Name => &self.template_editor_draft.name,
-                TemplateEditorField::Content => &self.template_editor_draft.content,
-                TemplateEditorField::Note => &self.template_editor_draft.note,
-                TemplateEditorField::Tags => &self.template_editor_draft.tags,
-            };
-            let cursor = self
-                .root_ime_selected_range
-                .as_ref()
-                .map(|r| r.start.min(text.len()))
-                .unwrap_or(text.len());
-            if cursor == 0 {
-                return;
-            }
-            text[..cursor]
-                .char_indices()
-                .last()
-                .map(|(i, _)| (i, cursor))
-        };
-        if let Some((prev, cursor)) = prev {
-            if let Some(inserted) = replace_text_in_template_editor_field(
-                &mut self.template_editor_draft,
-                field,
-                prev..cursor,
-                "",
-            ) {
-                self.root_ime_selected_range = Some(inserted.start..inserted.start);
-                cx.notify();
-            }
+        if self
+            .template_editor_draft
+            .field_mut(field)
+            .backspace_grapheme()
+        {
+            cx.notify();
         }
     }
 
@@ -1809,35 +1819,11 @@ impl RootView {
         field: TemplateEditorField,
         cx: &mut Context<Self>,
     ) {
-        let range = {
-            let text = match field {
-                TemplateEditorField::Name => &self.template_editor_draft.name,
-                TemplateEditorField::Content => &self.template_editor_draft.content,
-                TemplateEditorField::Note => &self.template_editor_draft.note,
-                TemplateEditorField::Tags => &self.template_editor_draft.tags,
-            };
-            let cursor = self
-                .root_ime_selected_range
-                .as_ref()
-                .map(|r| r.start.min(text.len()))
-                .unwrap_or(text.len());
-            if cursor >= text.len() {
-                return;
-            }
-            let next = text[cursor..]
-                .char_indices()
-                .nth(1)
-                .map(|(i, _)| cursor + i)
-                .unwrap_or(text.len());
-            cursor..next
-        };
-        if let Some(_) = replace_text_in_template_editor_field(
-            &mut self.template_editor_draft,
-            field,
-            range.clone(),
-            "",
-        ) {
-            self.root_ime_selected_range = Some(range.start..range.start);
+        if self
+            .template_editor_draft
+            .field_mut(field)
+            .delete_forward_grapheme()
+        {
             cx.notify();
         }
     }
@@ -1847,34 +1833,13 @@ impl RootView {
         let field = self
             .template_editor_active_field
             .unwrap_or(TemplateEditorField::Name);
-        let new_cursor = {
-            let text = match field {
-                TemplateEditorField::Name => &self.template_editor_draft.name,
-                TemplateEditorField::Content => &self.template_editor_draft.content,
-                TemplateEditorField::Note => &self.template_editor_draft.note,
-                TemplateEditorField::Tags => &self.template_editor_draft.tags,
-            };
-            let cursor = self
-                .root_ime_selected_range
-                .as_ref()
-                .map(|r| r.start.min(text.len()))
-                .unwrap_or(text.len());
-            if direction < 0 {
-                text[..cursor]
-                    .char_indices()
-                    .last()
-                    .map(|(i, _)| i)
-                    .unwrap_or(0)
-            } else {
-                text[cursor..]
-                    .char_indices()
-                    .nth(1)
-                    .map(|(i, _)| cursor + i)
-                    .unwrap_or(text.len())
-            }
-        };
-        self.root_ime_selected_range = Some(new_cursor..new_cursor);
-        cx.notify();
+        if self
+            .template_editor_draft
+            .field_mut(field)
+            .move_cursor_grapheme(direction)
+        {
+            cx.notify();
+        }
     }
 
     fn toggle_template_editor_favorite(&mut self, cx: &mut Context<Self>) {
@@ -1993,6 +1958,7 @@ impl RootView {
         let tags = self
             .template_editor_draft
             .tags
+            .text()
             .split([',', '、'])
             .map(str::trim)
             .filter(|tag| !tag.is_empty())
@@ -2000,9 +1966,9 @@ impl RootView {
             .collect::<Vec<_>>();
 
         let created = self.snippet_palette.create_template_item(
-            self.template_editor_draft.name.clone(),
-            self.template_editor_draft.content.clone(),
-            Some(self.template_editor_draft.note.clone()),
+            self.template_editor_draft.name.text().to_string(),
+            self.template_editor_draft.content.text().to_string(),
+            Some(self.template_editor_draft.note.text().to_string()),
             tags,
             self.template_editor_draft.favorite,
         );
@@ -2278,10 +2244,11 @@ impl RootView {
             return false;
         }
 
-        if should_defer_control_key_to_input_method(
-            &event.keystroke,
-            self.root_ime_marked_range.is_some(),
-        ) {
+        let ime_composing = self
+            .compute_root_ime_target()
+            .and_then(|target| self.current_root_ime_marked_range(target))
+            .is_some();
+        if should_defer_control_key_to_input_method(&event.keystroke, ime_composing) {
             return true;
         }
 
@@ -2346,10 +2313,11 @@ impl RootView {
             return false;
         }
 
-        if should_defer_control_key_to_input_method(
-            &event.keystroke,
-            self.root_ime_marked_range.is_some(),
-        ) {
+        let ime_composing = self
+            .template_editor_draft
+            .field(active_field)
+            .is_composing();
+        if should_defer_control_key_to_input_method(&event.keystroke, ime_composing) {
             return true;
         }
 
@@ -2413,19 +2381,23 @@ impl RootView {
                 return true;
             }
             "home" => {
-                self.root_ime_selected_range = Some(0..0);
-                cx.notify();
+                if self
+                    .template_editor_draft
+                    .field_mut(active_field)
+                    .set_cursor_to_start()
+                {
+                    cx.notify();
+                }
                 return true;
             }
             "end" => {
-                let len = match active_field {
-                    TemplateEditorField::Name => self.template_editor_draft.name.len(),
-                    TemplateEditorField::Content => self.template_editor_draft.content.len(),
-                    TemplateEditorField::Note => self.template_editor_draft.note.len(),
-                    TemplateEditorField::Tags => self.template_editor_draft.tags.len(),
-                };
-                self.root_ime_selected_range = Some(len..len);
-                cx.notify();
+                if self
+                    .template_editor_draft
+                    .field_mut(active_field)
+                    .set_cursor_to_end()
+                {
+                    cx.notify();
+                }
                 return true;
             }
             "v" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
@@ -3651,16 +3623,10 @@ impl RootView {
                                     div()
                                         .relative()
                                         .child(template_editor_input_box(
-                                            self.template_editor_draft.name.clone(),
+                                            self.template_editor_draft
+                                                .field(TemplateEditorField::Name),
                                             "例: メールの署名",
                                             active_field == TemplateEditorField::Name,
-                                            if active_field == TemplateEditorField::Name {
-                                                Some(self.template_editor_cursor(
-                                                    TemplateEditorField::Name,
-                                                ))
-                                            } else {
-                                                None
-                                            },
                                             cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                                 this.focus_template_editor_field(
                                                     TemplateEditorField::Name,
@@ -3687,7 +3653,8 @@ impl RootView {
                                     div()
                                         .relative()
                                         .child(template_editor_text_area(
-                                            self.template_editor_draft.content.clone(),
+                                            self.template_editor_draft
+                                                .field(TemplateEditorField::Content),
                                             "定型文の内容を入力...",
                                             active_field == TemplateEditorField::Content,
                                             180.0,
@@ -3717,16 +3684,10 @@ impl RootView {
                                     div()
                                         .relative()
                                         .child(template_editor_input_box(
-                                            self.template_editor_draft.note.clone(),
+                                            self.template_editor_draft
+                                                .field(TemplateEditorField::Note),
                                             "この定型文の用途",
                                             active_field == TemplateEditorField::Note,
-                                            if active_field == TemplateEditorField::Note {
-                                                Some(self.template_editor_cursor(
-                                                    TemplateEditorField::Note,
-                                                ))
-                                            } else {
-                                                None
-                                            },
                                             cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                                 this.focus_template_editor_field(
                                                     TemplateEditorField::Note,
@@ -3753,16 +3714,10 @@ impl RootView {
                                     div()
                                         .relative()
                                         .child(template_editor_input_box(
-                                            self.template_editor_draft.tags.clone(),
+                                            self.template_editor_draft
+                                                .field(TemplateEditorField::Tags),
                                             "タグをカンマ区切りで入力: 仕事,メール",
                                             active_field == TemplateEditorField::Tags,
-                                            if active_field == TemplateEditorField::Tags {
-                                                Some(self.template_editor_cursor(
-                                                    TemplateEditorField::Tags,
-                                                ))
-                                            } else {
-                                                None
-                                            },
                                             cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                                 this.focus_template_editor_field(
                                                     TemplateEditorField::Tags,
@@ -5495,7 +5450,7 @@ impl EntityInputHandler for RootView {
     ) -> Option<Range<usize>> {
         let target = self.compute_root_ime_target()?;
         let text = self.current_root_ime_text(target, cx)?;
-        self.root_ime_marked_range
+        self.current_root_ime_marked_range(target)
             .as_ref()
             .map(|range| byte_range_to_utf16_range(&text, range))
     }
@@ -5521,14 +5476,13 @@ impl EntityInputHandler for RootView {
         let range = range_utf16
             .as_ref()
             .map(|range| utf16_range_to_byte_range(&current_text, range))
-            .or_else(|| self.root_ime_marked_range.clone())
+            .or_else(|| self.current_root_ime_marked_range(target))
             .or_else(|| self.current_root_ime_selection_range(target, cx))
             .unwrap_or_else(|| current_text.len()..current_text.len());
         INPUT_METHOD_VK_PROCESSKEY.store(false, Ordering::Release);
         if let Some(inserted) = self.replace_text_in_active_root_ime_target(target, range, text, cx)
         {
-            self.root_ime_marked_range = None;
-            self.root_ime_selected_range = Some(inserted.end..inserted.end);
+            self.set_root_ime_state(target, None, Some(inserted.end..inserted.end));
             cx.notify();
         }
     }
@@ -5555,23 +5509,24 @@ impl EntityInputHandler for RootView {
         let range = range_utf16
             .as_ref()
             .map(|value| utf16_range_to_byte_range(&current_text, value))
-            .or_else(|| self.root_ime_marked_range.clone())
+            .or_else(|| self.current_root_ime_marked_range(target))
             .or_else(|| self.current_root_ime_selection_range(target, cx))
             .unwrap_or_else(|| current_text.len()..current_text.len());
         INPUT_METHOD_VK_PROCESSKEY.store(false, Ordering::Release);
         if let Some(inserted) =
             self.replace_text_in_active_root_ime_target(target, range.clone(), new_text, cx)
         {
-            self.root_ime_marked_range = if new_text.is_empty() {
+            let marked_range = if new_text.is_empty() {
                 None
             } else {
                 Some(inserted.clone())
             };
-            self.root_ime_selected_range = new_selected_range_utf16
+            let selection_range = new_selected_range_utf16
                 .as_ref()
                 .map(|value| utf16_range_to_byte_range(new_text, value))
                 .map(|value| inserted.start + value.start..inserted.start + value.end)
                 .or_else(|| Some(inserted.end..inserted.end));
+            self.set_root_ime_state(target, marked_range, selection_range);
             cx.notify();
         }
     }
@@ -6367,13 +6322,19 @@ fn template_editor_section_label(label: &'static str) -> Div {
 }
 
 fn template_editor_input_box(
-    value: String,
+    buffer: &ImeTextBuffer,
     placeholder: &'static str,
     active: bool,
-    cursor_byte: Option<usize>,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let is_empty = value.is_empty();
+    let value = buffer.text();
+    let is_empty = buffer.is_empty();
+    let selection = buffer.selection();
+    let cursor_byte = if active && selection.start == selection.end {
+        Some(buffer.cursor())
+    } else {
+        None
+    };
     let mut container = div()
         .w_full()
         .h(px(52.0))
@@ -6451,7 +6412,7 @@ fn template_editor_input_box(
                 .font_family(UI_FONT)
                 .text_size(px(13.0))
                 .text_color(rgb(TEXT))
-                .child(value),
+                .child(value.to_string()),
         );
     }
 
@@ -6459,13 +6420,14 @@ fn template_editor_input_box(
 }
 
 fn template_editor_text_area(
-    value: String,
+    buffer: &ImeTextBuffer,
     placeholder: &'static str,
     active: bool,
     height: f32,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let lines = if value.is_empty() {
+    let value = buffer.text();
+    let lines = if buffer.is_empty() {
         vec![
             div()
                 .font_family(UI_FONT)
@@ -6492,6 +6454,12 @@ fn template_editor_text_area(
             .collect::<Vec<_>>()
     };
 
+    let lines = if active && buffer.selection().start == buffer.selection().end {
+        append_caret_to_last_line(lines)
+    } else {
+        lines
+    };
+
     div()
         .w_full()
         .h(px(height))
@@ -6511,6 +6479,31 @@ fn template_editor_text_area(
         .flex_col()
         .gap(px(6.0))
         .children(lines)
+}
+
+fn append_caret_to_last_line(mut lines: Vec<AnyElement>) -> Vec<AnyElement> {
+    let caret = div()
+        .w(px(1.5))
+        .h(px(18.0))
+        .bg(rgb(ACCENT))
+        .flex_shrink_0()
+        .into_any_element();
+
+    if let Some(last_line) = lines.pop() {
+        lines.push(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(0.0))
+                .child(last_line)
+                .child(caret)
+                .into_any_element(),
+        );
+    } else {
+        lines.push(caret);
+    }
+
+    lines
 }
 
 fn template_editor_favorite_button(
@@ -6732,10 +6725,9 @@ mod tests {
         active_ai_settings_ime_target, active_root_ime_target, adjust_font_size_value,
         byte_index_to_utf16_offset, byte_range_to_utf16_range, collect_global_hotkeys,
         configured_global_shortcut_action, current_text_for_ai_settings_ime_target,
-        current_text_for_template_editor_field, cycle_string_option,
-        direct_text_from_input_keystroke, hotkey_binding_string, hotkey_matches,
-        hotkey_string_for_keystroke, next_filtered_index, process_completion_notice_detail,
-        replace_text_in_ai_settings_ime_target, replace_text_in_template_editor_field,
+        cycle_string_option, direct_text_from_input_keystroke, hotkey_binding_string,
+        hotkey_matches, hotkey_string_for_keystroke, next_filtered_index,
+        process_completion_notice_detail, replace_text_in_ai_settings_ime_target,
         should_defer_control_key_to_input_method, should_defer_keystroke_to_input_method,
         should_route_keystroke_via_text_input, snippet_panel_frame,
         snippet_primary_action_for_section, terminal_settings_from_config, titlebar_actions_width,
@@ -6744,6 +6736,7 @@ mod tests {
     };
     use crate::config::AppConfig;
     use crate::snippet_palette::SnippetSection;
+    use crate::text_input::ImeTextBuffer;
     use gpui::{KeyDownEvent, Keystroke, Modifiers};
     use std::sync::{
         Arc,
@@ -6886,20 +6879,17 @@ mod tests {
     #[test]
     fn template_editor_ime_replace_updates_multibyte_text() {
         let mut draft = TemplateEditorDraft {
-            content: "署名です".to_string(),
+            content: ImeTextBuffer::new("署名です"),
             ..TemplateEditorDraft::default()
         };
 
-        let inserted = replace_text_in_template_editor_field(
-            &mut draft,
-            TemplateEditorField::Content,
-            "署名".len().."署名です".len(),
-            "になります",
-        );
+        let inserted = draft
+            .field_mut(TemplateEditorField::Content)
+            .replace_range("署名".len().."署名です".len(), "になります");
 
         assert_eq!(inserted, Some("署名".len().."署名になります".len()));
         assert_eq!(
-            current_text_for_template_editor_field(&draft, TemplateEditorField::Content),
+            draft.field(TemplateEditorField::Content).text(),
             "署名になります"
         );
     }

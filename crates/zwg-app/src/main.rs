@@ -22,6 +22,7 @@ mod shell;
 mod snippet_palette;
 mod split;
 mod terminal;
+mod text_input;
 mod wasm_runtime;
 
 use gpui::*;
