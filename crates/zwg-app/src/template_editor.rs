@@ -2,13 +2,12 @@ use std::ops::Range;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{
-    byte_range_to_utf16_range, direct_text_from_input_keystroke,
-    should_defer_control_key_to_input_method, should_defer_keystroke_to_input_method,
-    should_route_keystroke_via_text_input, toggle_ime_via_imm, utf16_range_to_byte_range,
+    byte_range_to_utf16_range, consume_input_method_vk_processkey, toggle_ime_via_imm,
+    utf16_range_to_byte_range,
 };
-use crate::text_input::ImeTextBuffer;
 
 const TEXT: u32 = 0xF5F5F7;
 const SUBTEXT1: u32 = 0x8E8E93;
@@ -40,20 +39,20 @@ impl TemplateEditorField {
 
 #[derive(Clone, Debug)]
 struct TemplateEditorDraft {
-    name: ImeTextBuffer,
-    content: ImeTextBuffer,
-    note: ImeTextBuffer,
-    tags: ImeTextBuffer,
+    name: String,
+    content: String,
+    note: String,
+    tags: String,
     favorite: bool,
 }
 
 impl Default for TemplateEditorDraft {
     fn default() -> Self {
         Self {
-            name: ImeTextBuffer::default(),
-            content: ImeTextBuffer::default(),
-            note: ImeTextBuffer::default(),
-            tags: ImeTextBuffer::default(),
+            name: String::new(),
+            content: String::new(),
+            note: String::new(),
+            tags: String::new(),
             favorite: false,
         }
     }
@@ -61,19 +60,19 @@ impl Default for TemplateEditorDraft {
 
 impl TemplateEditorDraft {
     fn can_submit(&self) -> bool {
-        !self.name.text().trim().is_empty() && !self.content.text().trim().is_empty()
+        !self.name.trim().is_empty() && !self.content.trim().is_empty()
     }
 
-    fn field(&self, field: TemplateEditorField) -> &ImeTextBuffer {
+    fn field(&self, field: TemplateEditorField) -> &str {
         match field {
-            TemplateEditorField::Name => &self.name,
-            TemplateEditorField::Content => &self.content,
-            TemplateEditorField::Note => &self.note,
-            TemplateEditorField::Tags => &self.tags,
+            TemplateEditorField::Name => self.name.as_str(),
+            TemplateEditorField::Content => self.content.as_str(),
+            TemplateEditorField::Note => self.note.as_str(),
+            TemplateEditorField::Tags => self.tags.as_str(),
         }
     }
 
-    fn field_mut(&mut self, field: TemplateEditorField) -> &mut ImeTextBuffer {
+    fn field_mut(&mut self, field: TemplateEditorField) -> &mut String {
         match field {
             TemplateEditorField::Name => &mut self.name,
             TemplateEditorField::Content => &mut self.content,
@@ -89,18 +88,17 @@ impl TemplateEditorDraft {
 
         let tags = self
             .tags
-            .text()
             .split([',', '、'])
             .map(str::trim)
             .filter(|tag| !tag.is_empty())
             .map(|tag| tag.to_string())
             .collect::<Vec<_>>();
 
-        let note = self.note.text().trim();
+        let note = self.note.trim();
 
         Some(TemplateEditorSubmission {
-            name: self.name.text().trim().to_string(),
-            content: self.content.text().trim_end().to_string(),
+            name: self.name.trim().to_string(),
+            content: self.content.trim_end().to_string(),
             note: (!note.is_empty()).then(|| note.to_string()),
             tags,
             favorite: self.favorite,
@@ -127,6 +125,8 @@ pub(crate) struct TemplateEditorModal {
     focus_handle: FocusHandle,
     draft: TemplateEditorDraft,
     active_field: TemplateEditorField,
+    preedit_text: String,
+    marked_range: Option<Range<usize>>,
     pending_outcome: Option<TemplateEditorOutcome>,
 }
 
@@ -136,6 +136,8 @@ impl TemplateEditorModal {
             focus_handle: cx.focus_handle(),
             draft: TemplateEditorDraft::default(),
             active_field: TemplateEditorField::Name,
+            preedit_text: String::new(),
+            marked_range: None,
             pending_outcome: None,
         }
     }
@@ -148,7 +150,33 @@ impl TemplateEditorModal {
         self.pending_outcome.take()
     }
 
+    fn is_composing(&self) -> bool {
+        self.marked_range.is_some() || !self.preedit_text.is_empty()
+    }
+
+    fn clear_preedit(&mut self) {
+        self.preedit_text.clear();
+        self.marked_range = None;
+    }
+
+    fn active_text(&self) -> &str {
+        self.draft.field(self.active_field)
+    }
+
+    fn active_text_mut(&mut self) -> &mut String {
+        self.draft.field_mut(self.active_field)
+    }
+
+    fn display_text_for(&self, field: TemplateEditorField) -> String {
+        let mut text = self.draft.field(field).to_string();
+        if self.active_field == field && !self.preedit_text.is_empty() {
+            text.push_str(&self.preedit_text);
+        }
+        text
+    }
+
     fn request_cancel(&mut self, cx: &mut Context<Self>) {
+        self.clear_preedit();
         self.pending_outcome = Some(TemplateEditorOutcome::Cancelled);
         cx.notify();
     }
@@ -166,12 +194,16 @@ impl TemplateEditorModal {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.active_field != field {
+            self.clear_preedit();
+        }
         self.active_field = field;
         self.focus(window);
         cx.notify();
     }
 
     fn cycle_field(&mut self, step: isize, cx: &mut Context<Self>) {
+        self.clear_preedit();
         self.active_field = self.active_field.next(step);
         cx.notify();
     }
@@ -180,38 +212,19 @@ impl TemplateEditorModal {
         if text.is_empty() {
             return;
         }
-        if self
-            .draft
-            .field_mut(self.active_field)
-            .replace_selection(text)
-            .is_some()
-        {
-            cx.notify();
-        }
-    }
-
-    fn move_cursor(&mut self, direction: isize, cx: &mut Context<Self>) {
-        if self
-            .draft
-            .field_mut(self.active_field)
-            .move_cursor_grapheme(direction)
-        {
-            cx.notify();
-        }
+        self.clear_preedit();
+        self.active_text_mut().push_str(text);
+        cx.notify();
     }
 
     fn backspace(&mut self, cx: &mut Context<Self>) {
-        if self.draft.field_mut(self.active_field).backspace_grapheme() {
+        if pop_last_grapheme(self.active_text_mut()) {
             cx.notify();
         }
     }
 
     fn delete_forward(&mut self, cx: &mut Context<Self>) {
-        if self
-            .draft
-            .field_mut(self.active_field)
-            .delete_forward_grapheme()
-        {
+        if pop_last_grapheme(self.active_text_mut()) {
             cx.notify();
         }
     }
@@ -227,12 +240,8 @@ impl TemplateEditorModal {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if should_route_keystroke_via_text_input(&event.keystroke) {
-            return false;
-        }
-
-        let ime_composing = self.draft.field(self.active_field).is_composing();
-        if should_defer_control_key_to_input_method(&event.keystroke, ime_composing) {
+        if consume_input_method_vk_processkey() {
+            cx.notify();
             return true;
         }
 
@@ -245,17 +254,19 @@ impl TemplateEditorModal {
             return true;
         }
 
-        if should_defer_keystroke_to_input_method(&event.keystroke) {
-            cx.notify();
-            return true;
-        }
+        let composing = self.is_composing();
 
         match event.keystroke.key.as_ref() {
             "escape" => {
-                self.request_cancel(cx);
+                if composing {
+                    self.clear_preedit();
+                    cx.notify();
+                } else {
+                    self.request_cancel(cx);
+                }
                 return true;
             }
-            "tab" => {
+            "tab" if !composing => {
                 self.cycle_field(
                     if event.keystroke.modifiers.shift {
                         -1
@@ -266,11 +277,15 @@ impl TemplateEditorModal {
                 );
                 return true;
             }
-            "enter" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+            "enter"
+                if !composing
+                    && event.keystroke.modifiers.control
+                    && !event.keystroke.modifiers.alt =>
+            {
                 self.request_submit(cx);
                 return true;
             }
-            "enter" => {
+            "enter" if !composing => {
                 if self.active_field == TemplateEditorField::Content {
                     self.insert_text("\n", cx);
                 } else {
@@ -278,39 +293,21 @@ impl TemplateEditorModal {
                 }
                 return true;
             }
-            "backspace" => {
+            "backspace" if !composing => {
                 self.backspace(cx);
                 return true;
             }
-            "delete" => {
+            "delete" if !composing => {
                 self.delete_forward(cx);
                 return true;
             }
-            "left" if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
-                self.move_cursor(-1, cx);
+            "left" | "right" | "home" | "end" if !composing => {
                 return true;
             }
-            "right" if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
-                self.move_cursor(1, cx);
-                return true;
-            }
-            "home" => {
-                if self
-                    .draft
-                    .field_mut(self.active_field)
-                    .set_cursor_to_start()
-                {
-                    cx.notify();
-                }
-                return true;
-            }
-            "end" => {
-                if self.draft.field_mut(self.active_field).set_cursor_to_end() {
-                    cx.notify();
-                }
-                return true;
-            }
-            "v" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+            "v" if !composing
+                && event.keystroke.modifiers.control
+                && !event.keystroke.modifiers.alt =>
+            {
                 let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
                     return true;
                 };
@@ -318,7 +315,8 @@ impl TemplateEditorModal {
                 return true;
             }
             "insert"
-                if event.keystroke.modifiers.shift
+                if !composing
+                    && event.keystroke.modifiers.shift
                     && !event.keystroke.modifiers.control
                     && !event.keystroke.modifiers.alt =>
             {
@@ -331,9 +329,20 @@ impl TemplateEditorModal {
             _ => {}
         }
 
-        if let Some(text) = direct_text_from_input_keystroke(&event.keystroke) {
-            self.insert_text(&text, cx);
-            return true;
+        if !composing
+            && !event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt
+            && !event.keystroke.modifiers.platform
+        {
+            let key: &str = event.keystroke.key.as_ref();
+            let mut chars = key.chars();
+            if let Some(ch) = chars.next() {
+                if chars.next().is_none() && !ch.is_ascii() {
+                    self.active_text_mut().push(ch);
+                    cx.notify();
+                    return true;
+                }
+            }
         }
 
         false
@@ -360,7 +369,7 @@ impl EntityInputHandler for TemplateEditorModal {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<String> {
-        let text = self.draft.field(self.active_field).text().to_string();
+        let text = self.active_text().to_string();
         let range = utf16_range_to_byte_range(&text, &range_utf16);
         adjusted_range.replace(byte_range_to_utf16_range(&text, &range));
         Some(text[range].to_string())
@@ -372,9 +381,10 @@ impl EntityInputHandler for TemplateEditorModal {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        let buffer = self.draft.field(self.active_field);
+        let text = self.active_text();
+        let len = text.encode_utf16().count();
         Some(UTF16Selection {
-            range: byte_range_to_utf16_range(buffer.text(), &buffer.selection()),
+            range: len..len,
             reversed: false,
         })
     }
@@ -384,15 +394,12 @@ impl EntityInputHandler for TemplateEditorModal {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Range<usize>> {
-        let buffer = self.draft.field(self.active_field);
-        buffer
-            .marked_range()
-            .as_ref()
-            .map(|range| byte_range_to_utf16_range(buffer.text(), range))
+        self.marked_range.clone()
     }
 
     fn unmark_text(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.draft.field_mut(self.active_field).clear_marked_range() {
+        if self.is_composing() {
+            self.clear_preedit();
             cx.notify();
         }
     }
@@ -404,17 +411,22 @@ impl EntityInputHandler for TemplateEditorModal {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let buffer = self.draft.field_mut(self.active_field);
-        let current_text = buffer.text().to_string();
-        let range = range_utf16
-            .as_ref()
-            .map(|range| utf16_range_to_byte_range(&current_text, range))
-            .or_else(|| buffer.marked_range())
-            .or_else(|| Some(buffer.selection()))
-            .unwrap_or_else(|| current_text.len()..current_text.len());
-        if let Some(inserted) = buffer.replace_range(range, text) {
-            buffer.clear_marked_range();
-            buffer.set_selection(inserted.end..inserted.end);
+        let _ = range_utf16;
+        let had_composition = self.is_composing();
+        self.clear_preedit();
+
+        if text.is_empty() && had_composition {
+            cx.notify();
+            return;
+        }
+
+        if text.is_empty() {
+            self.backspace(cx);
+            return;
+        }
+
+        if !text.is_empty() {
+            self.active_text_mut().push_str(text);
             cx.notify();
         }
     }
@@ -427,29 +439,16 @@ impl EntityInputHandler for TemplateEditorModal {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let buffer = self.draft.field_mut(self.active_field);
-        let current_text = buffer.text().to_string();
-        let range = range_utf16
-            .as_ref()
-            .map(|value| utf16_range_to_byte_range(&current_text, value))
-            .or_else(|| buffer.marked_range())
-            .or_else(|| Some(buffer.selection()))
-            .unwrap_or_else(|| current_text.len()..current_text.len());
-        if let Some(inserted) = buffer.replace_range(range, new_text) {
-            let marked_range = if new_text.is_empty() {
-                None
-            } else {
-                Some(inserted.clone())
-            };
-            let selection_range = new_selected_range_utf16
-                .as_ref()
-                .map(|value| utf16_range_to_byte_range(new_text, value))
-                .map(|value| inserted.start + value.start..inserted.start + value.end)
-                .unwrap_or_else(|| inserted.end..inserted.end);
-            buffer.set_marked_range(marked_range);
-            buffer.set_selection(selection_range);
-            cx.notify();
-        }
+        let _ = range_utf16;
+        let _ = new_selected_range_utf16;
+        self.preedit_text = new_text.to_string();
+        let utf16_len = new_text.encode_utf16().count();
+        self.marked_range = if utf16_len == 0 {
+            None
+        } else {
+            Some(0..utf16_len)
+        };
+        cx.notify();
     }
 
     fn bounds_for_range(
@@ -459,13 +458,7 @@ impl EntityInputHandler for TemplateEditorModal {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<Bounds<Pixels>> {
-        Some(Bounds::new(
-            point(
-                element_bounds.left() + px(12.0),
-                element_bounds.top() + px(8.0),
-            ),
-            size(px(2.0), px(20.0)),
-        ))
+        Some(element_bounds)
     }
 
     fn character_index_for_point(
@@ -569,7 +562,7 @@ impl Render for TemplateEditorModal {
                             .gap(px(18.0))
                             .child(template_editor_section_label("名前 *"))
                             .child(template_editor_input_box(
-                                self.draft.field(TemplateEditorField::Name),
+                                self.display_text_for(TemplateEditorField::Name),
                                 "例: メールの署名",
                                 self.active_field == TemplateEditorField::Name,
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -578,7 +571,7 @@ impl Render for TemplateEditorModal {
                             ))
                             .child(template_editor_section_label("内容 *"))
                             .child(template_editor_text_area(
-                                self.draft.field(TemplateEditorField::Content),
+                                self.display_text_for(TemplateEditorField::Content),
                                 "定型文の内容を入力...",
                                 self.active_field == TemplateEditorField::Content,
                                 180.0,
@@ -588,7 +581,7 @@ impl Render for TemplateEditorModal {
                             ))
                             .child(template_editor_section_label("説明（オプション）"))
                             .child(template_editor_input_box(
-                                self.draft.field(TemplateEditorField::Note),
+                                self.display_text_for(TemplateEditorField::Note),
                                 "この定型文の用途",
                                 self.active_field == TemplateEditorField::Note,
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -597,7 +590,7 @@ impl Render for TemplateEditorModal {
                             ))
                             .child(template_editor_section_label("タグ（オプション）"))
                             .child(template_editor_input_box(
-                                self.draft.field(TemplateEditorField::Tags),
+                                self.display_text_for(TemplateEditorField::Tags),
                                 "タグをカンマ区切りで入力: 仕事,メール",
                                 self.active_field == TemplateEditorField::Tags,
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -672,19 +665,12 @@ fn template_editor_section_label(label: &'static str) -> Div {
 }
 
 fn template_editor_input_box(
-    buffer: &ImeTextBuffer,
+    value: String,
     placeholder: &'static str,
     active: bool,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let value = buffer.text();
-    let is_empty = buffer.is_empty();
-    let selection = buffer.selection();
-    let cursor_byte = if active && selection.start == selection.end {
-        Some(buffer.cursor())
-    } else {
-        None
-    };
+    let is_empty = value.is_empty();
     let mut container = div()
         .w_full()
         .h(px(52.0))
@@ -712,43 +698,19 @@ fn template_editor_input_box(
                 .text_color(rgb(SUBTEXT1))
                 .child(placeholder),
         );
-    } else if is_empty && active {
-        container = container
-            .child(div().w(px(1.5)).h(px(18.0)).bg(rgb(ACCENT)).flex_shrink_0())
-            .child(
-                div()
-                    .font_family(UI_FONT)
-                    .text_size(px(13.0))
-                    .text_color(rgb(SUBTEXT1))
-                    .child(placeholder),
-            );
-    } else if let Some(cursor) = cursor_byte.filter(|_| active) {
-        let cursor = cursor.min(value.len());
-        let cursor = if cursor == 0 || cursor >= value.len() {
-            cursor
-        } else {
-            value[..cursor]
-                .char_indices()
-                .last()
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(cursor)
-        };
-        let before = &value[..cursor];
-        let after = &value[cursor..];
-
+    } else if active {
         let mut row = div()
             .flex()
             .items_center()
             .font_family(UI_FONT)
             .text_size(px(13.0));
 
-        if !before.is_empty() {
-            row = row.child(div().text_color(rgb(TEXT)).child(before.to_string()));
+        if is_empty {
+            row = row.child(div().text_color(rgb(SUBTEXT1)).child(placeholder));
+        } else {
+            row = row.child(div().text_color(rgb(TEXT)).child(value));
         }
         row = row.child(div().w(px(1.5)).h(px(18.0)).bg(rgb(ACCENT)).flex_shrink_0());
-        if !after.is_empty() {
-            row = row.child(div().text_color(rgb(TEXT)).child(after.to_string()));
-        }
         container = container.child(row);
     } else {
         container = container.child(
@@ -756,7 +718,7 @@ fn template_editor_input_box(
                 .font_family(UI_FONT)
                 .text_size(px(13.0))
                 .text_color(rgb(TEXT))
-                .child(value.to_string()),
+                .child(value),
         );
     }
 
@@ -764,14 +726,13 @@ fn template_editor_input_box(
 }
 
 fn template_editor_text_area(
-    buffer: &ImeTextBuffer,
+    value: String,
     placeholder: &'static str,
     active: bool,
     height: f32,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let value = buffer.text();
-    let lines = if buffer.is_empty() {
+    let lines = if value.is_empty() {
         vec![
             div()
                 .font_family(UI_FONT)
@@ -798,7 +759,7 @@ fn template_editor_text_area(
             .collect::<Vec<_>>()
     };
 
-    let lines = if active && buffer.selection().start == buffer.selection().end {
+    let lines = if active {
         append_caret_to_last_line(lines)
     } else {
         lines
@@ -847,6 +808,15 @@ fn append_caret_to_last_line(mut lines: Vec<AnyElement>) -> Vec<AnyElement> {
     }
 
     vec![div().child(caret).into_any_element()]
+}
+
+fn pop_last_grapheme(text: &mut String) -> bool {
+    let Some((index, _)) = UnicodeSegmentation::grapheme_indices(text.as_str(), true).next_back()
+    else {
+        return false;
+    };
+    text.truncate(index);
+    true
 }
 
 fn template_editor_favorite_button(
@@ -948,16 +918,16 @@ fn template_editor_footer_button(
 
 #[cfg(test)]
 mod tests {
+    use super::pop_last_grapheme;
     use super::{TemplateEditorDraft, TemplateEditorSubmission};
-    use crate::text_input::ImeTextBuffer;
 
     #[test]
     fn template_editor_draft_builds_submission_with_trimmed_note_and_tags() {
         let draft = TemplateEditorDraft {
-            name: ImeTextBuffer::new(" 署名 "),
-            content: ImeTextBuffer::new("本文です\n"),
-            note: ImeTextBuffer::new(" メール用 "),
-            tags: ImeTextBuffer::new("仕事, メール、重要"),
+            name: " 署名 ".into(),
+            content: "本文です\n".into(),
+            note: " メール用 ".into(),
+            tags: "仕事, メール、重要".into(),
             favorite: true,
         };
 
@@ -971,5 +941,15 @@ mod tests {
                 favorite: true,
             })
         );
+    }
+
+    #[test]
+    fn pop_last_grapheme_removes_single_emoji_cluster() {
+        let mut text = "A👍🏽B".to_string();
+
+        assert!(pop_last_grapheme(&mut text));
+        assert_eq!(text, "A👍🏽");
+        assert!(pop_last_grapheme(&mut text));
+        assert_eq!(text, "A");
     }
 }

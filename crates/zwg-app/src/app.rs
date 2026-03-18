@@ -110,6 +110,18 @@ pub(crate) fn toggle_ime_via_imm() {
 pub(crate) fn toggle_ime_via_imm() {}
 
 #[cfg(target_os = "windows")]
+pub(crate) fn consume_input_method_vk_processkey() -> bool {
+    INPUT_METHOD_VK_PROCESSKEY
+        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+        .is_ok()
+}
+
+#[cfg(not(target_os = "windows"))]
+pub(crate) fn consume_input_method_vk_processkey() -> bool {
+    false
+}
+
+#[cfg(target_os = "windows")]
 unsafe extern "system" fn input_method_getmessage_hook_proc(
     code: i32,
     wparam: windows::Win32::Foundation::WPARAM,
@@ -2148,17 +2160,13 @@ impl RootView {
             &format!("root_ime_target={:?}", root_ime_target),
         );
 
-        if self.handle_ai_settings_key(event, window, cx)
-            || self.handle_keyboard_settings_key(event, window, cx)
-        {
-            cx.stop_propagation();
+        if self.template_editor.is_some() {
             return;
         }
 
-        if self.template_editor.is_some() {
-            if should_route_keystroke_via_text_input(&event.keystroke) {
-                return;
-            }
+        if self.handle_ai_settings_key(event, window, cx)
+            || self.handle_keyboard_settings_key(event, window, cx)
+        {
             cx.stop_propagation();
             return;
         }
@@ -5838,15 +5846,15 @@ mod tests {
         RootImeTarget, ZoomAction, active_ai_settings_ime_target, active_root_ime_target,
         adjust_font_size_value, byte_index_to_utf16_offset, byte_range_to_utf16_range,
         collect_global_hotkeys, configured_global_shortcut_action,
-        current_text_for_ai_settings_ime_target, cycle_string_option,
-        direct_text_from_input_keystroke, hotkey_binding_string, hotkey_matches,
-        hotkey_string_for_keystroke, next_filtered_index, process_completion_notice_detail,
-        replace_text_in_ai_settings_ime_target, should_defer_control_key_to_input_method,
-        should_defer_keystroke_to_input_method, should_route_keystroke_via_text_input,
-        snippet_panel_frame, snippet_primary_action_for_section, terminal_settings_from_config,
-        titlebar_actions_width, titlebar_side_cluster_width, traffic_lights_width,
-        utf16_offset_to_byte_index, utf16_range_to_byte_range, wrap_sidebar_preview,
-        zoom_action_for_window,
+        consume_input_method_vk_processkey, current_text_for_ai_settings_ime_target,
+        cycle_string_option, direct_text_from_input_keystroke, hotkey_binding_string,
+        hotkey_matches, hotkey_string_for_keystroke, next_filtered_index,
+        process_completion_notice_detail, replace_text_in_ai_settings_ime_target,
+        should_defer_control_key_to_input_method, should_defer_keystroke_to_input_method,
+        should_route_keystroke_via_text_input, snippet_panel_frame,
+        snippet_primary_action_for_section, terminal_settings_from_config, titlebar_actions_width,
+        titlebar_side_cluster_width, traffic_lights_width, utf16_offset_to_byte_index,
+        utf16_range_to_byte_range, wrap_sidebar_preview, zoom_action_for_window,
     };
     use crate::config::AppConfig;
     use crate::snippet_palette::SnippetSection;
@@ -6071,6 +6079,14 @@ mod tests {
         };
 
         assert!(should_route_keystroke_via_text_input(&keystroke));
+    }
+
+    #[test]
+    fn consume_input_method_vk_processkey_clears_pending_flag() {
+        INPUT_METHOD_VK_PROCESSKEY.store(true, Ordering::Release);
+
+        assert!(consume_input_method_vk_processkey());
+        assert!(!consume_input_method_vk_processkey());
     }
 
     #[test]
