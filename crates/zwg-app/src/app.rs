@@ -1451,12 +1451,6 @@ impl RootView {
         }
     }
 
-    fn select_snippet_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
-        if self.snippet_palette.select_tab(tab_id) {
-            cx.notify();
-        }
-    }
-
     fn select_snippet_section(&mut self, section: SnippetSection, cx: &mut Context<Self>) {
         if self.snippet_palette.select_section(section) {
             cx.notify();
@@ -1465,12 +1459,6 @@ impl RootView {
 
     fn cycle_snippet_sections(&mut self, step: isize, cx: &mut Context<Self>) {
         if self.snippet_palette.cycle_sections(step) {
-            cx.notify();
-        }
-    }
-
-    fn cycle_snippet_tabs(&mut self, step: isize, cx: &mut Context<Self>) {
-        if self.snippet_palette.cycle_tabs(step) {
             cx.notify();
         }
     }
@@ -1566,14 +1554,6 @@ impl RootView {
         match event.keystroke.key.as_ref() {
             "escape" => {
                 self.close_snippet_palette(window, cx);
-                true
-            }
-            "up" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
-                self.cycle_snippet_tabs(-1, cx);
-                true
-            }
-            "down" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
-                self.cycle_snippet_tabs(1, cx);
                 true
             }
             "up" => {
@@ -2168,7 +2148,6 @@ impl RootView {
         let pinned_only = self.snippet_palette.pinned_only();
         let total_count = self.snippet_palette.total_count();
         let pinned_count = self.snippet_palette.pinned_count();
-        let active_tab_title = self.snippet_palette.active_tab_title().to_string();
         let active_section = self.snippet_palette.active_section();
         let active_section_label = active_section.title().to_string();
 
@@ -2197,7 +2176,7 @@ impl RootView {
                             .text_size(px(11.0))
                             .text_color(rgb(SUBTEXT1))
                             .child(if search_query.is_empty() {
-                                "フィルタを解除するか、別タブへ切り替えてください。"
+                                "フィルタを解除するか、履歴と定型文を切り替えてください。"
                             } else {
                                 "検索語を短くするか、Ctrl+L で検索をクリアしてください。"
                             }),
@@ -2211,17 +2190,11 @@ impl RootView {
                     let item_id = item.id.clone();
                     let is_selected = selected_id.as_deref() == Some(item.id.as_str());
                     let relative_created_label = item.relative_created_label();
-                    let tab_title = self
-                        .snippet_palette
-                        .tab_title_for(&item.tab_id)
-                        .unwrap_or("Clipboard")
-                        .to_string();
                     let meta_row = if active_section == SnippetSection::History {
                         div()
                             .flex()
                             .items_center()
                             .gap(px(8.0))
-                            .child(snippet_tag_chip(tab_title.clone(), is_selected))
                             .children(relative_created_label.clone().into_iter().map(|label| {
                                 div()
                                     .font_family(UI_FONT)
@@ -2238,31 +2211,9 @@ impl RootView {
                                     .text_color(rgb(MUTED))
                                     .child(format!("{} から取得", item.source)),
                             )
-                            .children(item.tags.iter().take(1).map(|tag| {
-                                snippet_tag_chip(tag.clone(), is_selected).into_any_element()
-                            }))
+                            .into_any_element()
                     } else {
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .font_family(UI_FONT)
-                                    .text_size(px(10.0))
-                                    .text_color(rgb(MUTED))
-                                    .child(tab_title.clone()),
-                            )
-                            .child(
-                                div()
-                                    .font_family(UI_FONT)
-                                    .text_size(px(10.0))
-                                    .text_color(rgb(MUTED))
-                                    .child(item.source.clone()),
-                            )
-                            .children(item.tags.iter().take(2).map(|tag| {
-                                snippet_tag_chip(tag.clone(), is_selected).into_any_element()
-                            }))
+                        div().into_any_element()
                     };
 
                     let mut row = div()
@@ -2369,28 +2320,17 @@ impl RootView {
         };
 
         let detail = if let Some(item) = self.snippet_palette.selected_snippet().cloned() {
-            let tab_title = self
-                .snippet_palette
-                .tab_title_for(&item.tab_id)
-                .unwrap_or("Clipboard")
-                .to_string();
             let detail_meta = if active_section == SnippetSection::History {
                 if let Some(relative_label) = item.relative_created_label() {
                     format!(
-                        "{}  /  {}  /  {} から取得  /  {}",
-                        tab_title, relative_label, item.source, item.created_label
+                        "{}  /  {} から取得  /  {}",
+                        relative_label, item.source, item.created_label
                     )
                 } else {
-                    format!(
-                        "{}  /  {}  /  {}",
-                        tab_title, item.created_label, item.source
-                    )
+                    format!("{}  /  {}", item.source, item.created_label)
                 }
             } else {
-                format!(
-                    "{}  /  {}  /  {}",
-                    tab_title, item.created_label, item.source
-                )
+                item.created_label.clone()
             };
             let content_lines = item
                 .content
@@ -2571,7 +2511,7 @@ impl RootView {
                                     .font_family(UI_FONT)
                                     .text_size(px(11.0))
                                     .text_color(rgb(MUTED))
-                                    .child("Ctrl+↑↓ でサブタブ切替 / Delete で削除 / Ctrl+P でピン"),
+                                    .child("Delete で削除 / Ctrl+P でピン"),
                             ),
                     )
                     .into_any_element()
@@ -2660,8 +2600,8 @@ impl RootView {
                                         .text_size(px(11.0))
                                         .text_color(rgb(SUBTEXT1))
                                         .child(format!(
-                                            "{} {} 件 / ピン留め {} 件 / 現在 {}",
-                                            active_section_label, total_count, pinned_count, active_tab_title
+                                            "{} {} 件 / ピン留め {} 件",
+                                            active_section_label, total_count, pinned_count
                                         )),
                                 ),
                         )
@@ -2821,94 +2761,6 @@ impl RootView {
                                                                 .into_any_element()
                                                         }),
                                                 )
-                                        )
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .gap(px(8.0))
-                                                .children(
-                                                    self.snippet_palette
-                                                        .section_tabs()
-                                                        .iter()
-                                                        .map(|tab| {
-                                                            let tab_id = tab.id.clone();
-                                                            let active = self
-                                                                .snippet_palette
-                                                                .active_tab()
-                                                                .map(|active_tab| active_tab.id == tab.id)
-                                                                .unwrap_or(false);
-                                                            let shortcut_hint =
-                                                                tab.shortcut_hint.clone();
-
-                                                            div()
-                                                                .id(ElementId::Name(
-                                                                    format!("snippet-tab-{}", tab.id)
-                                                                        .into(),
-                                                                ))
-                                                                .rounded(px(999.0))
-                                                                .border_1()
-                                                                .border_color(if active {
-                                                                    rgba(0x0A84FF88)
-                                                                } else {
-                                                                    rgba(0xffffff10)
-                                                                })
-                                                                .bg(if active {
-                                                                    rgba(0x0A84FF22)
-                                                                } else {
-                                                                    rgba(0xffffff08)
-                                                                })
-                                                                .px(px(10.0))
-                                                                .py(px(6.0))
-                                                                .cursor_pointer()
-                                                                .hover(|style| {
-                                                                    style.bg(rgba(0xffffff14))
-                                                                })
-                                                                .on_mouse_down(
-                                                                    MouseButton::Left,
-                                                                    cx.listener(
-                                                                        move |this,
-                                                                              _: &MouseDownEvent,
-                                                                              _window,
-                                                                              cx| {
-                                                                            this.select_snippet_tab(
-                                                                                &tab_id,
-                                                                                cx,
-                                                                            );
-                                                                        },
-                                                                    ),
-                                                                )
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap(px(6.0))
-                                                                .child(
-                                                                    div()
-                                                                        .font_family(UI_FONT)
-                                                                        .text_size(px(11.0))
-                                                                        .font_weight(
-                                                                            FontWeight::MEDIUM,
-                                                                        )
-                                                                        .text_color(rgb(if active {
-                                                                            TEXT
-                                                                        } else {
-                                                                            SUBTEXT0
-                                                                        }))
-                                                                        .child(tab.title.clone()),
-                                                                )
-                                                                .child(if let Some(shortcut) =
-                                                                    shortcut_hint
-                                                                {
-                                                                    div()
-                                                                        .font_family(UI_FONT)
-                                                                        .text_size(px(10.0))
-                                                                        .text_color(rgb(MUTED))
-                                                                        .child(shortcut)
-                                                                        .into_any_element()
-                                                                } else {
-                                                                    div().into_any_element()
-                                                                })
-                                                                .into_any_element()
-                                                        }),
-                                                ),
                                         )
                                         .child(
                                             div()
