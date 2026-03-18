@@ -1608,7 +1608,8 @@ impl RootView {
         let suppressed = self.show_shell_menu
             || self.show_settings
             || self.show_close_confirm
-            || self.show_snippet_palette;
+            || self.show_snippet_palette
+            || self.show_template_editor;
         self.state
             .read(cx)
             .terminal_input_suppressed
@@ -2298,7 +2299,15 @@ impl RootView {
             return true;
         }
 
-        if should_defer_keystroke_to_input_method(&event.keystroke) {
+        let deferred = should_defer_keystroke_to_input_method(&event.keystroke);
+        log::info!(
+            "[IME_DEBUG] template_editor_key: key={:?} key_char={:?} deferred={} active_field={:?}",
+            event.keystroke.key,
+            event.keystroke.key_char,
+            deferred,
+            active_field,
+        );
+        if deferred {
             cx.notify();
             return true;
         }
@@ -5437,8 +5446,10 @@ impl EntityInputHandler for RootView {
         cx: &mut Context<Self>,
     ) {
         let Some(target) = self.compute_root_ime_target() else {
+            log::info!("[IME_DEBUG] replace_text_in_range: no root_ime_target, returning");
             return;
         };
+        log::info!("[IME_DEBUG] replace_text_in_range target={:?} text={:?}", target, text);
         log_input_method_text("replace_text_in_range start", Some(target), text);
         let Some(current_text) = self.current_root_ime_text(target, cx) else {
             return;
@@ -5467,8 +5478,10 @@ impl EntityInputHandler for RootView {
         cx: &mut Context<Self>,
     ) {
         let Some(target) = self.compute_root_ime_target() else {
+            log::info!("[IME_DEBUG] replace_and_mark_text_in_range: no root_ime_target, returning");
             return;
         };
+        log::info!("[IME_DEBUG] replace_and_mark_text_in_range target={:?} text={:?}", target, new_text);
         log_input_method_text(
             "replace_and_mark_text_in_range start",
             Some(target),
