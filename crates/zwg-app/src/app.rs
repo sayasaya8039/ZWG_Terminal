@@ -317,6 +317,28 @@ fn should_route_keystroke_via_text_input(_keystroke: &Keystroke) -> bool {
     false
 }
 
+fn should_defer_control_key_to_input_method(keystroke: &Keystroke, ime_composing: bool) -> bool {
+    if !ime_composing || keystroke.modifiers.control || keystroke.modifiers.alt {
+        return false;
+    }
+
+    matches!(
+        keystroke.key.as_ref(),
+        "enter"
+            | "escape"
+            | "tab"
+            | "space"
+            | "left"
+            | "right"
+            | "up"
+            | "down"
+            | "home"
+            | "end"
+            | "backspace"
+            | "delete"
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ZoomAction {
     Maximize,
@@ -2256,6 +2278,13 @@ impl RootView {
             return false;
         }
 
+        if should_defer_control_key_to_input_method(
+            &event.keystroke,
+            self.root_ime_marked_range.is_some(),
+        ) {
+            return true;
+        }
+
         if should_defer_keystroke_to_input_method(&event.keystroke) {
             return true;
         }
@@ -2315,6 +2344,13 @@ impl RootView {
 
         if should_route_keystroke_via_text_input(&event.keystroke) {
             return false;
+        }
+
+        if should_defer_control_key_to_input_method(
+            &event.keystroke,
+            self.root_ime_marked_range.is_some(),
+        ) {
+            return true;
         }
 
         // Ctrl+Space: toggle IME (gpui doesn't call DefWindowProc, so 半角/全角 doesn't work)
@@ -6700,11 +6736,11 @@ mod tests {
         direct_text_from_input_keystroke, hotkey_binding_string, hotkey_matches,
         hotkey_string_for_keystroke, next_filtered_index, process_completion_notice_detail,
         replace_text_in_ai_settings_ime_target, replace_text_in_template_editor_field,
-        should_defer_keystroke_to_input_method, should_route_keystroke_via_text_input,
-        snippet_panel_frame, snippet_primary_action_for_section, terminal_settings_from_config,
-        titlebar_actions_width, titlebar_side_cluster_width, traffic_lights_width,
-        utf16_offset_to_byte_index, utf16_range_to_byte_range, wrap_sidebar_preview,
-        zoom_action_for_window,
+        should_defer_control_key_to_input_method, should_defer_keystroke_to_input_method,
+        should_route_keystroke_via_text_input, snippet_panel_frame,
+        snippet_primary_action_for_section, terminal_settings_from_config, titlebar_actions_width,
+        titlebar_side_cluster_width, traffic_lights_width, utf16_offset_to_byte_index,
+        utf16_range_to_byte_range, wrap_sidebar_preview, zoom_action_for_window,
     };
     use crate::config::AppConfig;
     use crate::snippet_palette::SnippetSection;
@@ -6955,6 +6991,18 @@ mod tests {
         };
 
         assert!(should_route_keystroke_via_text_input(&keystroke));
+    }
+
+    #[test]
+    fn ime_composition_defers_enter_to_input_method() {
+        let keystroke = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "enter".into(),
+            key_char: None,
+        };
+
+        assert!(should_defer_control_key_to_input_method(&keystroke, true));
+        assert!(!should_defer_control_key_to_input_method(&keystroke, false));
     }
 
     #[test]
