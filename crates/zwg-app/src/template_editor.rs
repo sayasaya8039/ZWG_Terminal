@@ -349,7 +349,15 @@ impl TemplateEditorModal {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        if self.handle_key_down(event, window, cx) {
+        log::info!(
+            "[TMED] on_key_down REACHED key={:?} key_char={:?} focused={}",
+            event.keystroke.key,
+            event.keystroke.key_char,
+            self.focus_handle.is_focused(window),
+        );
+        let handled = self.handle_key_down(event, window, cx);
+        log::info!("[TMED] handle_key_down returned {}", handled);
+        if handled {
             cx.stop_propagation();
         }
     }

@@ -2154,16 +2154,14 @@ impl RootView {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let root_ime_target = self.compute_root_ime_target();
-        log_input_method_keystroke(
-            "on_key_down",
-            &event.keystroke,
-            &format!("root_ime_target={:?}", root_ime_target),
+        log::info!(
+            "[ROOT] on_key_down key={:?} template_editor={} root_ime={:?}",
+            event.keystroke.key,
+            self.template_editor.is_some(),
+            root_ime_target,
         );
 
         if self.template_editor.is_some() {
-            // Template editor has its own on_key_down handler via track_focus.
-            // Don't stop propagation here — let unhandled keys fall through
-            // so EntityInputHandler (IME/text input) can process them.
             return;
         }
 
