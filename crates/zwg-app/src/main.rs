@@ -21,6 +21,7 @@ mod config;
 mod shell;
 mod snippet_palette;
 mod split;
+mod template_editor;
 mod terminal;
 mod text_input;
 mod wasm_runtime;

@@ -38,9 +38,9 @@ use crate::config::{
 use crate::shell::{self, ShellType};
 use crate::snippet_palette::{SnippetPaletteModel, SnippetSection};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
+use crate::template_editor::{TemplateEditorModal, TemplateEditorOutcome};
 use crate::terminal::TerminalSettings;
 use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
-use crate::text_input::ImeTextBuffer;
 use crate::{
     ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, OpenSettings, Quit, SplitDown, SplitRight,
 };
@@ -70,7 +70,7 @@ static INPUT_METHOD_VK_PROCESSKEY: AtomicBool = AtomicBool::new(false);
 /// gpui never calls DefWindowProc for WM_KEYDOWN, so the standard 半角/全角 toggle
 /// doesn't reach Windows IME. This provides Ctrl+Space toggle via the IMM API.
 #[cfg(target_os = "windows")]
-fn toggle_ime_via_imm() {
+pub(crate) fn toggle_ime_via_imm() {
     use windows::Win32::UI::Input::Ime::{
         IME_CMODE_FULLSHAPE, IME_CMODE_NATIVE, IME_CONVERSION_MODE, IME_SENTENCE_MODE,
         ImmGetContext, ImmGetConversionStatus, ImmGetOpenStatus, ImmReleaseContext,
@@ -107,7 +107,7 @@ fn toggle_ime_via_imm() {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn toggle_ime_via_imm() {}
+pub(crate) fn toggle_ime_via_imm() {}
 
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn input_method_getmessage_hook_proc(
@@ -246,7 +246,7 @@ fn log_input_method_text(context: &str, target: Option<RootImeTarget>, text: &st
     log::debug!("IME_TEXT [{}] target={:?} text={:?}", context, target, text);
 }
 
-fn should_defer_keystroke_to_input_method(keystroke: &Keystroke) -> bool {
+pub(crate) fn should_defer_keystroke_to_input_method(keystroke: &Keystroke) -> bool {
     let ime_processkey_pending = INPUT_METHOD_VK_PROCESSKEY.swap(false, Ordering::AcqRel);
     if !ime_processkey_pending {
         log_input_method_keystroke(
@@ -281,7 +281,7 @@ fn should_defer_keystroke_to_input_method(keystroke: &Keystroke) -> bool {
     defer
 }
 
-fn direct_text_from_input_keystroke(keystroke: &Keystroke) -> Option<String> {
+pub(crate) fn direct_text_from_input_keystroke(keystroke: &Keystroke) -> Option<String> {
     if keystroke.modifiers.control || keystroke.modifiers.alt {
         return None;
     }
@@ -302,7 +302,7 @@ fn direct_text_from_input_keystroke(keystroke: &Keystroke) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
-fn should_route_keystroke_via_text_input(keystroke: &Keystroke) -> bool {
+pub(crate) fn should_route_keystroke_via_text_input(keystroke: &Keystroke) -> bool {
     if keystroke.modifiers.control || keystroke.modifiers.alt {
         return false;
     }
@@ -314,11 +314,14 @@ fn should_route_keystroke_via_text_input(keystroke: &Keystroke) -> bool {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn should_route_keystroke_via_text_input(_keystroke: &Keystroke) -> bool {
+pub(crate) fn should_route_keystroke_via_text_input(_keystroke: &Keystroke) -> bool {
     false
 }
 
-fn should_defer_control_key_to_input_method(keystroke: &Keystroke, ime_composing: bool) -> bool {
+pub(crate) fn should_defer_control_key_to_input_method(
+    keystroke: &Keystroke,
+    ime_composing: bool,
+) -> bool {
     if !ime_composing || keystroke.modifiers.control || keystroke.modifiers.alt {
         return false;
     }
@@ -581,72 +584,6 @@ enum AiSettingsTextField {
     Model,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TemplateEditorField {
-    Name,
-    Content,
-    Note,
-    Tags,
-}
-
-impl TemplateEditorField {
-    fn all() -> [Self; 4] {
-        [Self::Name, Self::Content, Self::Note, Self::Tags]
-    }
-
-    fn next(self, step: isize) -> Self {
-        let fields = Self::all();
-        let current_index = fields.iter().position(|field| *field == self).unwrap_or(0);
-        let next_index = (current_index as isize + step).rem_euclid(fields.len() as isize) as usize;
-        fields[next_index]
-    }
-}
-
-#[derive(Clone, Debug)]
-struct TemplateEditorDraft {
-    name: ImeTextBuffer,
-    content: ImeTextBuffer,
-    note: ImeTextBuffer,
-    tags: ImeTextBuffer,
-    favorite: bool,
-}
-
-impl Default for TemplateEditorDraft {
-    fn default() -> Self {
-        Self {
-            name: ImeTextBuffer::default(),
-            content: ImeTextBuffer::default(),
-            note: ImeTextBuffer::default(),
-            tags: ImeTextBuffer::default(),
-            favorite: false,
-        }
-    }
-}
-
-impl TemplateEditorDraft {
-    fn can_submit(&self) -> bool {
-        !self.name.text().trim().is_empty() && !self.content.text().trim().is_empty()
-    }
-
-    fn field(&self, field: TemplateEditorField) -> &ImeTextBuffer {
-        match field {
-            TemplateEditorField::Name => &self.name,
-            TemplateEditorField::Content => &self.content,
-            TemplateEditorField::Note => &self.note,
-            TemplateEditorField::Tags => &self.tags,
-        }
-    }
-
-    fn field_mut(&mut self, field: TemplateEditorField) -> &mut ImeTextBuffer {
-        match field {
-            TemplateEditorField::Name => &mut self.name,
-            TemplateEditorField::Content => &mut self.content,
-            TemplateEditorField::Note => &mut self.note,
-            TemplateEditorField::Tags => &mut self.tags,
-        }
-    }
-}
-
 #[derive(Clone)]
 struct AppNotice {
     title: String,
@@ -693,11 +630,11 @@ fn next_filtered_index(current: Option<usize>, visible: &[usize], step: isize) -
     visible.get(next_position as usize).copied()
 }
 
-fn byte_range_to_utf16_range(text: &str, range: &Range<usize>) -> Range<usize> {
+pub(crate) fn byte_range_to_utf16_range(text: &str, range: &Range<usize>) -> Range<usize> {
     byte_index_to_utf16_offset(text, range.start)..byte_index_to_utf16_offset(text, range.end)
 }
 
-fn utf16_range_to_byte_range(text: &str, range: &Range<usize>) -> Range<usize> {
+pub(crate) fn utf16_range_to_byte_range(text: &str, range: &Range<usize>) -> Range<usize> {
     utf16_offset_to_byte_index(text, range.start)..utf16_offset_to_byte_index(text, range.end)
 }
 
@@ -736,17 +673,9 @@ fn active_ai_settings_ime_target(
 }
 
 fn active_root_ime_target(
-    show_template_editor: bool,
-    template_editor_active_field: Option<TemplateEditorField>,
     show_settings: bool,
     ai_settings_active_text: Option<AiSettingsTextField>,
 ) -> Option<RootImeTarget> {
-    if show_template_editor {
-        if let Some(field) = template_editor_active_field {
-            return Some(RootImeTarget::TemplateEditor(field));
-        }
-    }
-
     if show_settings {
         if let Some(target) = active_ai_settings_ime_target(ai_settings_active_text) {
             return Some(RootImeTarget::AiSettings(target));
@@ -791,7 +720,6 @@ enum AiSettingsImeTarget {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RootImeTarget {
     AiSettings(AiSettingsImeTarget),
-    TemplateEditor(TemplateEditorField),
 }
 
 /// Root view containing tab bar + split container + overlays.
@@ -803,11 +731,9 @@ pub struct RootView {
     show_shell_menu: bool,
     show_settings: bool,
     show_snippet_palette: bool,
-    show_template_editor: bool,
+    template_editor: Option<Entity<TemplateEditorModal>>,
     show_close_confirm: bool,
     snippet_palette: SnippetPaletteModel,
-    template_editor_draft: TemplateEditorDraft,
-    template_editor_active_field: Option<TemplateEditorField>,
     keyboard_settings_active_text: Option<KeyboardSettingsTextField>,
     ai_settings_active_text: Option<AiSettingsTextField>,
     app_notice: Option<AppNotice>,
@@ -920,11 +846,9 @@ impl RootView {
             show_shell_menu: false,
             show_settings: false,
             show_snippet_palette: false,
-            show_template_editor: false,
+            template_editor: None,
             show_close_confirm: false,
             snippet_palette: SnippetPaletteModel::new(),
-            template_editor_draft: TemplateEditorDraft::default(),
-            template_editor_active_field: None,
             keyboard_settings_active_text: None,
             ai_settings_active_text: None,
             app_notice: None,
@@ -978,12 +902,7 @@ impl RootView {
     }
 
     fn compute_root_ime_target(&self) -> Option<RootImeTarget> {
-        active_root_ime_target(
-            self.show_template_editor,
-            self.template_editor_active_field,
-            self.show_settings,
-            self.ai_settings_active_text,
-        )
+        active_root_ime_target(self.show_settings, self.ai_settings_active_text)
     }
 
     fn sync_root_ime_target(&mut self) {
@@ -1012,11 +931,6 @@ impl RootView {
                 self.root_ime_marked_range = None;
                 self.root_ime_selected_range = None;
             }
-            RootImeTarget::TemplateEditor(field) => {
-                self.template_editor_draft
-                    .field_mut(field)
-                    .clear_marked_range();
-            }
         }
     }
 
@@ -1024,9 +938,6 @@ impl RootView {
         match target {
             RootImeTarget::AiSettings(target) => {
                 current_text_for_ai_settings_ime_target(&self.state.read(cx).config, target)
-            }
-            RootImeTarget::TemplateEditor(field) => {
-                Some(self.template_editor_draft.field(field).text().to_string())
             }
         }
     }
@@ -1043,18 +954,12 @@ impl RootView {
                     len..len
                 })
             }),
-            RootImeTarget::TemplateEditor(field) => {
-                Some(self.template_editor_draft.field(field).selection())
-            }
         }
     }
 
     fn current_root_ime_marked_range(&self, target: RootImeTarget) -> Option<Range<usize>> {
         match target {
             RootImeTarget::AiSettings(_) => self.root_ime_marked_range.clone(),
-            RootImeTarget::TemplateEditor(field) => {
-                self.template_editor_draft.field(field).marked_range()
-            }
         }
     }
 
@@ -1069,13 +974,6 @@ impl RootView {
                 self.root_ime_marked_range = marked_range;
                 if let Some(selection_range) = selection_range {
                     self.root_ime_selected_range = Some(selection_range);
-                }
-            }
-            RootImeTarget::TemplateEditor(field) => {
-                let buffer = self.template_editor_draft.field_mut(field);
-                buffer.set_marked_range(marked_range);
-                if let Some(selection_range) = selection_range {
-                    buffer.set_selection(selection_range);
                 }
             }
         }
@@ -1099,18 +997,13 @@ impl RootView {
                 });
                 Some(inserted)
             }
-            RootImeTarget::TemplateEditor(field) => self
-                .template_editor_draft
-                .field_mut(field)
-                .replace_range(range, text),
         }
     }
 
     fn open_settings_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_shell_menu = false;
         self.show_snippet_palette = false;
-        self.show_template_editor = false;
-        self.template_editor_active_field = None;
+        self.template_editor = None;
         self.show_settings = true;
         self.keyboard_settings_active_text = None;
         self.ai_settings_active_text = None;
@@ -1320,8 +1213,7 @@ impl RootView {
         if should_confirm {
             self.show_shell_menu = false;
             self.show_snippet_palette = false;
-            self.show_template_editor = false;
-            self.template_editor_active_field = None;
+            self.template_editor = None;
             self.show_settings = false;
             self.show_close_confirm = true;
             cx.notify();
@@ -1698,7 +1590,7 @@ impl RootView {
             || self.show_settings
             || self.show_close_confirm
             || self.show_snippet_palette
-            || self.show_template_editor;
+            || self.template_editor.is_some();
         self.state
             .read(cx)
             .terminal_input_suppressed
@@ -1709,8 +1601,7 @@ impl RootView {
         let next_visible = !self.show_snippet_palette;
         self.show_snippet_palette = next_visible;
         if !next_visible {
-            self.show_template_editor = false;
-            self.template_editor_active_field = None;
+            self.template_editor = None;
         }
         self.show_shell_menu = false;
         self.show_settings = false;
@@ -1725,125 +1616,15 @@ impl RootView {
             return;
         }
         self.show_snippet_palette = false;
-        self.show_template_editor = false;
-        self.template_editor_active_field = None;
+        self.template_editor = None;
         cx.notify();
         self.focus_active_terminal(window, cx);
     }
 
     fn open_template_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_template_editor = true;
-        self.template_editor_draft = TemplateEditorDraft::default();
-        self.template_editor_active_field = Some(TemplateEditorField::Name);
-        window.focus(&self.focus_handle);
-        cx.notify();
-    }
-
-    fn close_template_editor(&mut self, cx: &mut Context<Self>) {
-        if !self.show_template_editor {
-            return;
-        }
-
-        self.show_template_editor = false;
-        self.template_editor_active_field = None;
-        self.template_editor_draft = TemplateEditorDraft::default();
-        cx.notify();
-    }
-
-    fn cycle_template_editor_field(&mut self, step: isize, cx: &mut Context<Self>) {
-        let current = self
-            .template_editor_active_field
-            .unwrap_or(TemplateEditorField::Name);
-        self.template_editor_active_field = Some(current.next(step));
-        cx.notify();
-    }
-
-    fn focus_template_editor_field(
-        &mut self,
-        field: TemplateEditorField,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.template_editor_active_field = Some(field);
-        window.focus(&self.focus_handle);
-        cx.notify();
-    }
-
-    fn append_template_editor_text(
-        &mut self,
-        field: TemplateEditorField,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) {
-        self.insert_template_editor_at_cursor(field, text, cx);
-    }
-
-    /// Insert text at cursor position, update cursor after insertion.
-    fn insert_template_editor_at_cursor(
-        &mut self,
-        field: TemplateEditorField,
-        text: &str,
-        cx: &mut Context<Self>,
-    ) {
-        if text.is_empty() {
-            return;
-        }
-        if self
-            .template_editor_draft
-            .field_mut(field)
-            .replace_selection(text)
-            .is_some()
-        {
-            cx.notify();
-        }
-    }
-
-    /// Delete one character before cursor (Backspace).
-    fn backspace_template_editor_at_cursor(
-        &mut self,
-        field: TemplateEditorField,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .template_editor_draft
-            .field_mut(field)
-            .backspace_grapheme()
-        {
-            cx.notify();
-        }
-    }
-
-    /// Delete one character after cursor (Delete key).
-    fn delete_template_editor_at_cursor(
-        &mut self,
-        field: TemplateEditorField,
-        cx: &mut Context<Self>,
-    ) {
-        if self
-            .template_editor_draft
-            .field_mut(field)
-            .delete_forward_grapheme()
-        {
-            cx.notify();
-        }
-    }
-
-    /// Move cursor left or right by one character.
-    fn move_template_editor_cursor(&mut self, direction: isize, cx: &mut Context<Self>) {
-        let field = self
-            .template_editor_active_field
-            .unwrap_or(TemplateEditorField::Name);
-        if self
-            .template_editor_draft
-            .field_mut(field)
-            .move_cursor_grapheme(direction)
-        {
-            cx.notify();
-        }
-    }
-
-    fn toggle_template_editor_favorite(&mut self, cx: &mut Context<Self>) {
-        self.template_editor_draft.favorite = !self.template_editor_draft.favorite;
+        let editor = cx.new(|cx| TemplateEditorModal::new(cx));
+        editor.read(cx).focus(window);
+        self.template_editor = Some(editor);
         cx.notify();
     }
 
@@ -1944,55 +1725,51 @@ impl RootView {
         self.open_template_editor(window, cx);
     }
 
-    fn submit_template_editor(&mut self, cx: &mut Context<Self>) {
-        if !self.template_editor_draft.can_submit() {
-            self.show_app_notice(
-                "定型文を追加できませんでした",
-                "名前と内容は必須です。".to_string(),
-                1800,
-                cx,
-            );
+    fn sync_template_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.template_editor.clone() else {
             return;
-        }
+        };
 
-        let tags = self
-            .template_editor_draft
-            .tags
-            .text()
-            .split([',', '、'])
-            .map(str::trim)
-            .filter(|tag| !tag.is_empty())
-            .map(|tag| tag.to_string())
-            .collect::<Vec<_>>();
-
-        let created = self.snippet_palette.create_template_item(
-            self.template_editor_draft.name.text().to_string(),
-            self.template_editor_draft.content.text().to_string(),
-            Some(self.template_editor_draft.note.text().to_string()),
-            tags,
-            self.template_editor_draft.favorite,
-        );
-
-        if created.is_none() {
-            self.show_app_notice(
-                "定型文を追加できませんでした",
-                "入力内容を確認してください。".to_string(),
-                1800,
-                cx,
-            );
+        let outcome = editor.update(cx, |editor, _cx| editor.take_outcome());
+        let Some(outcome) = outcome else {
             return;
-        }
+        };
 
-        self.show_template_editor = false;
-        self.template_editor_active_field = None;
-        self.template_editor_draft = TemplateEditorDraft::default();
-        self.show_app_notice(
-            "定型文を追加しました",
-            "新しい定型文を選択しています。".to_string(),
-            1800,
-            cx,
-        );
-        cx.notify();
+        match outcome {
+            TemplateEditorOutcome::Cancelled => {
+                self.template_editor = None;
+                window.focus(&self.focus_handle);
+                cx.notify();
+            }
+            TemplateEditorOutcome::Submitted(submission) => {
+                let created = self.snippet_palette.create_template_item(
+                    submission.name,
+                    submission.content,
+                    submission.note,
+                    submission.tags,
+                    submission.favorite,
+                );
+
+                if created.is_some() {
+                    self.template_editor = None;
+                    window.focus(&self.focus_handle);
+                    self.show_app_notice(
+                        "定型文を追加しました",
+                        "新しい定型文を選択しています。".to_string(),
+                        1800,
+                        cx,
+                    );
+                    cx.notify();
+                } else {
+                    self.show_app_notice(
+                        "定型文を追加できませんでした",
+                        "入力内容を確認してください。".to_string(),
+                        1800,
+                        cx,
+                    );
+                }
+            }
+        }
     }
 
     fn capture_current_clipboard_to_history(
@@ -2295,140 +2072,6 @@ impl RootView {
         false
     }
 
-    fn handle_template_editor_key(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        if !self.show_template_editor {
-            return false;
-        }
-
-        let active_field = self
-            .template_editor_active_field
-            .unwrap_or(TemplateEditorField::Name);
-
-        if should_route_keystroke_via_text_input(&event.keystroke) {
-            return false;
-        }
-
-        let ime_composing = self
-            .template_editor_draft
-            .field(active_field)
-            .is_composing();
-        if should_defer_control_key_to_input_method(&event.keystroke, ime_composing) {
-            return true;
-        }
-
-        // Ctrl+Space: toggle IME (gpui doesn't call DefWindowProc, so 半角/全角 doesn't work)
-        if event.keystroke.modifiers.control
-            && !event.keystroke.modifiers.alt
-            && event.keystroke.key == "space"
-        {
-            toggle_ime_via_imm();
-            cx.notify();
-            return true;
-        }
-
-        if should_defer_keystroke_to_input_method(&event.keystroke) {
-            cx.notify();
-            return true;
-        }
-
-        match event.keystroke.key.as_ref() {
-            "escape" => {
-                self.close_template_editor(cx);
-                return true;
-            }
-            "tab" => {
-                self.cycle_template_editor_field(
-                    if event.keystroke.modifiers.shift {
-                        -1
-                    } else {
-                        1
-                    },
-                    cx,
-                );
-                return true;
-            }
-            "enter" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
-                self.submit_template_editor(cx);
-                return true;
-            }
-            "enter" => {
-                if active_field == TemplateEditorField::Content {
-                    self.append_template_editor_text(active_field, "\n", cx);
-                } else {
-                    self.cycle_template_editor_field(1, cx);
-                }
-                return true;
-            }
-            "backspace" => {
-                self.backspace_template_editor_at_cursor(active_field, cx);
-                return true;
-            }
-            "delete" => {
-                self.delete_template_editor_at_cursor(active_field, cx);
-                return true;
-            }
-            "left" if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
-                self.move_template_editor_cursor(-1, cx);
-                return true;
-            }
-            "right" if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
-                self.move_template_editor_cursor(1, cx);
-                return true;
-            }
-            "home" => {
-                if self
-                    .template_editor_draft
-                    .field_mut(active_field)
-                    .set_cursor_to_start()
-                {
-                    cx.notify();
-                }
-                return true;
-            }
-            "end" => {
-                if self
-                    .template_editor_draft
-                    .field_mut(active_field)
-                    .set_cursor_to_end()
-                {
-                    cx.notify();
-                }
-                return true;
-            }
-            "v" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
-                let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-                    return true;
-                };
-                self.append_template_editor_text(active_field, &text, cx);
-                return true;
-            }
-            "insert"
-                if event.keystroke.modifiers.shift
-                    && !event.keystroke.modifiers.control
-                    && !event.keystroke.modifiers.alt =>
-            {
-                let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
-                    return true;
-                };
-                self.append_template_editor_text(active_field, &text, cx);
-                return true;
-            }
-            _ => {}
-        }
-
-        if let Some(text) = direct_text_from_input_keystroke(&event.keystroke) {
-            self.append_template_editor_text(active_field, &text, cx);
-            return true;
-        }
-
-        false
-    }
-
     fn handle_keyboard_settings_key(
         &mut self,
         event: &KeyDownEvent,
@@ -2505,10 +2148,17 @@ impl RootView {
             &format!("root_ime_target={:?}", root_ime_target),
         );
 
-        if self.handle_template_editor_key(event, window, cx)
-            || self.handle_ai_settings_key(event, window, cx)
+        if self.handle_ai_settings_key(event, window, cx)
             || self.handle_keyboard_settings_key(event, window, cx)
         {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.template_editor.is_some() {
+            if should_route_keystroke_via_text_input(&event.keystroke) {
+                return;
+            }
             cx.stop_propagation();
             return;
         }
@@ -3233,7 +2883,7 @@ impl RootView {
             div()
                 .id("snippet-panel")
                 .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                    if !this.show_template_editor {
+                    if this.template_editor.is_none() {
                         this.close_snippet_palette(window, cx);
                     }
                 }))
@@ -3523,258 +3173,13 @@ impl RootView {
 
     fn render_template_editor_modal(
         &mut self,
-        viewport_w: f32,
-        viewport_h: f32,
-        cx: &mut Context<Self>,
+        _viewport_w: f32,
+        _viewport_h: f32,
+        _cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !self.show_template_editor {
-            return None;
-        }
-
-        let modal_width = (viewport_w - 32.0).clamp(520.0, 654.0);
-        let modal_height = (viewport_h - 40.0).clamp(560.0, 760.0);
-        let modal_left = ((viewport_w - modal_width) * 0.5).max(16.0);
-        let modal_top = ((viewport_h - modal_height) * 0.5).max(20.0);
-        let active_field = self
-            .template_editor_active_field
-            .unwrap_or(TemplateEditorField::Name);
-        let can_submit = self.template_editor_draft.can_submit();
-        let ime_entity = cx.entity();
-
-        Some(
-            div()
-                .id("template-editor-backdrop")
-                .absolute()
-                .top_0()
-                .left_0()
-                .right_0()
-                .bottom_0()
-                .bg(rgba(0x00000066))
-                .child(
-                    div()
-                        .id("template-editor-modal")
-                        .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                            this.close_template_editor(cx);
-                        }))
-                        .absolute()
-                        .top(px(modal_top))
-                        .left(px(modal_left))
-                        .w(px(modal_width))
-                        .h(px(modal_height))
-                        .rounded(px(18.0))
-                        .overflow_hidden()
-                        .border_1()
-                        .border_color(rgba(0xffffff12))
-                        .bg(rgb(0x2B2B2D))
-                        .shadow_lg()
-                        .flex()
-                        .flex_col()
-                        .child(
-                            div()
-                                .h(px(60.0))
-                                .px(px(24.0))
-                                .flex()
-                                .items_center()
-                                .justify_between()
-                                .child(
-                                    div()
-                                        .font_family(UI_FONT)
-                                        .text_size(px(18.0))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(rgb(TEXT))
-                                        .child("新しい定型文を追加"),
-                                )
-                                .child(
-                                    div()
-                                        .w(px(28.0))
-                                        .h(px(28.0))
-                                        .rounded(px(8.0))
-                                        .cursor_pointer()
-                                        .hover(|style| style.bg(rgba(0xffffff10)))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .font_family(UI_FONT)
-                                        .text_size(px(16.0))
-                                        .text_color(rgb(SUBTEXT1))
-                                        .on_mouse_down(
-                                            MouseButton::Left,
-                                            cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                                this.close_template_editor(cx);
-                                            }),
-                                        )
-                                        .child("x"),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .id("template-editor-scroll")
-                                .flex_1()
-                                .min_h(px(0.0))
-                                .overflow_scroll()
-                                .scrollbar_width(px(6.0))
-                                .px(px(24.0))
-                                .pb(px(16.0))
-                                .flex()
-                                .flex_col()
-                                .gap(px(18.0))
-                                .child(template_editor_section_label("名前 *"))
-                                .child(
-                                    div()
-                                        .relative()
-                                        .child(template_editor_input_box(
-                                            self.template_editor_draft
-                                                .field(TemplateEditorField::Name),
-                                            "例: メールの署名",
-                                            active_field == TemplateEditorField::Name,
-                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                                this.focus_template_editor_field(
-                                                    TemplateEditorField::Name,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        ))
-                                        .when(
-                                            self.root_ime_target
-                                                == Some(RootImeTarget::TemplateEditor(
-                                                    TemplateEditorField::Name,
-                                                )),
-                                            |node| {
-                                                node.child(root_ime_input_overlay(
-                                                    ime_entity.clone(),
-                                                    self.focus_handle.clone(),
-                                                ))
-                                            },
-                                        ),
-                                )
-                                .child(template_editor_section_label("内容 *"))
-                                .child(
-                                    div()
-                                        .relative()
-                                        .child(template_editor_text_area(
-                                            self.template_editor_draft
-                                                .field(TemplateEditorField::Content),
-                                            "定型文の内容を入力...",
-                                            active_field == TemplateEditorField::Content,
-                                            180.0,
-                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                                this.focus_template_editor_field(
-                                                    TemplateEditorField::Content,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        ))
-                                        .when(
-                                            self.root_ime_target
-                                                == Some(RootImeTarget::TemplateEditor(
-                                                    TemplateEditorField::Content,
-                                                )),
-                                            |node| {
-                                                node.child(root_ime_input_overlay(
-                                                    ime_entity.clone(),
-                                                    self.focus_handle.clone(),
-                                                ))
-                                            },
-                                        ),
-                                )
-                                .child(template_editor_section_label("説明（オプション）"))
-                                .child(
-                                    div()
-                                        .relative()
-                                        .child(template_editor_input_box(
-                                            self.template_editor_draft
-                                                .field(TemplateEditorField::Note),
-                                            "この定型文の用途",
-                                            active_field == TemplateEditorField::Note,
-                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                                this.focus_template_editor_field(
-                                                    TemplateEditorField::Note,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        ))
-                                        .when(
-                                            self.root_ime_target
-                                                == Some(RootImeTarget::TemplateEditor(
-                                                    TemplateEditorField::Note,
-                                                )),
-                                            |node| {
-                                                node.child(root_ime_input_overlay(
-                                                    ime_entity.clone(),
-                                                    self.focus_handle.clone(),
-                                                ))
-                                            },
-                                        ),
-                                )
-                                .child(template_editor_section_label("タグ（オプション）"))
-                                .child(
-                                    div()
-                                        .relative()
-                                        .child(template_editor_input_box(
-                                            self.template_editor_draft
-                                                .field(TemplateEditorField::Tags),
-                                            "タグをカンマ区切りで入力: 仕事,メール",
-                                            active_field == TemplateEditorField::Tags,
-                                            cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                                this.focus_template_editor_field(
-                                                    TemplateEditorField::Tags,
-                                                    window,
-                                                    cx,
-                                                );
-                                            }),
-                                        ))
-                                        .when(
-                                            self.root_ime_target
-                                                == Some(RootImeTarget::TemplateEditor(
-                                                    TemplateEditorField::Tags,
-                                                )),
-                                            |node| {
-                                                node.child(root_ime_input_overlay(
-                                                    ime_entity.clone(),
-                                                    self.focus_handle.clone(),
-                                                ))
-                                            },
-                                        ),
-                                )
-                                .child(template_editor_favorite_button(
-                                    self.template_editor_draft.favorite,
-                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                        this.toggle_template_editor_favorite(cx);
-                                    }),
-                                )),
-                        )
-                        .child(
-                            div()
-                                .h(px(84.0))
-                                .px(px(24.0))
-                                .pb(px(18.0))
-                                .flex()
-                                .items_end()
-                                .justify_end()
-                                .gap(px(14.0))
-                                .child(template_editor_footer_button(
-                                    "キャンセル",
-                                    false,
-                                    true,
-                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                        this.close_template_editor(cx);
-                                    }),
-                                ))
-                                .child(template_editor_footer_button(
-                                    "追加",
-                                    true,
-                                    can_submit,
-                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                                        this.submit_template_editor(cx);
-                                    }),
-                                )),
-                        ),
-                )
-                .into_any_element(),
-        )
+        self.template_editor
+            .clone()
+            .map(|editor| editor.into_any_element())
     }
 
     fn render_settings_panel(
@@ -4802,6 +4207,7 @@ impl RootView {
 impl Render for RootView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.maybe_clear_app_notice();
+        self.sync_template_editor(window, cx);
         self.sync_root_ime_target();
         self.process_terminal_notifications(cx);
 
@@ -4961,6 +4367,7 @@ impl Render for RootView {
                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                     this.show_settings = false;
                     this.show_snippet_palette = false;
+                    this.template_editor = None;
                     this.show_shell_menu = true;
                     cx.notify();
                     cx.stop_propagation();
@@ -4972,6 +4379,7 @@ impl Render for RootView {
                     cx.listener(|this, _: &MouseDownEvent, _window, cx| {
                         this.show_settings = false;
                         this.show_snippet_palette = false;
+                        this.template_editor = None;
                         this.show_shell_menu = true;
                         cx.notify();
                         cx.stop_propagation();
@@ -6312,300 +5720,6 @@ fn interactive_action_button(
     button.child(label)
 }
 
-fn template_editor_section_label(label: &'static str) -> Div {
-    div()
-        .font_family(UI_FONT)
-        .text_size(px(13.0))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(rgb(TEXT))
-        .child(label)
-}
-
-fn template_editor_input_box(
-    buffer: &ImeTextBuffer,
-    placeholder: &'static str,
-    active: bool,
-    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> Div {
-    let value = buffer.text();
-    let is_empty = buffer.is_empty();
-    let selection = buffer.selection();
-    let cursor_byte = if active && selection.start == selection.end {
-        Some(buffer.cursor())
-    } else {
-        None
-    };
-    let mut container = div()
-        .w_full()
-        .h(px(52.0))
-        .rounded(px(12.0))
-        .border_1()
-        .border_color(if active {
-            rgba(0x7AA2F7FF)
-        } else {
-            rgba(0xffffff10)
-        })
-        .bg(rgb(0x171719))
-        .px(px(16.0))
-        .cursor_text()
-        .hover(|style| style.bg(rgb(0x1A1A1C)))
-        .on_mouse_down(MouseButton::Left, listener)
-        .flex()
-        .items_center()
-        .overflow_hidden();
-
-    if is_empty && !active {
-        // Placeholder only
-        container = container.child(
-            div()
-                .font_family(UI_FONT)
-                .text_size(px(13.0))
-                .text_color(rgb(SUBTEXT1))
-                .child(placeholder),
-        );
-    } else if is_empty && active {
-        // Empty + active: show placeholder with cursor at start
-        container = container
-            .child(div().w(px(1.5)).h(px(18.0)).bg(rgb(ACCENT)).flex_shrink_0())
-            .child(
-                div()
-                    .font_family(UI_FONT)
-                    .text_size(px(13.0))
-                    .text_color(rgb(SUBTEXT1))
-                    .child(placeholder),
-            );
-    } else if let Some(cursor) = cursor_byte.filter(|_| active) {
-        // Active with cursor: split text at cursor position
-        let cursor = cursor.min(value.len());
-        // Ensure cursor is at a char boundary
-        let cursor = if cursor == 0 || cursor >= value.len() {
-            cursor
-        } else {
-            value[..cursor]
-                .char_indices()
-                .last()
-                .map(|(i, c)| i + c.len_utf8())
-                .unwrap_or(cursor)
-        };
-        let before = &value[..cursor];
-        let after = &value[cursor..];
-
-        let mut row = div()
-            .flex()
-            .items_center()
-            .font_family(UI_FONT)
-            .text_size(px(13.0));
-
-        if !before.is_empty() {
-            row = row.child(div().text_color(rgb(TEXT)).child(before.to_string()));
-        }
-        // Cursor caret
-        row = row.child(div().w(px(1.5)).h(px(18.0)).bg(rgb(ACCENT)).flex_shrink_0());
-        if !after.is_empty() {
-            row = row.child(div().text_color(rgb(TEXT)).child(after.to_string()));
-        }
-        container = container.child(row);
-    } else {
-        // Inactive with text: show text only
-        container = container.child(
-            div()
-                .font_family(UI_FONT)
-                .text_size(px(13.0))
-                .text_color(rgb(TEXT))
-                .child(value.to_string()),
-        );
-    }
-
-    container
-}
-
-fn template_editor_text_area(
-    buffer: &ImeTextBuffer,
-    placeholder: &'static str,
-    active: bool,
-    height: f32,
-    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> Div {
-    let value = buffer.text();
-    let lines = if buffer.is_empty() {
-        vec![
-            div()
-                .font_family(UI_FONT)
-                .text_size(px(13.0))
-                .text_color(rgb(SUBTEXT1))
-                .child(placeholder)
-                .into_any_element(),
-        ]
-    } else {
-        value
-            .lines()
-            .map(|line| {
-                div()
-                    .font_family(UI_FONT)
-                    .text_size(px(13.0))
-                    .text_color(rgb(TEXT))
-                    .child(if line.is_empty() {
-                        " ".to_string()
-                    } else {
-                        line.to_string()
-                    })
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>()
-    };
-
-    let lines = if active && buffer.selection().start == buffer.selection().end {
-        append_caret_to_last_line(lines)
-    } else {
-        lines
-    };
-
-    div()
-        .w_full()
-        .h(px(height))
-        .rounded(px(12.0))
-        .border_1()
-        .border_color(if active {
-            rgba(0x7AA2F7FF)
-        } else {
-            rgba(0xffffff10)
-        })
-        .bg(rgb(0x171719))
-        .p(px(16.0))
-        .cursor_text()
-        .hover(|style| style.bg(rgb(0x1A1A1C)))
-        .on_mouse_down(MouseButton::Left, listener)
-        .flex()
-        .flex_col()
-        .gap(px(6.0))
-        .children(lines)
-}
-
-fn append_caret_to_last_line(mut lines: Vec<AnyElement>) -> Vec<AnyElement> {
-    let caret = div()
-        .w(px(1.5))
-        .h(px(18.0))
-        .bg(rgb(ACCENT))
-        .flex_shrink_0()
-        .into_any_element();
-
-    if let Some(last_line) = lines.pop() {
-        lines.push(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(0.0))
-                .child(last_line)
-                .child(caret)
-                .into_any_element(),
-        );
-    } else {
-        lines.push(caret);
-    }
-
-    lines
-}
-
-fn template_editor_favorite_button(
-    favorite: bool,
-    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> Div {
-    let mut button = div()
-        .h(px(42.0))
-        .px(px(16.0))
-        .rounded(px(12.0))
-        .border_1()
-        .cursor_pointer()
-        .flex()
-        .items_center()
-        .gap(px(10.0))
-        .on_mouse_down(MouseButton::Left, listener);
-
-    if favorite {
-        button = button
-            .bg(rgba(0x0A84FF26))
-            .border_color(rgba(0x0A84FFFF))
-            .text_color(rgb(TEXT));
-    } else {
-        button = button
-            .bg(rgba(0xffffff10))
-            .border_color(rgba(0xffffff10))
-            .text_color(rgb(TEXT));
-    }
-
-    button
-        .child(
-            svg()
-                .path(if favorite {
-                    "ui/star-filled.svg"
-                } else {
-                    "ui/star.svg"
-                })
-                .size(px(16.0))
-                .text_color(rgb(if favorite { 0xF5C542 } else { SUBTEXT0 })),
-        )
-        .child(
-            div()
-                .font_family(UI_FONT)
-                .text_size(px(13.0))
-                .font_weight(FontWeight::MEDIUM)
-                .child("お気に入り"),
-        )
-}
-
-fn template_editor_footer_button(
-    label: &'static str,
-    accent: bool,
-    enabled: bool,
-    listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> Div {
-    let mut button = div()
-        .h(px(42.0))
-        .px(px(if accent { 22.0 } else { 18.0 }))
-        .rounded(px(12.0))
-        .border_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .font_family(UI_FONT)
-        .text_size(px(13.0))
-        .font_weight(FontWeight::SEMIBOLD);
-
-    if enabled {
-        button = button
-            .cursor_pointer()
-            .on_mouse_down(MouseButton::Left, listener);
-    }
-
-    if accent {
-        button = button
-            .bg(if enabled {
-                rgb(ACCENT)
-            } else {
-                rgba(0x0A84FF66)
-            })
-            .border_color(if enabled {
-                rgb(ACCENT)
-            } else {
-                rgba(0x0A84FF66)
-            })
-            .text_color(rgb(0xffffff));
-        if enabled {
-            button = button.hover(|style| style.bg(rgb(0x409CFF)));
-        }
-    } else {
-        button = button
-            .bg(rgba(0xffffff00))
-            .border_color(rgba(0xffffff00))
-            .text_color(rgb(TEXT));
-        if enabled {
-            button = button.hover(|style| style.bg(rgba(0xffffff10)));
-        }
-    }
-
-    button.child(label)
-}
-
 fn slider_with_dynamic_value(fill_ratio: f32, value: String) -> Div {
     let fill_width = 112.0 * fill_ratio.clamp(0.0, 1.0);
 
@@ -6721,22 +5835,21 @@ fn color_dot(color: u32) -> Div {
 mod tests {
     use super::{
         AiSettingsImeTarget, AiSettingsTextField, GlobalShortcutAction, INPUT_METHOD_VK_PROCESSKEY,
-        RootImeTarget, TemplateEditorDraft, TemplateEditorField, ZoomAction,
-        active_ai_settings_ime_target, active_root_ime_target, adjust_font_size_value,
-        byte_index_to_utf16_offset, byte_range_to_utf16_range, collect_global_hotkeys,
-        configured_global_shortcut_action, current_text_for_ai_settings_ime_target,
-        cycle_string_option, direct_text_from_input_keystroke, hotkey_binding_string,
-        hotkey_matches, hotkey_string_for_keystroke, next_filtered_index,
-        process_completion_notice_detail, replace_text_in_ai_settings_ime_target,
-        should_defer_control_key_to_input_method, should_defer_keystroke_to_input_method,
-        should_route_keystroke_via_text_input, snippet_panel_frame,
-        snippet_primary_action_for_section, terminal_settings_from_config, titlebar_actions_width,
-        titlebar_side_cluster_width, traffic_lights_width, utf16_offset_to_byte_index,
-        utf16_range_to_byte_range, wrap_sidebar_preview, zoom_action_for_window,
+        RootImeTarget, ZoomAction, active_ai_settings_ime_target, active_root_ime_target,
+        adjust_font_size_value, byte_index_to_utf16_offset, byte_range_to_utf16_range,
+        collect_global_hotkeys, configured_global_shortcut_action,
+        current_text_for_ai_settings_ime_target, cycle_string_option,
+        direct_text_from_input_keystroke, hotkey_binding_string, hotkey_matches,
+        hotkey_string_for_keystroke, next_filtered_index, process_completion_notice_detail,
+        replace_text_in_ai_settings_ime_target, should_defer_control_key_to_input_method,
+        should_defer_keystroke_to_input_method, should_route_keystroke_via_text_input,
+        snippet_panel_frame, snippet_primary_action_for_section, terminal_settings_from_config,
+        titlebar_actions_width, titlebar_side_cluster_width, traffic_lights_width,
+        utf16_offset_to_byte_index, utf16_range_to_byte_range, wrap_sidebar_preview,
+        zoom_action_for_window,
     };
     use crate::config::AppConfig;
     use crate::snippet_palette::SnippetSection;
-    use crate::text_input::ImeTextBuffer;
     use gpui::{KeyDownEvent, Keystroke, Modifiers};
     use std::sync::{
         Arc,
@@ -6839,19 +5952,14 @@ mod tests {
     }
 
     #[test]
-    fn root_ime_target_prefers_template_editor_when_modal_is_open() {
+    fn root_ime_target_tracks_ai_settings_fields() {
         assert_eq!(
-            active_root_ime_target(
-                true,
-                Some(TemplateEditorField::Content),
-                true,
-                Some(AiSettingsTextField::Model),
-            ),
-            Some(RootImeTarget::TemplateEditor(TemplateEditorField::Content))
+            active_root_ime_target(true, Some(AiSettingsTextField::Model)),
+            Some(RootImeTarget::AiSettings(AiSettingsImeTarget::Model))
         );
         assert_eq!(
-            active_root_ime_target(false, None, true, Some(AiSettingsTextField::Model)),
-            Some(RootImeTarget::AiSettings(AiSettingsImeTarget::Model))
+            active_root_ime_target(false, Some(AiSettingsTextField::Model)),
+            None
         );
     }
 
@@ -6873,24 +5981,6 @@ mod tests {
         assert_eq!(
             current_text_for_ai_settings_ime_target(&config, AiSettingsImeTarget::Model).as_deref(),
             Some("gpt-4.1-mini")
-        );
-    }
-
-    #[test]
-    fn template_editor_ime_replace_updates_multibyte_text() {
-        let mut draft = TemplateEditorDraft {
-            content: ImeTextBuffer::new("署名です"),
-            ..TemplateEditorDraft::default()
-        };
-
-        let inserted = draft
-            .field_mut(TemplateEditorField::Content)
-            .replace_range("署名".len().."署名です".len(), "になります");
-
-        assert_eq!(inserted, Some("署名".len().."署名になります".len()));
-        assert_eq!(
-            draft.field(TemplateEditorField::Content).text(),
-            "署名になります"
         );
     }
 
