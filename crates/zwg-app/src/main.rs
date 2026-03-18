@@ -16,6 +16,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod ai;
 mod app;
+mod clipboard_monitor;
 mod config;
 mod shell;
 mod snippet_palette;
@@ -375,6 +376,7 @@ fn main() {
             let root = cx.new(|cx| app::RootView::new(state.clone(), cx));
             // Auto-focus terminal so the user can type immediately at startup
             root.update(cx, |view, cx| {
+                view.attach_clipboard_monitor(window, cx);
                 view.focus_active_terminal(window, cx);
             });
             root

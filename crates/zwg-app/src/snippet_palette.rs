@@ -1,4 +1,17 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+use std::fs;
+use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::clipboard_monitor::ClipboardCapture;
+
+const HISTORY_FILE_NAME: &str = "clipboard-history.json";
+const HISTORY_STORE_VERSION: u32 = 1;
+const HISTORY_LIMIT: usize = 200;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SnippetSection {
     History,
     Template,
@@ -24,18 +37,10 @@ impl SnippetSection {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SnippetTab {
-    pub id: String,
-    pub title: String,
-    pub section: SnippetSection,
-    pub shortcut_hint: Option<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnippetRecord {
     pub id: String,
-    pub tab_id: String,
+    pub section: SnippetSection,
     pub kind_label: String,
     pub title: String,
     pub summary: String,
@@ -45,18 +50,17 @@ pub struct SnippetRecord {
     pub pinned: bool,
     pub source: String,
     pub created_label: String,
-    pub captured_minutes_ago: Option<u32>,
+    pub captured_at_epoch_secs: Option<u64>,
 }
 
 impl SnippetRecord {
     pub fn relative_created_label(&self) -> Option<String> {
-        self.captured_minutes_ago.map(format_relative_minutes)
+        self.captured_at_epoch_secs.map(format_relative_epoch_secs)
     }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnippetPaletteModel {
-    tabs: Vec<SnippetTab>,
     snippets: Vec<SnippetRecord>,
     active_section: SnippetSection,
     selected_snippet_id: Option<String>,
@@ -64,13 +68,32 @@ pub struct SnippetPaletteModel {
     pinned_only: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct PersistedHistory {
+    version: u32,
+    records: Vec<SnippetRecord>,
+}
+
 impl SnippetPaletteModel {
     pub fn new() -> Self {
-        let tabs = demo_tabs();
-        let snippets = demo_snippets();
+        Self::from_records(load_history_records(), default_template_records())
+    }
+
+    #[cfg(test)]
+    pub fn with_test_data() -> Self {
+        Self::from_records(sample_history_records(), default_template_records())
+    }
+
+    fn from_records(mut history: Vec<SnippetRecord>, templates: Vec<SnippetRecord>) -> Self {
+        history.retain(|record| record.section == SnippetSection::History);
+        let mut snippets = history;
+        snippets.extend(
+            templates
+                .into_iter()
+                .filter(|record| record.section == SnippetSection::Template),
+        );
 
         let mut model = Self {
-            tabs,
             snippets,
             active_section: SnippetSection::History,
             selected_snippet_id: None,
@@ -90,27 +113,23 @@ impl SnippetPaletteModel {
         self.active_section
     }
 
+    pub fn has_history_items(&self) -> bool {
+        self.snippets
+            .iter()
+            .any(|snippet| snippet.section == SnippetSection::History)
+    }
+
     pub fn section_total_count(&self, section: SnippetSection) -> usize {
         self.snippets
             .iter()
-            .filter(|snippet| {
-                self.tab_for_id(&snippet.tab_id)
-                    .map(|tab| tab.section == section)
-                    .unwrap_or(false)
-            })
+            .filter(|snippet| snippet.section == section)
             .count()
     }
 
     pub fn section_pinned_count(&self, section: SnippetSection) -> usize {
         self.snippets
             .iter()
-            .filter(|snippet| {
-                snippet.pinned
-                    && self
-                        .tab_for_id(&snippet.tab_id)
-                        .map(|tab| tab.section == section)
-                        .unwrap_or(false)
-            })
+            .filter(|snippet| snippet.section == section && snippet.pinned)
             .count()
     }
 
@@ -138,11 +157,7 @@ impl SnippetPaletteModel {
     pub fn visible_snippets(&self) -> Vec<&SnippetRecord> {
         filter_snippets(&self.snippets, &self.search_query)
             .into_iter()
-            .filter(|snippet| {
-                self.tab_for_id(&snippet.tab_id)
-                    .map(|tab| tab.section == self.active_section)
-                    .unwrap_or(false)
-            })
+            .filter(|snippet| snippet.section == self.active_section)
             .filter(|snippet| !self.pinned_only || snippet.pinned)
             .collect()
     }
@@ -258,75 +273,108 @@ impl SnippetPaletteModel {
             .find(|snippet| snippet.id == selected_id)?;
         snippet.pinned = !snippet.pinned;
         let pinned = snippet.pinned;
+        let should_persist = snippet.section == SnippetSection::History;
+        if should_persist {
+            self.persist_history();
+        }
         self.sync_selection();
         Some(pinned)
     }
 
     pub fn create_new_item(&mut self) -> Option<String> {
-        let target_tab = self
-            .tabs
-            .iter()
-            .find(|tab| tab.section == self.active_section)?
-            .id
-            .clone();
-        let section_key = match self.active_section {
-            SnippetSection::History => "history",
-            SnippetSection::Template => "template",
-        };
+        if self.active_section != SnippetSection::Template {
+            return None;
+        }
+
         let next_index = self
             .snippets
             .iter()
-            .filter(|snippet| {
-                self.tab_for_id(&snippet.tab_id)
-                    .map(|tab| tab.section == self.active_section)
-                    .unwrap_or(false)
-            })
+            .filter(|snippet| snippet.section == SnippetSection::Template)
             .count()
             + 1;
-        let new_id = format!("{section_key}-new-{next_index}");
-        let new_item = match self.active_section {
-            SnippetSection::History => SnippetRecord {
-                id: new_id.clone(),
-                tab_id: target_tab,
-                kind_label: "TEXT".into(),
-                title: "検索".into(),
-                summary: "Safari でコピーした新規履歴".into(),
-                content: "text".into(),
-                note: None,
-                tags: Vec::new(),
-                pinned: false,
-                source: "Safari".into(),
-                created_label: "たった今".into(),
-                captured_minutes_ago: Some(0),
-            },
-            SnippetSection::Template => SnippetRecord {
-                id: new_id.clone(),
-                tab_id: target_tab,
-                kind_label: "TEXT".into(),
-                title: "新規".into(),
-                summary: "text".into(),
-                content: "text".into(),
-                note: None,
-                tags: Vec::new(),
-                pinned: false,
-                source: "手動作成".into(),
-                created_label: "たった今".into(),
-                captured_minutes_ago: None,
-            },
+        let new_id = format!("template-new-{next_index}");
+        let new_item = SnippetRecord {
+            id: new_id.clone(),
+            section: SnippetSection::Template,
+            kind_label: "TEXT".into(),
+            title: "新規".into(),
+            summary: "text".into(),
+            content: "text".into(),
+            note: None,
+            tags: Vec::new(),
+            pinned: false,
+            source: "手動作成".into(),
+            created_label: "たった今".into(),
+            captured_at_epoch_secs: None,
         };
         let insert_at = self
             .snippets
             .iter()
-            .position(|snippet| {
-                self.tab_for_id(&snippet.tab_id)
-                    .map(|tab| tab.section == self.active_section)
-                    .unwrap_or(false)
-            })
+            .position(|snippet| snippet.section == SnippetSection::Template)
             .unwrap_or(self.snippets.len());
         self.snippets.insert(insert_at, new_item);
         self.selected_snippet_id = Some(new_id.clone());
         self.sync_selection();
         Some(new_id)
+    }
+
+    pub fn ingest_clipboard_capture(&mut self, capture: ClipboardCapture) -> bool {
+        if capture.content.trim().is_empty() {
+            return false;
+        }
+
+        let existing_index = self.snippets.iter().position(|snippet| {
+            snippet.section == SnippetSection::History
+                && snippet.kind_label == capture.kind_label
+                && snippet.content == capture.content
+        });
+        let (id, pinned) = if let Some(existing_index) = existing_index {
+            let existing = self.snippets.remove(existing_index);
+            (existing.id, existing.pinned)
+        } else {
+            (format!("history-{}", Uuid::new_v4().simple()), false)
+        };
+
+        let history_record = SnippetRecord {
+            id,
+            section: SnippetSection::History,
+            kind_label: capture.kind_label,
+            title: capture.title,
+            summary: capture.summary,
+            content: capture.content,
+            note: capture.note,
+            tags: capture.tags,
+            pinned,
+            source: capture.source,
+            created_label: capture.created_label,
+            captured_at_epoch_secs: Some(capture.captured_at_epoch_secs),
+        };
+
+        let insert_at = self
+            .snippets
+            .iter()
+            .position(|snippet| snippet.section == SnippetSection::History)
+            .unwrap_or(0);
+        self.snippets.insert(insert_at, history_record);
+        self.trim_history_items();
+        self.sync_selection();
+        self.persist_history();
+        true
+    }
+
+    pub fn clear_history(&mut self) -> bool {
+        let original_len = self.snippets.len();
+        self.snippets
+            .retain(|snippet| snippet.section != SnippetSection::History);
+        if self.snippets.len() == original_len {
+            let _ = clear_history_store();
+            return false;
+        }
+
+        self.selected_snippet_id = None;
+        self.sync_selection();
+        let _ = clear_history_store();
+        true
     }
 
     pub fn remove_selected(&mut self) -> bool {
@@ -338,6 +386,11 @@ impl SnippetPaletteModel {
             .iter()
             .position(|snippet_id| *snippet_id == selected_id)
             .unwrap_or(0);
+        let removed = self
+            .snippets
+            .iter()
+            .find(|snippet| snippet.id == selected_id)
+            .map(|snippet| snippet.section);
         let original_len = self.snippets.len();
         self.snippets.retain(|snippet| snippet.id != selected_id);
         if self.snippets.len() == original_len {
@@ -350,7 +403,35 @@ impl SnippetPaletteModel {
             .cloned()
             .or_else(|| visible_after.last().cloned());
         self.sync_selection();
+        if removed == Some(SnippetSection::History) {
+            self.persist_history();
+        }
         true
+    }
+
+    fn trim_history_items(&mut self) {
+        while self.section_total_count(SnippetSection::History) > HISTORY_LIMIT {
+            let removable_index = self
+                .snippets
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, snippet)| snippet.section == SnippetSection::History && !snippet.pinned)
+                .map(|(index, _)| index)
+                .or_else(|| {
+                    self.snippets
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, snippet)| snippet.section == SnippetSection::History)
+                        .map(|(index, _)| index)
+                });
+
+            let Some(removable_index) = removable_index else {
+                break;
+            };
+            self.snippets.remove(removable_index);
+        }
     }
 
     fn visible_snippet_ids(&self) -> Vec<String> {
@@ -360,8 +441,17 @@ impl SnippetPaletteModel {
             .collect()
     }
 
-    fn tab_for_id(&self, tab_id: &str) -> Option<&SnippetTab> {
-        self.tabs.iter().find(|tab| tab.id == tab_id)
+    fn persist_history(&self) {
+        if let Err(err) = save_history_records(
+            &self
+                .snippets
+                .iter()
+                .filter(|snippet| snippet.section == SnippetSection::History)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ) {
+            log::warn!("Failed to save clipboard history: {}", err);
+        }
     }
 
     fn sync_selection(&mut self) {
@@ -402,68 +492,69 @@ pub fn filter_snippets<'a>(snippets: &'a [SnippetRecord], query: &str) -> Vec<&'
         .collect()
 }
 
-fn demo_tabs() -> Vec<SnippetTab> {
-    vec![
-        SnippetTab {
-            id: "clipboard".into(),
-            title: "Clipboard".into(),
-            section: SnippetSection::History,
-            shortcut_hint: Some("Alt+C".into()),
-        },
-        SnippetTab {
-            id: "notes".into(),
-            title: "Notes".into(),
-            section: SnippetSection::Template,
-            shortcut_hint: Some("Alt+N".into()),
-        },
-        SnippetTab {
-            id: "commands".into(),
-            title: "Commands".into(),
-            section: SnippetSection::Template,
-            shortcut_hint: Some("Alt+M".into()),
-        },
-        SnippetTab {
-            id: "links".into(),
-            title: "Links".into(),
-            section: SnippetSection::History,
-            shortcut_hint: Some("Alt+L".into()),
-        },
-    ]
+fn history_store_path() -> PathBuf {
+    #[cfg(test)]
+    {
+        return std::env::temp_dir()
+            .join("zwg-terminal-tests")
+            .join(format!("{}-{}.json", HISTORY_FILE_NAME, std::process::id()));
+    }
+
+    #[cfg(not(test))]
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("zwg-terminal")
+        .join(HISTORY_FILE_NAME)
 }
 
-fn demo_snippets() -> Vec<SnippetRecord> {
+fn load_history_records() -> Vec<SnippetRecord> {
+    let path = history_store_path();
+    let Ok(contents) = fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let Ok(store) = serde_json::from_str::<PersistedHistory>(&contents) else {
+        return Vec::new();
+    };
+    store
+        .records
+        .into_iter()
+        .filter(|record| record.section == SnippetSection::History)
+        .collect()
+}
+
+fn save_history_records(records: &[SnippetRecord]) -> std::io::Result<()> {
+    let path = history_store_path();
+    if records.is_empty() {
+        return clear_history_store();
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let store = PersistedHistory {
+        version: HISTORY_STORE_VERSION,
+        records: records.to_vec(),
+    };
+    let contents = serde_json::to_string_pretty(&store)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    fs::write(path, contents)
+}
+
+fn clear_history_store() -> std::io::Result<()> {
+    let path = history_store_path();
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn default_template_records() -> Vec<SnippetRecord> {
     vec![
         SnippetRecord {
-            id: "clipboard-release-mail".into(),
-            tab_id: "clipboard".into(),
-            kind_label: "TEXT".into(),
-            title: "CopyQはクリップボード管理ツールです。テキスト、画像、その他のデータをコピーすると…".into(),
-            summary: "テキスト、画像、その他のデータをコピーすると、自動的に履歴に保存されます。".into(),
-            content: "CopyQはクリップボード管理ツールです。テキスト、画像、その他のデータをコピーすると、自動的に履歴に保存されます。".into(),
-            note: Some("Safari でコピーした説明文のサンプル。".into()),
-            tags: vec!["browser".into()],
-            pinned: true,
-            source: "Safari".into(),
-            created_label: "2026年3月18日 09:46:34".into(),
-            captured_minutes_ago: Some(5),
-        },
-        SnippetRecord {
-            id: "clipboard-bug-template".into(),
-            tab_id: "clipboard".into(),
-            kind_label: "CODE".into(),
-            title: "function fibonacci(n) { if (n <= 1) return n; return fibonacci(n - 1)…".into(),
-            summary: "return n; return fibonacci(n - 1)…".into(),
-            content: "function fibonacci(n) {\n  if (n <= 1) return n;\n  return fibonacci(n - 1) + fibonacci(n - 2);\n}".into(),
-            note: Some("VS Code からコピーしたコード断片のサンプル。".into()),
-            tags: vec!["code".into(), "javascript".into()],
-            pinned: false,
-            source: "VS Code".into(),
-            created_label: "2026年3月18日 09:36:34".into(),
-            captured_minutes_ago: Some(15),
-        },
-        SnippetRecord {
-            id: "notes-weekly".into(),
-            tab_id: "notes".into(),
+            id: "template-weekly".into(),
+            section: SnippetSection::Template,
             kind_label: "TEXT".into(),
             title: "週次メモの雛形".into(),
             summary: "決定事項、課題、次週の 3 ブロックに絞った簡易ノートです。".into(),
@@ -473,11 +564,11 @@ fn demo_snippets() -> Vec<SnippetRecord> {
             pinned: true,
             source: "Editor".into(),
             created_label: "2026年3月17日 09:10".into(),
-            captured_minutes_ago: None,
+            captured_at_epoch_secs: None,
         },
         SnippetRecord {
-            id: "notes-followup".into(),
-            tab_id: "notes".into(),
+            id: "template-followup".into(),
+            section: SnippetSection::Template,
             kind_label: "TEXT".into(),
             title: "打ち合わせ後のフォロー".into(),
             summary: "議事録共有前に送る軽いフォロー文です。".into(),
@@ -487,11 +578,11 @@ fn demo_snippets() -> Vec<SnippetRecord> {
             pinned: false,
             source: "Mail".into(),
             created_label: "2026年3月16日 14:22".into(),
-            captured_minutes_ago: None,
+            captured_at_epoch_secs: None,
         },
         SnippetRecord {
-            id: "commands-build".into(),
-            tab_id: "commands".into(),
+            id: "template-build".into(),
+            section: SnippetSection::Template,
             kind_label: "CODE".into(),
             title: "ZWG ビルド確認".into(),
             summary: "変更後の標準ビルド確認セットです。".into(),
@@ -501,176 +592,153 @@ fn demo_snippets() -> Vec<SnippetRecord> {
             pinned: true,
             source: "Terminal".into(),
             created_label: "2026年3月18日 19:02".into(),
-            captured_minutes_ago: None,
+            captured_at_epoch_secs: None,
+        },
+    ]
+}
+
+fn format_relative_epoch_secs(epoch_secs: u64) -> String {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let elapsed_minutes = now_secs.saturating_sub(epoch_secs) / 60;
+    match elapsed_minutes {
+        0..=59 => format!("{}分前", elapsed_minutes.max(1)),
+        60..=1439 => format!("{}時間前", elapsed_minutes / 60),
+        _ => format!("{}日前", elapsed_minutes / 1440),
+    }
+}
+
+#[cfg(test)]
+fn sample_history_records() -> Vec<SnippetRecord> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    vec![
+        SnippetRecord {
+            id: "history-copyq".into(),
+            section: SnippetSection::History,
+            kind_label: "TEXT".into(),
+            title: "CopyQはクリップボード管理ツールです。".into(),
+            summary: "テキスト、画像、その他のデータをコピーすると、自動的に履歴に保存されます。".into(),
+            content: "CopyQはクリップボード管理ツールです。テキスト、画像、その他のデータをコピーすると、自動的に履歴に保存されます。".into(),
+            note: Some("Safari でコピーした説明文のサンプル。".into()),
+            tags: vec!["browser".into()],
+            pinned: true,
+            source: "Safari".into(),
+            created_label: "2026年3月18日 09:46:34".into(),
+            captured_at_epoch_secs: Some(now.saturating_sub(5 * 60)),
         },
         SnippetRecord {
-            id: "commands-review".into(),
-            tab_id: "commands".into(),
+            id: "history-code".into(),
+            section: SnippetSection::History,
             kind_label: "CODE".into(),
-            title: "差分確認".into(),
-            summary: "作業前後の状態を崩さず確認するための定番コマンドです。".into(),
-            content: "git status --short\ngit diff -- crates/zwg-app/src/app.rs\nrg -n \"snippet|clipboard|copyq\" crates/zwg-app/src".into(),
-            note: Some("品質レビュー前の基本セット。".into()),
-            tags: vec!["git".into(), "review".into()],
+            title: "function fibonacci(n) { if (n <= 1) return n; }".into(),
+            summary: "return fibonacci(n - 1)…".into(),
+            content: "function fibonacci(n) {\n  if (n <= 1) return n;\n  return fibonacci(n - 1) + fibonacci(n - 2);\n}".into(),
+            note: Some("VS Code からコピーしたコード断片のサンプル。".into()),
+            tags: vec!["code".into(), "javascript".into()],
             pinned: false,
-            source: "Terminal".into(),
-            created_label: "2026年3月18日 18:55".into(),
-            captured_minutes_ago: None,
+            source: "VS Code".into(),
+            created_label: "2026年3月18日 09:36:34".into(),
+            captured_at_epoch_secs: Some(now.saturating_sub(15 * 60)),
         },
         SnippetRecord {
-            id: "links-copyq".into(),
-            tab_id: "links".into(),
+            id: "history-mail".into(),
+            section: SnippetSection::History,
             kind_label: "MAIL".into(),
             title: "hello@example.com".into(),
             summary: "".into(),
             content: "hello@example.com".into(),
             note: Some("メールアドレスの履歴サンプル。".into()),
             tags: vec!["mail".into()],
-            pinned: true,
+            pinned: false,
             source: "Mail".into(),
             created_label: "2026年3月18日 09:21:34".into(),
-            captured_minutes_ago: Some(30),
-        },
-        SnippetRecord {
-            id: "links-figma".into(),
-            tab_id: "links".into(),
-            kind_label: "HTML".into(),
-            title: "<div class=\"container\"><h1>Hello World</h1><p>This is a sample…".into(),
-            summary: "".into(),
-            content: "<div class=\"container\">\n  <h1>Hello World</h1>\n  <p>This is a sample page.</p>\n</div>".into(),
-            note: Some("HTML 断片の履歴サンプル。".into()),
-            tags: vec!["html".into()],
-            pinned: false,
-            source: "Chrome".into(),
-            created_label: "2026年3月18日 08:51:34".into(),
-            captured_minutes_ago: Some(60),
-        },
-        SnippetRecord {
-            id: "clipboard-calendar".into(),
-            tab_id: "clipboard".into(),
-            kind_label: "DATE".into(),
-            title: "2026年3月16日（月）".into(),
-            summary: "".into(),
-            content: "2026年3月16日（月）".into(),
-            note: Some("カレンダーの履歴サンプル。".into()),
-            tags: vec!["date".into()],
-            pinned: false,
-            source: "Calendar".into(),
-            created_label: "2026年3月18日 08:46:34".into(),
-            captured_minutes_ago: Some(60),
-        },
-        SnippetRecord {
-            id: "clipboard-sql".into(),
-            tab_id: "clipboard".into(),
-            kind_label: "SQL".into(),
-            title: "SELECT users.name, orders.total FROM users INNER JOIN orders…".into(),
-            summary: "".into(),
-            content: "SELECT users.name, orders.total\nFROM users\nINNER JOIN orders ON orders.user_id = users.id;".into(),
-            note: Some("DataGrip からコピーしたクエリ。".into()),
-            tags: vec!["sql".into()],
-            pinned: false,
-            source: "DataGrip".into(),
-            created_label: "2026年3月18日 07:46:34".into(),
-            captured_minutes_ago: Some(120),
-        },
-        SnippetRecord {
-            id: "clipboard-url".into(),
-            tab_id: "clipboard".into(),
-            kind_label: "LINK".into(),
-            title: "https://www.example.com/article/how-clipboard-managers-work".into(),
-            summary: "".into(),
-            content: "https://www.example.com/article/how-clipboard-managers-work".into(),
-            note: Some("URL の履歴サンプル。".into()),
-            tags: vec!["link".into()],
-            pinned: false,
-            source: "Safari".into(),
-            created_label: "2026年3月18日 07:16:34".into(),
-            captured_minutes_ago: Some(150),
+            captured_at_epoch_secs: Some(now.saturating_sub(30 * 60)),
         },
     ]
 }
 
-fn format_relative_minutes(minutes: u32) -> String {
-    match minutes {
-        0..=59 => format!("{minutes}分前"),
-        60..=1439 => format!("{}時間前", minutes / 60),
-        _ => format!("{}日前", minutes / 1440),
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::{SnippetPaletteModel, SnippetSection, filter_snippets};
+    use crate::clipboard_monitor::ClipboardCapture;
 
     #[test]
     fn palette_model_selects_first_visible_snippet_by_default() {
-        let model = SnippetPaletteModel::new();
+        let model = SnippetPaletteModel::with_test_data();
 
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
-            Some("clipboard-release-mail")
+            Some("history-copyq")
         );
         assert_eq!(model.active_section(), SnippetSection::History);
-        assert_eq!(model.visible_count(), 7);
+        assert_eq!(model.visible_count(), 3);
     }
 
     #[test]
     fn filter_snippets_matches_summary_note_source_content_and_tags() {
-        let model = SnippetPaletteModel::new();
+        let model = SnippetPaletteModel::with_test_data();
         let snippets = model.snippets();
 
-        assert_eq!(filter_snippets(snippets, "validation").len(), 1);
-        assert_eq!(filter_snippets(snippets, "DataGrip").len(), 1);
-        assert_eq!(filter_snippets(snippets, "議事").len(), 1);
+        assert_eq!(filter_snippets(snippets, "browser").len(), 1);
+        assert_eq!(filter_snippets(snippets, "VS Code").len(), 1);
+        assert_eq!(filter_snippets(snippets, "weekly").len(), 1);
         assert_eq!(filter_snippets(snippets, "javascript").len(), 1);
         assert_eq!(filter_snippets(snippets, "fibonacci").len(), 1);
     }
 
     #[test]
     fn switching_sections_reselects_first_visible_item() {
-        let mut model = SnippetPaletteModel::new();
+        let mut model = SnippetPaletteModel::with_test_data();
 
         assert!(model.select_section(SnippetSection::Template));
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
-            Some("notes-weekly")
+            Some("template-weekly")
         );
     }
 
     #[test]
     fn switching_sections_restores_first_visible_item_in_target_section() {
-        let mut model = SnippetPaletteModel::new();
+        let mut model = SnippetPaletteModel::with_test_data();
 
         assert!(model.select_section(SnippetSection::Template));
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
-            Some("notes-weekly")
+            Some("template-weekly")
         );
         assert!(model.cycle_sections(1));
         assert_eq!(model.active_section(), SnippetSection::History);
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
-            Some("clipboard-release-mail")
+            Some("history-copyq")
         );
     }
 
     #[test]
     fn toggling_pinned_filter_keeps_visible_selection_valid() {
-        let mut model = SnippetPaletteModel::new();
+        let mut model = SnippetPaletteModel::with_test_data();
 
-        assert!(model.select("clipboard-bug-template"));
+        assert!(model.select("history-code"));
         assert!(model.toggle_pinned_only());
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
-            Some("clipboard-release-mail")
+            Some("history-copyq")
         );
     }
 
     #[test]
     fn toggling_selected_pinned_updates_selected_item() {
-        let mut model = SnippetPaletteModel::new();
+        let mut model = SnippetPaletteModel::with_test_data();
         assert!(model.select_section(SnippetSection::Template));
-        assert!(model.select("commands-review"));
+        assert!(model.select("template-followup"));
 
         assert_eq!(model.toggle_selected_pinned(), Some(true));
         assert!(model.selected_snippet().unwrap().pinned);
@@ -680,50 +748,77 @@ mod tests {
 
     #[test]
     fn remove_selected_promotes_next_visible_snippet() {
-        let mut model = SnippetPaletteModel::new();
+        let mut model = SnippetPaletteModel::with_test_data();
 
         assert!(model.remove_selected());
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
-            Some("clipboard-bug-template")
+            Some("history-code")
         );
     }
 
     #[test]
     fn search_query_filters_and_retargets_selection() {
-        let mut model = SnippetPaletteModel::new();
+        let mut model = SnippetPaletteModel::with_test_data();
 
         model.set_search_query("VS Code");
 
         assert_eq!(model.visible_count(), 1);
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
-            Some("clipboard-bug-template")
+            Some("history-code")
         );
     }
 
     #[test]
     fn create_new_item_selects_inserted_record() {
-        let mut model = SnippetPaletteModel::new();
+        let mut model = SnippetPaletteModel::with_test_data();
+        assert!(model.select_section(SnippetSection::Template));
 
         let new_id = model.create_new_item();
 
-        assert_eq!(new_id.as_deref(), Some("history-new-8"));
+        assert_eq!(new_id.as_deref(), Some("template-new-4"));
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
-            Some("history-new-8")
-        );
-        assert_eq!(
-            model
-                .selected_snippet()
-                .map(|snippet| snippet.source.as_str()),
-            Some("Safari")
+            Some("template-new-4")
         );
     }
 
     #[test]
+    fn ingest_clipboard_capture_reorders_duplicates_without_growing_history() {
+        let mut model = SnippetPaletteModel::with_test_data();
+        let original_history_count = model.section_total_count(SnippetSection::History);
+        let duplicate_capture = ClipboardCapture {
+            sequence_number: 2,
+            kind_label: "TEXT".into(),
+            title: "CopyQはクリップボード管理ツールです。".into(),
+            summary: "テキスト、画像、その他のデータをコピーすると、自動的に履歴に保存されます。".into(),
+            content: "CopyQはクリップボード管理ツールです。テキスト、画像、その他のデータをコピーすると、自動的に履歴に保存されます。".into(),
+            note: None,
+            tags: vec!["browser".into()],
+            source: "ZWG Terminal".into(),
+            created_label: "2026年3月18日 10:00:00".into(),
+            captured_at_epoch_secs: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+        };
+
+        assert!(model.ingest_clipboard_capture(duplicate_capture));
+        assert_eq!(
+            model.section_total_count(SnippetSection::History),
+            original_history_count
+        );
+        assert_eq!(
+            model.selected_snippet().map(|snippet| snippet.id.as_str()),
+            Some("history-copyq")
+        );
+        assert_eq!(model.snippets()[0].source, "ZWG Terminal");
+    }
+
+    #[test]
     fn relative_created_label_formats_minutes_hours_and_days() {
-        let model = SnippetPaletteModel::new();
+        let model = SnippetPaletteModel::with_test_data();
         let snippets = model.snippets();
 
         assert_eq!(
@@ -735,9 +830,18 @@ mod tests {
             Some("15分前")
         );
         assert_eq!(
-            snippets[9].relative_created_label().as_deref(),
-            Some("2時間前")
+            snippets[2].relative_created_label().as_deref(),
+            Some("30分前")
         );
-        assert_eq!(snippets[2].relative_created_label(), None);
+        assert_eq!(snippets[3].relative_created_label(), None);
+    }
+
+    #[test]
+    fn clear_history_retains_templates() {
+        let mut model = SnippetPaletteModel::with_test_data();
+
+        assert!(model.clear_history());
+        assert_eq!(model.section_total_count(SnippetSection::History), 0);
+        assert_eq!(model.section_total_count(SnippetSection::Template), 3);
     }
 }

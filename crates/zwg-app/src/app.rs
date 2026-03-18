@@ -7,7 +7,7 @@ use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -26,6 +26,10 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use crate::ai::{
     default_model_for_provider, next_ai_provider, resolve_ai_api_key, resolve_ai_model,
     sanitize_ai_provider,
+};
+use crate::clipboard_monitor::{
+    ClipboardCapture, ClipboardListenerRegistration, install_clipboard_monitor_hook,
+    register_clipboard_listener, snapshot_current_clipboard,
 };
 use crate::config::{
     AppConfig, DEFAULT_TERMINAL_FONT_FAMILY, DEFAULT_UI_FONT_FAMILY,
@@ -605,6 +609,8 @@ enum AiSettingsImeTarget {
 pub struct RootView {
     state: Entity<AppState>,
     focus_handle: FocusHandle,
+    clipboard_listener: Option<ClipboardListenerRegistration>,
+    last_clipboard_sequence: Option<u32>,
     show_shell_menu: bool,
     show_settings: bool,
     show_snippet_palette: bool,
@@ -712,10 +718,13 @@ impl AppState {
 impl RootView {
     pub fn new(state: Entity<AppState>, _cx: &mut Context<Self>) -> Self {
         install_input_method_hook();
+        install_clipboard_monitor_hook();
 
         Self {
             state,
             focus_handle: _cx.focus_handle(),
+            clipboard_listener: None,
+            last_clipboard_sequence: None,
             show_shell_menu: false,
             show_settings: false,
             show_snippet_palette: false,
@@ -732,6 +741,45 @@ impl RootView {
             last_save_time: Instant::now(),
             bounds_dirty: false,
         }
+    }
+
+    pub fn attach_clipboard_monitor(&mut self, window: &Window, cx: &mut Context<Self>) {
+        if self.clipboard_listener.is_some() {
+            return;
+        }
+
+        let Some((listener, event_rx, initial_sequence)) = register_clipboard_listener(window)
+        else {
+            log::warn!("Clipboard listener registration skipped");
+            return;
+        };
+
+        self.clipboard_listener = Some(listener);
+        self.last_clipboard_sequence = Some(initial_sequence);
+
+        if !self.snippet_palette.has_history_items() {
+            self.capture_current_clipboard_to_history(false, cx);
+        }
+
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_, cx: &mut AsyncApp| {
+            loop {
+                let Ok(event) = event_rx.recv_async().await else {
+                    break;
+                };
+                cx.background_executor()
+                    .timer(Duration::from_millis(40))
+                    .await;
+                let _ = this.update(cx, |view: &mut RootView, cx| {
+                    if view.last_clipboard_sequence == Some(event.sequence_number) {
+                        return;
+                    }
+                    view.last_clipboard_sequence = Some(event.sequence_number);
+                    view.capture_current_clipboard_to_history(false, cx);
+                });
+            }
+        })
+        .detach();
     }
 
     fn compute_ai_settings_ime_target(&self) -> Option<AiSettingsImeTarget> {
@@ -1186,6 +1234,7 @@ impl RootView {
             }
         }
 
+        self.snippet_palette.clear_history();
         self.app_notice = None;
     }
 
@@ -1458,6 +1507,13 @@ impl RootView {
     }
 
     fn create_new_snippet_item(&mut self, cx: &mut Context<Self>) {
+        if self.snippet_palette.active_section() == SnippetSection::History {
+            if self.capture_current_clipboard_to_history(true, cx) {
+                cx.notify();
+            }
+            return;
+        }
+
         let section_label = self.snippet_palette.active_section().title().to_string();
         if self.snippet_palette.create_new_item().is_some() {
             self.show_app_notice(
@@ -1468,6 +1524,53 @@ impl RootView {
             );
             cx.notify();
         }
+    }
+
+    fn capture_current_clipboard_to_history(
+        &mut self,
+        show_notice: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(capture) = snapshot_current_clipboard() else {
+            if show_notice {
+                self.show_app_notice(
+                    "履歴へ追加できませんでした",
+                    "現在のクリップボードには取り込める項目がありません。",
+                    1800,
+                    cx,
+                );
+            }
+            return false;
+        };
+
+        self.handle_monitored_clipboard_capture(capture, show_notice, cx)
+    }
+
+    fn handle_monitored_clipboard_capture(
+        &mut self,
+        capture: ClipboardCapture,
+        show_notice: bool,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        self.last_clipboard_sequence = Some(capture.sequence_number);
+        if !self
+            .snippet_palette
+            .ingest_clipboard_capture(capture.clone())
+        {
+            return false;
+        }
+
+        if show_notice {
+            self.show_app_notice(
+                "履歴へ追加しました",
+                format!("{} からコピーした項目を保存しました。", capture.source),
+                1600,
+                cx,
+            );
+        }
+
+        cx.notify();
+        true
     }
 
     fn cycle_snippet_sections(&mut self, step: isize, cx: &mut Context<Self>) {
