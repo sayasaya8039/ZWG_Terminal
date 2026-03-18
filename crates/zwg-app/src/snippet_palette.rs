@@ -1,7 +1,34 @@
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnippetSection {
+    History,
+    Template,
+}
+
+impl SnippetSection {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::History => "履歴",
+            Self::Template => "定型文",
+        }
+    }
+
+    pub fn empty_label(self) -> &'static str {
+        match self {
+            Self::History => "履歴がありません",
+            Self::Template => "定型文がありません",
+        }
+    }
+
+    fn all() -> [Self; 2] {
+        [Self::History, Self::Template]
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SnippetTab {
     pub id: String,
     pub title: String,
+    pub section: SnippetSection,
     pub shortcut_hint: Option<String>,
 }
 
@@ -23,6 +50,7 @@ pub struct SnippetRecord {
 pub struct SnippetPaletteModel {
     tabs: Vec<SnippetTab>,
     snippets: Vec<SnippetRecord>,
+    active_section: SnippetSection,
     active_tab_id: String,
     selected_snippet_id: Option<String>,
     search_query: String,
@@ -41,6 +69,7 @@ impl SnippetPaletteModel {
         let mut model = Self {
             tabs,
             snippets,
+            active_section: SnippetSection::History,
             active_tab_id,
             selected_snippet_id: None,
             search_query: String::new(),
@@ -50,13 +79,44 @@ impl SnippetPaletteModel {
         model
     }
 
-    pub fn tabs(&self) -> &[SnippetTab] {
-        &self.tabs
+    pub fn section_tabs(&self) -> Vec<&SnippetTab> {
+        self.tabs
+            .iter()
+            .filter(|tab| tab.section == self.active_section)
+            .collect()
     }
 
     #[cfg(test)]
     pub fn snippets(&self) -> &[SnippetRecord] {
         &self.snippets
+    }
+
+    pub fn active_section(&self) -> SnippetSection {
+        self.active_section
+    }
+
+    pub fn section_total_count(&self, section: SnippetSection) -> usize {
+        self.snippets
+            .iter()
+            .filter(|snippet| {
+                self.tab_for_id(&snippet.tab_id)
+                    .map(|tab| tab.section == section)
+                    .unwrap_or(false)
+            })
+            .count()
+    }
+
+    pub fn section_pinned_count(&self, section: SnippetSection) -> usize {
+        self.snippets
+            .iter()
+            .filter(|snippet| {
+                snippet.pinned
+                    && self
+                        .tab_for_id(&snippet.tab_id)
+                        .map(|tab| tab.section == section)
+                        .unwrap_or(false)
+            })
+            .count()
     }
 
     pub fn active_tab(&self) -> Option<&SnippetTab> {
@@ -78,14 +138,11 @@ impl SnippetPaletteModel {
     }
 
     pub fn total_count(&self) -> usize {
-        self.snippets.len()
+        self.section_total_count(self.active_section)
     }
 
     pub fn pinned_count(&self) -> usize {
-        self.snippets
-            .iter()
-            .filter(|snippet| snippet.pinned)
-            .count()
+        self.section_pinned_count(self.active_section)
     }
 
     #[cfg(test)]
@@ -103,6 +160,11 @@ impl SnippetPaletteModel {
     pub fn visible_snippets(&self) -> Vec<&SnippetRecord> {
         filter_snippets(&self.snippets, &self.search_query)
             .into_iter()
+            .filter(|snippet| {
+                self.tab_for_id(&snippet.tab_id)
+                    .map(|tab| tab.section == self.active_section)
+                    .unwrap_or(false)
+            })
             .filter(|snippet| snippet.tab_id == self.active_tab_id)
             .filter(|snippet| !self.pinned_only || snippet.pinned)
             .collect()
@@ -130,7 +192,8 @@ impl SnippetPaletteModel {
     }
 
     pub fn select_tab(&mut self, tab_id: &str) -> bool {
-        if self.tabs.iter().any(|tab| tab.id == tab_id) {
+        if let Some(tab) = self.tabs.iter().find(|tab| tab.id == tab_id) {
+            self.active_section = tab.section;
             self.active_tab_id = tab_id.to_string();
             self.sync_selection();
             return true;
@@ -140,17 +203,42 @@ impl SnippetPaletteModel {
     }
 
     pub fn cycle_tabs(&mut self, step: isize) -> bool {
-        let Some(current_index) = self
-            .tabs
+        let visible_tabs = self.section_tabs();
+        let Some(current_index) = visible_tabs
             .iter()
             .position(|tab| tab.id == self.active_tab_id)
         else {
             return false;
         };
         let next_index =
-            (current_index as isize + step).rem_euclid(self.tabs.len() as isize) as usize;
-        let next_id = self.tabs[next_index].id.clone();
+            (current_index as isize + step).rem_euclid(visible_tabs.len() as isize) as usize;
+        let next_id = visible_tabs[next_index].id.clone();
         self.active_tab_id = next_id;
+        self.sync_selection();
+        true
+    }
+
+    pub fn select_section(&mut self, section: SnippetSection) -> bool {
+        if self.active_section == section {
+            return false;
+        }
+
+        self.active_section = section;
+        self.ensure_active_tab_matches_section();
+        self.sync_selection();
+        true
+    }
+
+    pub fn cycle_sections(&mut self, step: isize) -> bool {
+        let sections = SnippetSection::all();
+        let current_index = sections
+            .iter()
+            .position(|section| *section == self.active_section)
+            .unwrap_or(0);
+        let next_index =
+            (current_index as isize + step).rem_euclid(sections.len() as isize) as usize;
+        self.active_section = sections[next_index];
+        self.ensure_active_tab_matches_section();
         self.sync_selection();
         true
     }
@@ -257,7 +345,31 @@ impl SnippetPaletteModel {
             .collect()
     }
 
+    fn tab_for_id(&self, tab_id: &str) -> Option<&SnippetTab> {
+        self.tabs.iter().find(|tab| tab.id == tab_id)
+    }
+
+    fn ensure_active_tab_matches_section(&mut self) {
+        let matches_section = self
+            .tab_for_id(&self.active_tab_id)
+            .map(|tab| tab.section == self.active_section)
+            .unwrap_or(false);
+
+        if matches_section {
+            return;
+        }
+
+        if let Some(tab) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.section == self.active_section)
+        {
+            self.active_tab_id = tab.id.clone();
+        }
+    }
+
     fn sync_selection(&mut self) {
+        self.ensure_active_tab_matches_section();
         let visible = self.visible_snippet_ids();
         self.selected_snippet_id = match (self.selected_snippet_id.clone(), visible.first()) {
             (_, None) => None,
@@ -300,21 +412,25 @@ fn demo_tabs() -> Vec<SnippetTab> {
         SnippetTab {
             id: "clipboard".into(),
             title: "Clipboard".into(),
+            section: SnippetSection::History,
             shortcut_hint: Some("Alt+C".into()),
         },
         SnippetTab {
             id: "notes".into(),
             title: "Notes".into(),
+            section: SnippetSection::Template,
             shortcut_hint: Some("Alt+N".into()),
         },
         SnippetTab {
             id: "commands".into(),
             title: "Commands".into(),
+            section: SnippetSection::Template,
             shortcut_hint: Some("Alt+M".into()),
         },
         SnippetTab {
             id: "links".into(),
             title: "Links".into(),
+            section: SnippetSection::History,
             shortcut_hint: Some("Alt+L".into()),
         },
     ]
@@ -423,7 +539,7 @@ fn demo_snippets() -> Vec<SnippetRecord> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SnippetPaletteModel, filter_snippets};
+    use super::{SnippetPaletteModel, SnippetSection, filter_snippets};
 
     #[test]
     fn palette_model_selects_first_visible_snippet_by_default() {
@@ -433,6 +549,7 @@ mod tests {
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
             Some("clipboard-release-mail")
         );
+        assert_eq!(model.active_section(), SnippetSection::History);
         assert_eq!(model.active_tab_title(), "Clipboard");
     }
 
@@ -452,6 +569,7 @@ mod tests {
     fn switching_tabs_reselects_first_visible_item() {
         let mut model = SnippetPaletteModel::new();
 
+        assert!(model.select_section(SnippetSection::Template));
         assert!(model.select_tab("commands"));
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
@@ -459,11 +577,26 @@ mod tests {
         );
 
         assert!(model.cycle_tabs(1));
-        assert_eq!(model.active_tab_title(), "Links");
+        assert_eq!(model.active_tab_title(), "Notes");
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
-            Some("links-copyq")
+            Some("notes-weekly")
         );
+    }
+
+    #[test]
+    fn switching_sections_promotes_first_tab_in_target_section() {
+        let mut model = SnippetPaletteModel::new();
+
+        assert!(model.select_section(SnippetSection::Template));
+        assert_eq!(model.active_tab_title(), "Notes");
+        assert_eq!(
+            model.selected_snippet().map(|snippet| snippet.id.as_str()),
+            Some("notes-weekly")
+        );
+        assert!(model.cycle_sections(1));
+        assert_eq!(model.active_section(), SnippetSection::History);
+        assert_eq!(model.active_tab_title(), "Clipboard");
     }
 
     #[test]
@@ -481,6 +614,7 @@ mod tests {
     #[test]
     fn toggling_selected_pinned_updates_selected_item() {
         let mut model = SnippetPaletteModel::new();
+        assert!(model.select_section(SnippetSection::Template));
         assert!(model.select_tab("commands"));
         assert!(model.select("commands-review"));
 

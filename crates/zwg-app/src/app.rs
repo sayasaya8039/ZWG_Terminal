@@ -32,7 +32,7 @@ use crate::config::{
     SUPPORTED_TERMINAL_FONT_FAMILIES, WindowState, set_launch_on_login,
 };
 use crate::shell::{self, ShellType};
-use crate::snippet_palette::SnippetPaletteModel;
+use crate::snippet_palette::{SnippetPaletteModel, SnippetSection};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::terminal::TerminalSettings;
 use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
@@ -1435,9 +1435,10 @@ impl RootView {
         let Some(item) = self.snippet_palette.selected_snippet() else {
             return;
         };
+        let section_label = self.snippet_palette.active_section().title();
         cx.write_to_clipboard(ClipboardItem::new_string(item.content.clone()));
         self.show_app_notice(
-            "CopyQ 項目をコピーしました",
+            format!("{section_label}をコピーしました"),
             format!("{} をクリップボードへ送信しました。", item.title),
             2200,
             cx,
@@ -1452,6 +1453,18 @@ impl RootView {
 
     fn select_snippet_tab(&mut self, tab_id: &str, cx: &mut Context<Self>) {
         if self.snippet_palette.select_tab(tab_id) {
+            cx.notify();
+        }
+    }
+
+    fn select_snippet_section(&mut self, section: SnippetSection, cx: &mut Context<Self>) {
+        if self.snippet_palette.select_section(section) {
+            cx.notify();
+        }
+    }
+
+    fn cycle_snippet_sections(&mut self, step: isize, cx: &mut Context<Self>) {
+        if self.snippet_palette.cycle_sections(step) {
             cx.notify();
         }
     }
@@ -1517,6 +1530,7 @@ impl RootView {
     }
 
     fn delete_selected_snippet(&mut self, cx: &mut Context<Self>) {
+        let section_label = self.snippet_palette.active_section().title().to_string();
         let Some(title) = self
             .snippet_palette
             .selected_snippet()
@@ -1526,7 +1540,7 @@ impl RootView {
         };
         if self.snippet_palette.remove_selected() {
             self.show_app_notice(
-                "履歴項目を削除しました",
+                format!("{section_label}を削除しました"),
                 format!("{title} を現在の一覧から取り除きました。"),
                 1800,
                 cx,
@@ -1554,6 +1568,14 @@ impl RootView {
                 self.close_snippet_palette(window, cx);
                 true
             }
+            "up" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.cycle_snippet_tabs(-1, cx);
+                true
+            }
+            "down" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.cycle_snippet_tabs(1, cx);
+                true
+            }
             "up" => {
                 self.move_snippet_selection(-1, cx);
                 true
@@ -1563,7 +1585,7 @@ impl RootView {
                 true
             }
             "tab" => {
-                self.cycle_snippet_tabs(
+                self.cycle_snippet_sections(
                     if event.keystroke.modifiers.shift {
                         -1
                     } else {
@@ -1571,6 +1593,14 @@ impl RootView {
                     },
                     cx,
                 );
+                true
+            }
+            "left" if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.cycle_snippet_sections(-1, cx);
+                true
+            }
+            "right" if !event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.cycle_snippet_sections(1, cx);
                 true
             }
             "enter" => {
@@ -2139,6 +2169,8 @@ impl RootView {
         let total_count = self.snippet_palette.total_count();
         let pinned_count = self.snippet_palette.pinned_count();
         let active_tab_title = self.snippet_palette.active_tab_title().to_string();
+        let active_section = self.snippet_palette.active_section();
+        let active_section_label = active_section.title().to_string();
 
         let list_items = if visible.is_empty() {
             vec![
@@ -2157,7 +2189,7 @@ impl RootView {
                             .font_family(UI_FONT)
                             .text_size(px(13.0))
                             .text_color(rgb(TEXT))
-                            .child("このタブに表示できる項目がありません"),
+                            .child(active_section.empty_label()),
                     )
                     .child(
                         div()
@@ -2310,31 +2342,30 @@ impl RootView {
                 .collect::<Vec<_>>()
         };
 
-        let detail =
-            if let Some(item) = self.snippet_palette.selected_snippet().cloned() {
-                let tab_title = self
-                    .snippet_palette
-                    .tab_title_for(&item.tab_id)
-                    .unwrap_or("Clipboard")
-                    .to_string();
-                let content_lines = item
-                    .content
-                    .lines()
-                    .map(|line| {
-                        div()
-                            .font_family(MONO_FONT)
-                            .text_size(px(12.0))
-                            .text_color(rgb(TEXT))
-                            .child(if line.is_empty() {
-                                " ".to_string()
-                            } else {
-                                line.to_string()
-                            })
-                            .into_any_element()
-                    })
-                    .collect::<Vec<_>>();
+        let detail = if let Some(item) = self.snippet_palette.selected_snippet().cloned() {
+            let tab_title = self
+                .snippet_palette
+                .tab_title_for(&item.tab_id)
+                .unwrap_or("Clipboard")
+                .to_string();
+            let content_lines = item
+                .content
+                .lines()
+                .map(|line| {
+                    div()
+                        .font_family(MONO_FONT)
+                        .text_size(px(12.0))
+                        .text_color(rgb(TEXT))
+                        .child(if line.is_empty() {
+                            " ".to_string()
+                        } else {
+                            line.to_string()
+                        })
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>();
 
-                div()
+            div()
                     .flex_1()
                     .min_w(px(0.0))
                     .bg(rgb(PANEL_BG))
@@ -2490,32 +2521,34 @@ impl RootView {
                                     .font_family(UI_FONT)
                                     .text_size(px(11.0))
                                     .text_color(rgb(SUBTEXT1))
-                                    .child("タイプで絞り込み / Tab でタブ切替 / Enter でコピー"),
+                                    .child(
+                                        "タイプで絞り込み / Tab・←→ で履歴と定型文を切替 / Enter でコピー",
+                                    ),
                             )
                             .child(
                                 div()
                                     .font_family(UI_FONT)
                                     .text_size(px(11.0))
                                     .text_color(rgb(MUTED))
-                                    .child("Delete で削除 / Ctrl+P でピン"),
+                                    .child("Ctrl+↑↓ でサブタブ切替 / Delete で削除 / Ctrl+P でピン"),
                             ),
                     )
                     .into_any_element()
-            } else {
-                div()
-                    .flex_1()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .child(
-                        div()
-                            .font_family(UI_FONT)
-                            .text_size(px(13.0))
-                            .text_color(rgb(SUBTEXT1))
-                            .child("CopyQ ライク項目がありません"),
-                    )
-                    .into_any_element()
-            };
+        } else {
+            div()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .font_family(UI_FONT)
+                        .text_size(px(13.0))
+                        .text_color(rgb(SUBTEXT1))
+                        .child(active_section.empty_label()),
+                )
+                .into_any_element()
+        };
 
         Some(
             div()
@@ -2578,7 +2611,7 @@ impl RootView {
                                         .text_size(px(13.0))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(rgb(TEXT))
-                                        .child("CopyQ ライク履歴"),
+                                        .child("CopyQ ライクパネル"),
                                 )
                                 .child(
                                     div()
@@ -2586,8 +2619,8 @@ impl RootView {
                                         .text_size(px(11.0))
                                         .text_color(rgb(SUBTEXT1))
                                         .child(format!(
-                                            "{} 件 / ピン留め {} 件 / 現在 {}",
-                                            total_count, pinned_count, active_tab_title
+                                            "{} {} 件 / ピン留め {} 件 / 現在 {}",
+                                            active_section_label, total_count, pinned_count, active_tab_title
                                         )),
                                 ),
                         )
@@ -2670,7 +2703,7 @@ impl RootView {
                                                             rgb(TEXT)
                                                         })
                                                         .child(if search_query.is_empty() {
-                                                            "Search CopyQ items".to_string()
+                                                            format!("{active_section_label}を検索")
                                                         } else {
                                                             search_query.clone()
                                                         }),
@@ -2681,8 +2714,80 @@ impl RootView {
                                                 .flex()
                                                 .gap(px(8.0))
                                                 .children(
+                                                    [SnippetSection::History, SnippetSection::Template]
+                                                        .into_iter()
+                                                        .map(|section| {
+                                                            let active = active_section == section;
+                                                            let section_value = section;
+
+                                                            div()
+                                                                .id(ElementId::Name(
+                                                                    format!(
+                                                                        "snippet-section-{}",
+                                                                        section.title()
+                                                                    )
+                                                                    .into(),
+                                                                ))
+                                                                .rounded(px(11.0))
+                                                                .border_1()
+                                                                .border_color(if active {
+                                                                    rgba(0x0A84FF99)
+                                                                } else {
+                                                                    rgba(0xffffff10)
+                                                                })
+                                                                .bg(if active {
+                                                                    rgba(0x0A84FF2C)
+                                                                } else {
+                                                                    rgba(0xffffff08)
+                                                                })
+                                                                .px(px(12.0))
+                                                                .py(px(8.0))
+                                                                .cursor_pointer()
+                                                                .hover(|style| {
+                                                                    style.bg(rgba(0xffffff14))
+                                                                })
+                                                                .on_mouse_down(
+                                                                    MouseButton::Left,
+                                                                    cx.listener(
+                                                                        move |this,
+                                                                              _: &MouseDownEvent,
+                                                                              _window,
+                                                                              cx| {
+                                                                            this.select_snippet_section(
+                                                                                section_value,
+                                                                                cx,
+                                                                            );
+                                                                        },
+                                                                    ),
+                                                                )
+                                                                .flex()
+                                                                .items_center()
+                                                                .justify_center()
+                                                                .child(
+                                                                    div()
+                                                                        .font_family(UI_FONT)
+                                                                        .text_size(px(12.0))
+                                                                        .font_weight(
+                                                                            FontWeight::MEDIUM,
+                                                                        )
+                                                                        .text_color(rgb(if active {
+                                                                            TEXT
+                                                                        } else {
+                                                                            SUBTEXT0
+                                                                        }))
+                                                                        .child(section.title()),
+                                                                )
+                                                                .into_any_element()
+                                                        }),
+                                                )
+                                        )
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .gap(px(8.0))
+                                                .children(
                                                     self.snippet_palette
-                                                        .tabs()
+                                                        .section_tabs()
                                                         .iter()
                                                         .map(|tab| {
                                                             let tab_id = tab.id.clone();
@@ -2770,9 +2875,16 @@ impl RootView {
                                                 .text_size(px(11.0))
                                                 .text_color(rgb(MUTED))
                                                 .child(if pinned_only {
-                                                    "ピン留めのみ表示中"
+                                                    format!("{active_section_label}のピン留めのみ表示中")
                                                 } else {
-                                                    "タイプ入力で即時フィルタ。Ctrl+F 相当は不要です。"
+                                                    format!(
+                                                        "{} と定型文は上のボタンで切り替えます。",
+                                                        if active_section == SnippetSection::History {
+                                                            "履歴"
+                                                        } else {
+                                                            "定型文"
+                                                        }
+                                                    )
                                                 }),
                                         ),
                                 )
