@@ -137,6 +137,7 @@ pub(crate) struct TemplateEditorModal {
     focus_handle: FocusHandle,
     draft: TemplateEditorDraft,
     active_field: TemplateEditorField,
+    cursor: usize, // byte offset into active field
     preedit_text: String,
     marked_range: Option<Range<usize>>,
     pending_outcome: Option<TemplateEditorOutcome>,
@@ -149,6 +150,7 @@ impl TemplateEditorModal {
             focus_handle: cx.focus_handle(),
             draft: TemplateEditorDraft::default(),
             active_field: TemplateEditorField::Name,
+            cursor: 0,
             preedit_text: String::new(),
             marked_range: None,
             pending_outcome: None,
@@ -210,8 +212,9 @@ impl TemplateEditorModal {
     ) {
         if self.active_field != field {
             self.clear_preedit();
+            self.active_field = field;
+            self.cursor = self.active_text().len();
         }
-        self.active_field = field;
         self.focus(window);
         cx.notify();
     }
@@ -219,7 +222,16 @@ impl TemplateEditorModal {
     fn cycle_field(&mut self, step: isize, cx: &mut Context<Self>) {
         self.clear_preedit();
         self.active_field = self.active_field.next(step);
+        self.cursor = self.active_text().len(); // cursor at end of new field
         cx.notify();
+    }
+
+    /// Clamp cursor to valid position within active field.
+    fn clamp_cursor(&mut self) {
+        let len = self.active_text().len();
+        if self.cursor > len {
+            self.cursor = len;
+        }
     }
 
     fn insert_text(&mut self, text: &str, cx: &mut Context<Self>) {
@@ -227,20 +239,63 @@ impl TemplateEditorModal {
             return;
         }
         self.clear_preedit();
-        self.active_text_mut().push_str(text);
+        self.clamp_cursor();
+        let cur = self.cursor;
+        self.draft.field_mut(self.active_field).insert_str(cur, text);
+        self.cursor = cur + text.len();
         cx.notify();
     }
 
     fn backspace(&mut self, cx: &mut Context<Self>) {
-        if pop_last_grapheme(self.active_text_mut()) {
-            cx.notify();
+        self.clamp_cursor();
+        if self.cursor == 0 {
+            return;
         }
+        let cur = self.cursor;
+        let prev = {
+            let t = self.draft.field(self.active_field);
+            t[..cur].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
+        };
+        self.draft.field_mut(self.active_field).drain(prev..cur);
+        self.cursor = prev;
+        cx.notify();
     }
 
     fn delete_forward(&mut self, cx: &mut Context<Self>) {
-        if pop_last_grapheme(self.active_text_mut()) {
-            cx.notify();
-        }
+        self.clamp_cursor();
+        let cur = self.cursor;
+        let next = {
+            let t = self.draft.field(self.active_field);
+            if cur >= t.len() { return; }
+            t[cur..].char_indices().nth(1).map(|(i, _)| cur + i).unwrap_or(t.len())
+        };
+        self.draft.field_mut(self.active_field).drain(cur..next);
+        cx.notify();
+    }
+
+    fn move_cursor(&mut self, direction: isize, cx: &mut Context<Self>) {
+        self.clamp_cursor();
+        let cur = self.cursor;
+        let new_pos = {
+            let t = self.draft.field(self.active_field);
+            if direction < 0 {
+                t[..cur].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
+            } else {
+                t[cur..].char_indices().nth(1).map(|(i, _)| cur + i).unwrap_or(t.len())
+            }
+        };
+        self.cursor = new_pos;
+        cx.notify();
+    }
+
+    fn move_cursor_home(&mut self, cx: &mut Context<Self>) {
+        self.cursor = 0;
+        cx.notify();
+    }
+
+    fn move_cursor_end(&mut self, cx: &mut Context<Self>) {
+        self.cursor = self.active_text().len();
+        cx.notify();
     }
 
     fn toggle_favorite(&mut self, cx: &mut Context<Self>) {
@@ -319,7 +374,20 @@ impl TemplateEditorModal {
                 self.delete_forward(cx);
                 return true;
             }
-            "left" | "right" | "home" | "end" if !composing => {
+            "left" if !composing => {
+                self.move_cursor(-1, cx);
+                return true;
+            }
+            "right" if !composing => {
+                self.move_cursor(1, cx);
+                return true;
+            }
+            "home" if !composing => {
+                self.move_cursor_home(cx);
+                return true;
+            }
+            "end" if !composing => {
+                self.move_cursor_end(cx);
                 return true;
             }
             "v" if !composing
@@ -534,13 +602,15 @@ impl Render for TemplateEditorModal {
                     }))
                     .relative()
                     .w(px(modal_width))
-                    .h(px(modal_height))
+                    .max_h(px(modal_height))
                     .rounded(px(18.0))
                     .overflow_hidden()
                     .border_1()
                     .border_color(rgba(0xffffff12))
                     .bg(rgb(UI_BG))
                     .shadow_lg()
+                    .flex()
+                    .flex_col()
                     .child(template_editor_input_overlay(
                         entity.clone(),
                         self.focus_handle.clone(),
@@ -599,6 +669,7 @@ impl Render for TemplateEditorModal {
                                 self.display_text_for(TemplateEditorField::Name),
                                 "例: メールの署名",
                                 self.active_field == TemplateEditorField::Name,
+                                if self.active_field == TemplateEditorField::Name { Some(self.cursor) } else { None },
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                     this.focus_field(TemplateEditorField::Name, window, cx);
                                 }),
@@ -618,6 +689,7 @@ impl Render for TemplateEditorModal {
                                 self.display_text_for(TemplateEditorField::Note),
                                 "この定型文の用途",
                                 self.active_field == TemplateEditorField::Note,
+                                if self.active_field == TemplateEditorField::Note { Some(self.cursor) } else { None },
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                     this.focus_field(TemplateEditorField::Note, window, cx);
                                 }),
@@ -627,6 +699,7 @@ impl Render for TemplateEditorModal {
                                 self.display_text_for(TemplateEditorField::Tags),
                                 "タグをカンマ区切りで入力: 仕事,メール",
                                 self.active_field == TemplateEditorField::Tags,
+                                if self.active_field == TemplateEditorField::Tags { Some(self.cursor) } else { None },
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                     this.focus_field(TemplateEditorField::Tags, window, cx);
                                 }),
@@ -702,9 +775,11 @@ fn template_editor_input_box(
     value: String,
     placeholder: &'static str,
     active: bool,
+    cursor_byte: Option<usize>,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
     let is_empty = value.is_empty();
+    let caret = div().w(px(1.5)).h(px(18.0)).bg(rgb(ACCENT)).flex_shrink_0();
     let mut container = div()
         .w_full()
         .h(px(52.0))
@@ -724,35 +799,65 @@ fn template_editor_input_box(
         .items_center()
         .overflow_hidden();
 
-    if is_empty && !active {
+    if !active {
+        // Inactive: show text or placeholder
         container = container.child(
             div()
                 .font_family(UI_FONT)
                 .text_size(px(13.0))
-                .text_color(rgb(SUBTEXT1))
-                .child(placeholder),
+                .text_color(rgb(if is_empty { SUBTEXT1 } else { TEXT }))
+                .child(if is_empty {
+                    placeholder.to_string()
+                } else {
+                    value
+                }),
         );
-    } else if active {
+    } else if is_empty {
+        // Active + empty: caret then placeholder
+        container = container.child(
+            div()
+                .flex()
+                .items_center()
+                .font_family(UI_FONT)
+                .text_size(px(13.0))
+                .child(caret)
+                .child(div().text_color(rgb(SUBTEXT1)).child(placeholder)),
+        );
+    } else if let Some(pos) = cursor_byte {
+        // Active + text + cursor position
+        let pos = pos.min(value.len());
+        // Snap to char boundary
+        let pos = value[..pos]
+            .char_indices()
+            .last()
+            .map(|(i, c)| i + c.len_utf8())
+            .unwrap_or(0)
+            .min(value.len());
+        let before = &value[..pos];
+        let after = &value[pos..];
         let mut row = div()
             .flex()
             .items_center()
             .font_family(UI_FONT)
             .text_size(px(13.0));
-
-        if is_empty {
-            row = row.child(div().text_color(rgb(SUBTEXT1)).child(placeholder));
-        } else {
-            row = row.child(div().text_color(rgb(TEXT)).child(value));
+        if !before.is_empty() {
+            row = row.child(div().text_color(rgb(TEXT)).child(before.to_string()));
         }
-        row = row.child(div().w(px(1.5)).h(px(18.0)).bg(rgb(ACCENT)).flex_shrink_0());
+        row = row.child(caret);
+        if !after.is_empty() {
+            row = row.child(div().text_color(rgb(TEXT)).child(after.to_string()));
+        }
         container = container.child(row);
     } else {
+        // Active + text, no cursor info: caret at end
         container = container.child(
             div()
+                .flex()
+                .items_center()
                 .font_family(UI_FONT)
                 .text_size(px(13.0))
-                .text_color(rgb(TEXT))
-                .child(value),
+                .child(div().text_color(rgb(TEXT)).child(value))
+                .child(caret),
         );
     }
 
