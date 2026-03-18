@@ -494,6 +494,12 @@ impl EntityInputHandler for TemplateEditorModal {
 
 impl Render for TemplateEditorModal {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        debug_write(format!(
+            "[RENDER] TemplateEditorModal focused={} field={:?} text={:?}\n",
+            self.focus_handle.is_focused(_window),
+            self.active_field,
+            self.active_text(),
+        ));
         let modal_width = 654.0;
         let modal_height = 720.0;
         let entity = cx.entity();
