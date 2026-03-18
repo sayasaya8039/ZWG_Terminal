@@ -8,7 +8,9 @@ use uuid::Uuid;
 use crate::clipboard_monitor::ClipboardCapture;
 
 const HISTORY_FILE_NAME: &str = "clipboard-history.json";
+const TEMPLATE_FILE_NAME: &str = "snippet-templates.json";
 const HISTORY_STORE_VERSION: u32 = 1;
+const TEMPLATE_STORE_VERSION: u32 = 1;
 const HISTORY_LIMIT: usize = 200;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,7 +78,7 @@ struct PersistedHistory {
 
 impl SnippetPaletteModel {
     pub fn new() -> Self {
-        Self::from_records(load_history_records(), default_template_records())
+        Self::from_records(load_history_records(), load_template_records())
     }
 
     #[cfg(test)]
@@ -273,16 +275,23 @@ impl SnippetPaletteModel {
             .find(|snippet| snippet.id == selected_id)?;
         snippet.pinned = !snippet.pinned;
         let pinned = snippet.pinned;
-        let should_persist = snippet.section == SnippetSection::History;
-        if should_persist {
-            self.persist_history();
+        match snippet.section {
+            SnippetSection::History => self.persist_history(),
+            SnippetSection::Template => self.persist_templates(),
         }
         self.sync_selection();
         Some(pinned)
     }
 
-    pub fn create_new_item(&mut self) -> Option<String> {
-        if self.active_section != SnippetSection::Template {
+    pub fn create_template_item(
+        &mut self,
+        title: String,
+        content: String,
+        note: Option<String>,
+        tags: Vec<String>,
+        pinned: bool,
+    ) -> Option<String> {
+        if title.trim().is_empty() || content.trim().is_empty() {
             return None;
         }
 
@@ -293,16 +302,21 @@ impl SnippetPaletteModel {
             .count()
             + 1;
         let new_id = format!("template-new-{next_index}");
+        let cleaned_note = note.and_then(|value| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        });
+        let summary = template_summary(cleaned_note.as_deref(), &content);
         let new_item = SnippetRecord {
             id: new_id.clone(),
             section: SnippetSection::Template,
-            kind_label: "TEXT".into(),
-            title: "新規".into(),
-            summary: "text".into(),
-            content: "text".into(),
-            note: None,
-            tags: Vec::new(),
-            pinned: false,
+            kind_label: template_kind_label(&content).to_string(),
+            title: title.trim().to_string(),
+            summary,
+            content: content.trim_end().to_string(),
+            note: cleaned_note,
+            tags,
+            pinned,
             source: "手動作成".into(),
             created_label: "たった今".into(),
             captured_at_epoch_secs: None,
@@ -315,6 +329,7 @@ impl SnippetPaletteModel {
         self.snippets.insert(insert_at, new_item);
         self.selected_snippet_id = Some(new_id.clone());
         self.sync_selection();
+        self.persist_templates();
         Some(new_id)
     }
 
@@ -403,8 +418,10 @@ impl SnippetPaletteModel {
             .cloned()
             .or_else(|| visible_after.last().cloned());
         self.sync_selection();
-        if removed == Some(SnippetSection::History) {
-            self.persist_history();
+        match removed {
+            Some(SnippetSection::History) => self.persist_history(),
+            Some(SnippetSection::Template) => self.persist_templates(),
+            None => {}
         }
         true
     }
@@ -451,6 +468,19 @@ impl SnippetPaletteModel {
                 .collect::<Vec<_>>(),
         ) {
             log::warn!("Failed to save clipboard history: {}", err);
+        }
+    }
+
+    fn persist_templates(&self) {
+        if let Err(err) = save_template_records(
+            &self
+                .snippets
+                .iter()
+                .filter(|snippet| snippet.section == SnippetSection::Template)
+                .cloned()
+                .collect::<Vec<_>>(),
+        ) {
+            log::warn!("Failed to save snippet templates: {}", err);
         }
     }
 
@@ -507,6 +537,25 @@ fn history_store_path() -> PathBuf {
         .join(HISTORY_FILE_NAME)
 }
 
+fn template_store_path() -> PathBuf {
+    #[cfg(test)]
+    {
+        return std::env::temp_dir()
+            .join("zwg-terminal-tests")
+            .join(format!(
+                "{}-{}.json",
+                TEMPLATE_FILE_NAME,
+                std::process::id()
+            ));
+    }
+
+    #[cfg(not(test))]
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("zwg-terminal")
+        .join(TEMPLATE_FILE_NAME)
+}
+
 fn load_history_records() -> Vec<SnippetRecord> {
     let path = history_store_path();
     let Ok(contents) = fs::read_to_string(path) else {
@@ -522,6 +571,21 @@ fn load_history_records() -> Vec<SnippetRecord> {
         .collect()
 }
 
+fn load_template_records() -> Vec<SnippetRecord> {
+    let path = template_store_path();
+    let Ok(contents) = fs::read_to_string(path) else {
+        return default_template_records();
+    };
+    let Ok(store) = serde_json::from_str::<PersistedHistory>(&contents) else {
+        return default_template_records();
+    };
+    store
+        .records
+        .into_iter()
+        .filter(|record| record.section == SnippetSection::Template)
+        .collect::<Vec<_>>()
+}
+
 fn save_history_records(records: &[SnippetRecord]) -> std::io::Result<()> {
     let path = history_store_path();
     if records.is_empty() {
@@ -534,6 +598,21 @@ fn save_history_records(records: &[SnippetRecord]) -> std::io::Result<()> {
 
     let store = PersistedHistory {
         version: HISTORY_STORE_VERSION,
+        records: records.to_vec(),
+    };
+    let contents = serde_json::to_string_pretty(&store)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    fs::write(path, contents)
+}
+
+fn save_template_records(records: &[SnippetRecord]) -> std::io::Result<()> {
+    let path = template_store_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let store = PersistedHistory {
+        version: TEMPLATE_STORE_VERSION,
         records: records.to_vec(),
     };
     let contents = serde_json::to_string_pretty(&store)
@@ -607,6 +686,44 @@ fn format_relative_epoch_secs(epoch_secs: u64) -> String {
         0..=59 => format!("{}分前", elapsed_minutes.max(1)),
         60..=1439 => format!("{}時間前", elapsed_minutes / 60),
         _ => format!("{}日前", elapsed_minutes / 1440),
+    }
+}
+
+fn template_summary(note: Option<&str>, content: &str) -> String {
+    if let Some(note) = note.map(str::trim).filter(|note| !note.is_empty()) {
+        return truncate_summary(note, 72);
+    }
+
+    let flattened = content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ");
+    truncate_summary(&flattened, 72)
+}
+
+fn truncate_summary(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.chars().count() <= max_chars {
+        return trimmed.to_string();
+    }
+
+    let truncated = trimmed.chars().take(max_chars).collect::<String>();
+    format!("{}…", truncated.trim_end())
+}
+
+fn template_kind_label(content: &str) -> &'static str {
+    let trimmed = content.trim();
+    if trimmed.contains('{')
+        || trimmed.contains("=>")
+        || trimmed.contains("fn ")
+        || trimmed.contains("function ")
+        || trimmed.contains("cargo ")
+    {
+        "CODE"
+    } else {
+        "TEXT"
     }
 }
 
@@ -775,12 +892,24 @@ mod tests {
         let mut model = SnippetPaletteModel::with_test_data();
         assert!(model.select_section(SnippetSection::Template));
 
-        let new_id = model.create_new_item();
+        let new_id = model.create_template_item(
+            "新規".into(),
+            "text".into(),
+            Some("text".into()),
+            vec!["memo".into()],
+            false,
+        );
 
         assert_eq!(new_id.as_deref(), Some("template-new-4"));
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
             Some("template-new-4")
+        );
+        assert_eq!(
+            model
+                .selected_snippet()
+                .map(|snippet| snippet.summary.as_str()),
+            Some("text")
         );
     }
 
