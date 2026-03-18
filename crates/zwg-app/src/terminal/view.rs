@@ -229,6 +229,22 @@ fn take_ime_endcomposition_texts() -> Vec<String> {
 }
 
 #[cfg(target_os = "windows")]
+fn take_ime_endcomposition_texts_for_terminal(input_suppressed: bool) -> Vec<String> {
+    let texts = take_ime_endcomposition_texts();
+    if input_suppressed {
+        if !texts.is_empty() && terminal_ime_trace_enabled() {
+            log::debug!(
+                "IME_TERM dropped {} queued endcomposition item(s) while input was suppressed",
+                texts.len()
+            );
+        }
+        Vec::new()
+    } else {
+        texts
+    }
+}
+
+#[cfg(target_os = "windows")]
 fn read_ime_result_text(hwnd: windows::Win32::Foundation::HWND) -> Option<String> {
     use windows::Win32::UI::Input::Ime::{
         GCS_COMPREADSTR, GCS_COMPSTR, GCS_RESULTREADSTR, GCS_RESULTSTR, IME_COMPOSITION_STRING,
@@ -1699,7 +1715,9 @@ impl TerminalPane {
     fn flush_ime_endcomposition_queue(&mut self) {
         #[cfg(target_os = "windows")]
         {
-            let texts = take_ime_endcomposition_texts();
+            let texts = take_ime_endcomposition_texts_for_terminal(
+                self.input_suppressed.load(Ordering::Relaxed),
+            );
             if !texts.is_empty() && terminal_ime_trace_enabled() {
                 log::debug!(
                     "IME_TERM flush queue: {} item(s) from IME end composition",
@@ -2222,6 +2240,14 @@ mod snapshot_tests {
     };
     use gpui::{Bounds, Keystroke, Modifiers, ScrollDelta, point, px, size};
 
+    #[cfg(target_os = "windows")]
+    fn push_ime_endcomposition_test_text(text: &str) {
+        match super::IME_COMPOSITION_RESULT_QUEUE.lock() {
+            Ok(mut queue) => queue.push_back(text.to_string()),
+            Err(err) => err.into_inner().push_back(text.to_string()),
+        }
+    }
+
     #[test]
     fn viewport_rows_to_refresh_returns_dirty_rows_without_scroll() {
         assert_eq!(
@@ -2309,6 +2335,27 @@ mod snapshot_tests {
         assert!(should_forward_replace_text_to_terminal("a", false));
         assert!(should_forward_replace_text_to_terminal("あ", false));
         assert!(should_forward_replace_text_to_terminal("あ", true));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn queued_endcomposition_text_is_dropped_while_terminal_input_is_suppressed() {
+        push_ime_endcomposition_test_text("日本語");
+
+        assert!(super::take_ime_endcomposition_texts_for_terminal(true).is_empty());
+        assert!(super::take_ime_endcomposition_texts().is_empty());
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn queued_endcomposition_text_is_forwarded_when_terminal_input_is_active() {
+        push_ime_endcomposition_test_text("日本語");
+
+        assert_eq!(
+            super::take_ime_endcomposition_texts_for_terminal(false),
+            vec!["日本語".to_string()]
+        );
+        assert!(super::take_ime_endcomposition_texts().is_empty());
     }
 
     #[cfg(not(target_os = "windows"))]
