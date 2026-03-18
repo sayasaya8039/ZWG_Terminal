@@ -2867,7 +2867,7 @@ impl RootView {
                                 ),
                         )
                         .child(
-                            panel_icon_button("snippet-detail-edit", "ui/settings.svg", false)
+                            panel_icon_button("snippet-detail-edit", "ui/edit.svg", false)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -2876,7 +2876,7 @@ impl RootView {
                                 ),
                         )
                         .child(
-                            panel_icon_button("snippet-detail-paste", "ui/settings-terminal.svg", false)
+                            panel_icon_button("snippet-detail-copy", "ui/copy.svg", false)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _: &MouseDownEvent, window, cx| {
