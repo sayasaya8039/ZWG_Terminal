@@ -2161,6 +2161,7 @@ impl RootView {
         );
 
         if self.template_editor.is_some() {
+            cx.stop_propagation();
             return;
         }
 

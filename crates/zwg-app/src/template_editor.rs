@@ -5,7 +5,8 @@ use gpui::*;
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{
-    byte_range_to_utf16_range, consume_input_method_vk_processkey, toggle_ime_via_imm,
+    byte_range_to_utf16_range, consume_input_method_vk_processkey,
+    direct_text_from_input_keystroke, should_route_keystroke_via_text_input, toggle_ime_via_imm,
     utf16_range_to_byte_range,
 };
 
@@ -254,6 +255,10 @@ impl TemplateEditorModal {
             return true;
         }
 
+        if should_route_keystroke_via_text_input(&event.keystroke) {
+            return false;
+        }
+
         let composing = self.is_composing();
 
         match event.keystroke.key.as_ref() {
@@ -334,14 +339,9 @@ impl TemplateEditorModal {
             && !event.keystroke.modifiers.alt
             && !event.keystroke.modifiers.platform
         {
-            let key: &str = event.keystroke.key.as_ref();
-            let mut chars = key.chars();
-            if let Some(ch) = chars.next() {
-                if chars.next().is_none() && !ch.is_ascii() {
-                    self.active_text_mut().push(ch);
-                    cx.notify();
-                    return true;
-                }
+            if let Some(text) = direct_text_from_input_keystroke(&event.keystroke) {
+                self.insert_text(&text, cx);
+                return true;
             }
         }
 
