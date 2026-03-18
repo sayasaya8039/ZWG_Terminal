@@ -65,6 +65,49 @@ const MONO_FONT: &str = DEFAULT_TERMINAL_FONT_FAMILY;
 const WINDOW_CHROME_RADIUS: f32 = 14.0;
 static INPUT_METHOD_VK_PROCESSKEY: AtomicBool = AtomicBool::new(false);
 
+/// Toggle IME on/off using Windows IMM API.
+/// gpui never calls DefWindowProc for WM_KEYDOWN, so the standard 半角/全角 toggle
+/// doesn't reach Windows IME. This provides Ctrl+Space toggle via the IMM API.
+#[cfg(target_os = "windows")]
+fn toggle_ime_via_imm() {
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    use windows::Win32::UI::Input::Ime::{
+        ImmGetContext, ImmGetOpenStatus, ImmSetOpenStatus,
+        ImmGetConversionStatus, ImmSetConversionStatus, ImmReleaseContext,
+        IME_CONVERSION_MODE, IME_SENTENCE_MODE, IME_CMODE_NATIVE, IME_CMODE_FULLSHAPE,
+    };
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let himc = ImmGetContext(hwnd);
+        if !himc.0.is_null() {
+            let open = ImmGetOpenStatus(himc).as_bool();
+            if open {
+                let _ = ImmSetOpenStatus(himc, false);
+            } else {
+                let _ = ImmSetOpenStatus(himc, true);
+                let mut conversion = IME_CONVERSION_MODE(0);
+                let mut sentence = IME_SENTENCE_MODE(0);
+                if ImmGetConversionStatus(
+                    himc,
+                    Some(&mut conversion as *mut IME_CONVERSION_MODE),
+                    Some(&mut sentence as *mut IME_SENTENCE_MODE),
+                )
+                .as_bool()
+                {
+                    let new_conv = IME_CONVERSION_MODE(
+                        conversion.0 | IME_CMODE_NATIVE.0 | IME_CMODE_FULLSHAPE.0,
+                    );
+                    let _ = ImmSetConversionStatus(himc, new_conv, sentence);
+                }
+            }
+            let _ = ImmReleaseContext(hwnd, himc);
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn toggle_ime_via_imm() {}
+
 #[cfg(target_os = "windows")]
 unsafe extern "system" fn input_method_getmessage_hook_proc(
     code: i32,
@@ -1956,7 +1999,18 @@ impl RootView {
             return false;
         }
 
+        // Ctrl+Space: toggle IME (gpui doesn't call DefWindowProc, so 半角/全角 doesn't work)
+        if event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt
+            && event.keystroke.key == "space"
+        {
+            toggle_ime_via_imm();
+            cx.notify();
+            return true;
+        }
+
         if should_defer_keystroke_to_input_method(&event.keystroke) {
+            cx.notify();
             return true;
         }
 
@@ -2110,7 +2164,18 @@ impl RootView {
             .template_editor_active_field
             .unwrap_or(TemplateEditorField::Name);
 
+        // Ctrl+Space: toggle IME (gpui doesn't call DefWindowProc, so 半角/全角 doesn't work)
+        if event.keystroke.modifiers.control
+            && !event.keystroke.modifiers.alt
+            && event.keystroke.key == "space"
+        {
+            toggle_ime_via_imm();
+            cx.notify();
+            return true;
+        }
+
         if should_defer_keystroke_to_input_method(&event.keystroke) {
+            cx.notify();
             return true;
         }
 
