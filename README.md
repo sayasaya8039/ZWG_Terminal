@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.1.2-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.2.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/platform-Windows%2011-0078D6" alt="Platform">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   <img src="https://img.shields.io/badge/rust-2024%20edition-orange" alt="Rust">
@@ -69,7 +69,7 @@ ZWG Terminal は **Ghostty の VT パーサ**（Zig 製）と **Zed エディタ
 | **ペイン分割** | 水平・垂直分割、ドラッグリサイズ |
 | **GUI 設定パネル** | 7 カテゴリの設定 UI（一般・外観・ターミナル・キーボード・通知・プライバシー・詳細） |
 | **マルチ AI サジェスト** | コマンドパレット入力中に Claude / OpenAI / Gemini API で候補コマンドを即時表示 |
-| **スニペットパレット** | テンプレート管理・検索・CSV インポート/エクスポート（Shift-JIS 対応・IME 対応） |
+| **スニペットパレット** | クリップボード履歴 + 定型文管理・検索・新規作成・編集・ターミナルへ直接ペースト（日本語 IME 対応） |
 | **テーマ** | Catppuccin Mocha / Latte、Tokyo Night、Solarized、Monokai、Dracula、Nord |
 | **背景画像** | カスタム背景画像（透過度調整可能） |
 | **シェル自動検出** | pwsh / PowerShell / CMD / WSL / Git Bash |
@@ -168,7 +168,9 @@ ZWG_Terminal/
     │       ├── config/mod.rs     # 設定、テーマ、キーボード、永続化
     │       ├── shell/mod.rs      # シェル検出 (pwsh/cmd/wsl/git-bash)
     │       ├── split/mod.rs      # ツリー型ペイン分割
-    │       ├── snippets/         # スニペットパレット (store/view/settings)
+    │       ├── snippet_palette.rs # クリップボード履歴 + 定型文データモデル
+    │       ├── template_editor.rs # 定型文エディタモーダル（IME 対応）
+    │       ├── clipboard_monitor.rs # クリップボード監視
     │       └── terminal/
     │           ├── view.rs       # ターミナルペイン描画
     │           ├── pty.rs        # ConPTY プロセス管理
@@ -316,7 +318,7 @@ powershell -ExecutionPolicy Bypass -File packaging/windows/New-CodeSigningCert.p
 
 # MSIX を生成して署名
 powershell -ExecutionPolicy Bypass -File packaging/windows/Build-MSIX.ps1 `
-  -Version 1.1.2.0 `
+  -Version 1.2.0.0 `
   -Publisher "CN=ZWG Terminal Test" `
   -Architecture x64 `
   -PfxPath packaging/windows/certs/ZWGTerminal-TestCert.pfx `
@@ -348,12 +350,12 @@ signtool sign /fd SHA256 /f packaging/windows/certs/ZWGTerminal-TestCert.pfx `
 # 3. MSIX 署名
 signtool sign /fd SHA256 /f packaging/windows/certs/ZWGTerminal-TestCert.pfx `
   /p changeit /tr http://timestamp.digicert.com /td SHA256 `
-  packaging/windows/dist/ZWG_Terminal_1.1.2.0_x64.msix
+  packaging/windows/dist/ZWG_Terminal_1.2.0.0_x64.msix
 ```
 
 ### Winget / Microsoft Store 提出物
 
-- Winget manifest テンプレート: `packaging/winget/manifests/s/sayasaya8039/ZWGTerminal/1.1.2/`
+- Winget manifest テンプレート: `packaging/winget/manifests/s/sayasaya8039/ZWGTerminal/1.2.0/`
 - Microsoft Store / sideload 用 AppxManifest: `packaging/windows/AppxManifest.xml`
 - 本体 EXE の実行レベルは `resources/windows/app.manifest` で `asInvoker` を固定
 
@@ -364,7 +366,7 @@ signtool sign /fd SHA256 /f packaging/windows/certs/ZWGTerminal-TestCert.pfx `
 rustup target add aarch64-pc-windows-msvc
 cargo build --release --target aarch64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File packaging/windows/Build-MSIX.ps1 `
-  -Version 1.1.2.0 `
+  -Version 1.2.0.0 `
   -Publisher "CN=ZWG Terminal Test" `
   -Architecture arm64
 ```

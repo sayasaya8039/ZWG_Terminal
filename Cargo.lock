@@ -2041,14 +2041,14 @@ dependencies = [
 
 [[package]]
 name = "ghostty-vt"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "ghostty-vt-sys",
 ]
 
 [[package]]
 name = "ghostty-vt-sys"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "cc",
 ]
@@ -7606,7 +7606,7 @@ dependencies = [
 
 [[package]]
 name = "zwg"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -7626,6 +7626,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec",
+ "unicode-segmentation",
  "unicode-width",
  "ureq",
  "uuid",
