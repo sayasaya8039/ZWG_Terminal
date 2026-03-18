@@ -2154,12 +2154,22 @@ impl RootView {
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let root_ime_target = self.compute_root_ime_target();
-        log::info!(
-            "[ROOT] on_key_down key={:?} template_editor={} root_ime={:?}",
-            event.keystroke.key,
-            self.template_editor.is_some(),
-            root_ime_target,
-        );
+        {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(r"D:\NEXTCLOUD\Windows_app\ZWG_Terminal\ime-debug.log")
+            {
+                let _ = writeln!(
+                    f,
+                    "[ROOT] key={:?} tpl_editor={} root_ime={:?}",
+                    event.keystroke.key,
+                    self.template_editor.is_some(),
+                    root_ime_target,
+                );
+            }
+        }
 
         if self.template_editor.is_some() {
             return;

@@ -10,6 +10,17 @@ use crate::app::{
     utf16_range_to_byte_range,
 };
 
+fn debug_write(msg: String) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"D:\NEXTCLOUD\Windows_app\ZWG_Terminal\ime-debug.log")
+    {
+        let _ = f.write_all(msg.as_bytes());
+    }
+}
+
 const TEXT: u32 = 0xF5F5F7;
 const SUBTEXT1: u32 = 0x8E8E93;
 const ACCENT: u32 = 0x0A84FF;
@@ -349,14 +360,16 @@ impl TemplateEditorModal {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        log::info!(
-            "[TMED] on_key_down REACHED key={:?} key_char={:?} focused={}",
+        debug_write(format!(
+            "[TMED] key={:?} key_char={:?} focused={} field={:?} text={:?}\n",
             event.keystroke.key,
             event.keystroke.key_char,
             self.focus_handle.is_focused(window),
-        );
+            self.active_field,
+            self.active_text(),
+        ));
         let handled = self.handle_key_down(event, window, cx);
-        log::info!("[TMED] handle_key_down returned {}", handled);
+        debug_write(format!("[TMED] handled={} text_after={:?}\n", handled, self.active_text()));
         if handled {
             cx.stop_propagation();
         }
