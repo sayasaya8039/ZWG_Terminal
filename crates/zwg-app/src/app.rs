@@ -70,12 +70,12 @@ static INPUT_METHOD_VK_PROCESSKEY: AtomicBool = AtomicBool::new(false);
 /// doesn't reach Windows IME. This provides Ctrl+Space toggle via the IMM API.
 #[cfg(target_os = "windows")]
 fn toggle_ime_via_imm() {
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     use windows::Win32::UI::Input::Ime::{
-        ImmGetContext, ImmGetOpenStatus, ImmSetOpenStatus,
-        ImmGetConversionStatus, ImmSetConversionStatus, ImmReleaseContext,
-        IME_CONVERSION_MODE, IME_SENTENCE_MODE, IME_CMODE_NATIVE, IME_CMODE_FULLSHAPE,
+        IME_CMODE_FULLSHAPE, IME_CMODE_NATIVE, IME_CONVERSION_MODE, IME_SENTENCE_MODE,
+        ImmGetContext, ImmGetConversionStatus, ImmGetOpenStatus, ImmReleaseContext,
+        ImmSetConversionStatus, ImmSetOpenStatus,
     };
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
     unsafe {
         let hwnd = GetForegroundWindow();
         let himc = ImmGetContext(hwnd);
@@ -298,6 +298,23 @@ fn direct_text_from_input_keystroke(keystroke: &Keystroke) -> Option<String> {
     }
 
     None
+}
+
+#[cfg(target_os = "windows")]
+fn should_route_keystroke_via_text_input(keystroke: &Keystroke) -> bool {
+    if keystroke.modifiers.control || keystroke.modifiers.alt {
+        return false;
+    }
+
+    keystroke
+        .key_char
+        .as_ref()
+        .is_some_and(|key_char| !key_char.is_empty() && key_char.chars().any(|ch| !ch.is_ascii()))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn should_route_keystroke_via_text_input(_keystroke: &Keystroke) -> bool {
+    false
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1738,7 +1755,8 @@ impl RootView {
                 TemplateEditorField::Note => &self.template_editor_draft.note,
                 TemplateEditorField::Tags => &self.template_editor_draft.tags,
             };
-            let cursor = self.root_ime_selected_range
+            let cursor = self
+                .root_ime_selected_range
                 .as_ref()
                 .map(|r| r.start.min(text.len()))
                 .unwrap_or(text.len());
@@ -1776,7 +1794,8 @@ impl RootView {
                 TemplateEditorField::Note => &self.template_editor_draft.note,
                 TemplateEditorField::Tags => &self.template_editor_draft.tags,
             };
-            let cursor = self.root_ime_selected_range
+            let cursor = self
+                .root_ime_selected_range
                 .as_ref()
                 .map(|r| r.start.min(text.len()))
                 .unwrap_or(text.len());
@@ -1813,7 +1832,8 @@ impl RootView {
                 TemplateEditorField::Note => &self.template_editor_draft.note,
                 TemplateEditorField::Tags => &self.template_editor_draft.tags,
             };
-            let cursor = self.root_ime_selected_range
+            let cursor = self
+                .root_ime_selected_range
                 .as_ref()
                 .map(|r| r.start.min(text.len()))
                 .unwrap_or(text.len());
@@ -2232,6 +2252,10 @@ impl RootView {
             return false;
         };
 
+        if should_route_keystroke_via_text_input(&event.keystroke) {
+            return false;
+        }
+
         if should_defer_keystroke_to_input_method(&event.keystroke) {
             return true;
         }
@@ -2289,6 +2313,10 @@ impl RootView {
             .template_editor_active_field
             .unwrap_or(TemplateEditorField::Name);
 
+        if should_route_keystroke_via_text_input(&event.keystroke) {
+            return false;
+        }
+
         // Ctrl+Space: toggle IME (gpui doesn't call DefWindowProc, so 半角/全角 doesn't work)
         if event.keystroke.modifiers.control
             && !event.keystroke.modifiers.alt
@@ -2299,15 +2327,7 @@ impl RootView {
             return true;
         }
 
-        let deferred = should_defer_keystroke_to_input_method(&event.keystroke);
-        log::info!(
-            "[IME_DEBUG] template_editor_key: key={:?} key_char={:?} deferred={} active_field={:?}",
-            event.keystroke.key,
-            event.keystroke.key_char,
-            deferred,
-            active_field,
-        );
-        if deferred {
+        if should_defer_keystroke_to_input_method(&event.keystroke) {
             cx.notify();
             return true;
         }
@@ -2395,9 +2415,10 @@ impl RootView {
 
         if let Some(text) = direct_text_from_input_keystroke(&event.keystroke) {
             self.append_template_editor_text(active_field, &text, cx);
+            return true;
         }
 
-        true
+        false
     }
 
     fn handle_keyboard_settings_key(
@@ -2485,6 +2506,9 @@ impl RootView {
         }
 
         if root_ime_target.is_some() {
+            if should_route_keystroke_via_text_input(&event.keystroke) {
+                return;
+            }
             cx.stop_propagation();
             return;
         }
@@ -3595,7 +3619,9 @@ impl RootView {
                                             "例: メールの署名",
                                             active_field == TemplateEditorField::Name,
                                             if active_field == TemplateEditorField::Name {
-                                                Some(self.template_editor_cursor(TemplateEditorField::Name))
+                                                Some(self.template_editor_cursor(
+                                                    TemplateEditorField::Name,
+                                                ))
                                             } else {
                                                 None
                                             },
@@ -3659,7 +3685,9 @@ impl RootView {
                                             "この定型文の用途",
                                             active_field == TemplateEditorField::Note,
                                             if active_field == TemplateEditorField::Note {
-                                                Some(self.template_editor_cursor(TemplateEditorField::Note))
+                                                Some(self.template_editor_cursor(
+                                                    TemplateEditorField::Note,
+                                                ))
                                             } else {
                                                 None
                                             },
@@ -3693,7 +3721,9 @@ impl RootView {
                                             "タグをカンマ区切りで入力: 仕事,メール",
                                             active_field == TemplateEditorField::Tags,
                                             if active_field == TemplateEditorField::Tags {
-                                                Some(self.template_editor_cursor(TemplateEditorField::Tags))
+                                                Some(self.template_editor_cursor(
+                                                    TemplateEditorField::Tags,
+                                                ))
                                             } else {
                                                 None
                                             },
@@ -5446,10 +5476,8 @@ impl EntityInputHandler for RootView {
         cx: &mut Context<Self>,
     ) {
         let Some(target) = self.compute_root_ime_target() else {
-            log::info!("[IME_DEBUG] replace_text_in_range: no root_ime_target, returning");
             return;
         };
-        log::info!("[IME_DEBUG] replace_text_in_range target={:?} text={:?}", target, text);
         log_input_method_text("replace_text_in_range start", Some(target), text);
         let Some(current_text) = self.current_root_ime_text(target, cx) else {
             return;
@@ -5478,10 +5506,8 @@ impl EntityInputHandler for RootView {
         cx: &mut Context<Self>,
     ) {
         let Some(target) = self.compute_root_ime_target() else {
-            log::info!("[IME_DEBUG] replace_and_mark_text_in_range: no root_ime_target, returning");
             return;
         };
-        log::info!("[IME_DEBUG] replace_and_mark_text_in_range target={:?} text={:?}", target, new_text);
         log_input_method_text(
             "replace_and_mark_text_in_range start",
             Some(target),
@@ -6343,13 +6369,7 @@ fn template_editor_input_box(
     } else if is_empty && active {
         // Empty + active: show placeholder with cursor at start
         container = container
-            .child(
-                div()
-                    .w(px(1.5))
-                    .h(px(18.0))
-                    .bg(rgb(ACCENT))
-                    .flex_shrink_0(),
-            )
+            .child(div().w(px(1.5)).h(px(18.0)).bg(rgb(ACCENT)).flex_shrink_0())
             .child(
                 div()
                     .font_family(UI_FONT)
@@ -6373,29 +6393,19 @@ fn template_editor_input_box(
         let before = &value[..cursor];
         let after = &value[cursor..];
 
-        let mut row = div().flex().items_center().font_family(UI_FONT).text_size(px(13.0));
+        let mut row = div()
+            .flex()
+            .items_center()
+            .font_family(UI_FONT)
+            .text_size(px(13.0));
 
         if !before.is_empty() {
-            row = row.child(
-                div()
-                    .text_color(rgb(TEXT))
-                    .child(before.to_string()),
-            );
+            row = row.child(div().text_color(rgb(TEXT)).child(before.to_string()));
         }
         // Cursor caret
-        row = row.child(
-            div()
-                .w(px(1.5))
-                .h(px(18.0))
-                .bg(rgb(ACCENT))
-                .flex_shrink_0(),
-        );
+        row = row.child(div().w(px(1.5)).h(px(18.0)).bg(rgb(ACCENT)).flex_shrink_0());
         if !after.is_empty() {
-            row = row.child(
-                div()
-                    .text_color(rgb(TEXT))
-                    .child(after.to_string()),
-            );
+            row = row.child(div().text_color(rgb(TEXT)).child(after.to_string()));
         }
         container = container.child(row);
     } else {
@@ -6690,10 +6700,11 @@ mod tests {
         direct_text_from_input_keystroke, hotkey_binding_string, hotkey_matches,
         hotkey_string_for_keystroke, next_filtered_index, process_completion_notice_detail,
         replace_text_in_ai_settings_ime_target, replace_text_in_template_editor_field,
-        should_defer_keystroke_to_input_method, snippet_panel_frame,
-        snippet_primary_action_for_section, terminal_settings_from_config, titlebar_actions_width,
-        titlebar_side_cluster_width, traffic_lights_width, utf16_offset_to_byte_index,
-        utf16_range_to_byte_range, wrap_sidebar_preview, zoom_action_for_window,
+        should_defer_keystroke_to_input_method, should_route_keystroke_via_text_input,
+        snippet_panel_frame, snippet_primary_action_for_section, terminal_settings_from_config,
+        titlebar_actions_width, titlebar_side_cluster_width, traffic_lights_width,
+        utf16_offset_to_byte_index, utf16_range_to_byte_range, wrap_sidebar_preview,
+        zoom_action_for_window,
     };
     use crate::config::AppConfig;
     use crate::snippet_palette::SnippetSection;
@@ -6933,6 +6944,17 @@ mod tests {
 
         INPUT_METHOD_VK_PROCESSKEY.store(true, Ordering::Release);
         assert!(should_defer_keystroke_to_input_method(&keystroke));
+    }
+
+    #[test]
+    fn should_route_keystroke_to_text_input_for_committed_non_ascii_text() {
+        let keystroke = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "process".into(),
+            key_char: Some("日本".into()),
+        };
+
+        assert!(should_route_keystroke_via_text_input(&keystroke));
     }
 
     #[test]
