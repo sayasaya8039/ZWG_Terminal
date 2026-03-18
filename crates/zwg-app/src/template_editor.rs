@@ -680,6 +680,7 @@ impl Render for TemplateEditorModal {
                                 "定型文の内容を入力...",
                                 self.active_field == TemplateEditorField::Content,
                                 180.0,
+                                if self.active_field == TemplateEditorField::Content { Some(self.cursor) } else { None },
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                     this.focus_field(TemplateEditorField::Content, window, cx);
                                 }),
@@ -869,17 +870,100 @@ fn template_editor_text_area(
     placeholder: &'static str,
     active: bool,
     height: f32,
+    cursor_byte: Option<usize>,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let lines = if value.is_empty() {
-        vec![
-            div()
-                .font_family(UI_FONT)
-                .text_size(px(13.0))
-                .text_color(rgb(SUBTEXT1))
-                .child(placeholder)
-                .into_any_element(),
-        ]
+    let caret = || {
+        div()
+            .w(px(1.5))
+            .h(px(18.0))
+            .bg(rgb(ACCENT))
+            .flex_shrink_0()
+    };
+
+    let lines: Vec<AnyElement> = if value.is_empty() && !active {
+        vec![div()
+            .font_family(UI_FONT)
+            .text_size(px(13.0))
+            .text_color(rgb(SUBTEXT1))
+            .child(placeholder)
+            .into_any_element()]
+    } else if value.is_empty() && active {
+        vec![div()
+            .flex()
+            .items_center()
+            .font_family(UI_FONT)
+            .text_size(px(13.0))
+            .child(caret())
+            .child(div().text_color(rgb(SUBTEXT1)).child(placeholder))
+            .into_any_element()]
+    } else if active {
+        let cursor_pos = cursor_byte
+            .map(|c| c.min(value.len()))
+            .unwrap_or(value.len());
+        // Snap to char boundary
+        let cursor_pos = if cursor_pos == 0 {
+            0
+        } else {
+            value[..cursor_pos]
+                .char_indices()
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0)
+                .min(value.len())
+        };
+        // Build lines with cursor inserted at the right position
+        let before = &value[..cursor_pos];
+        let after = &value[cursor_pos..];
+        let mut result: Vec<AnyElement> = Vec::new();
+
+        // Lines before cursor
+        let before_lines: Vec<&str> = before.split('\n').collect();
+        let after_lines: Vec<&str> = after.split('\n').collect();
+
+        // All lines before the cursor line
+        for line in &before_lines[..before_lines.len().saturating_sub(1)] {
+            result.push(
+                div()
+                    .font_family(UI_FONT)
+                    .text_size(px(13.0))
+                    .text_color(rgb(TEXT))
+                    .child(if line.is_empty() { " ".to_string() } else { line.to_string() })
+                    .into_any_element(),
+            );
+        }
+
+        // Cursor line: [last_before_part] [caret] [first_after_part]
+        let cursor_line_before = before_lines.last().unwrap_or(&"");
+        let cursor_line_after = after_lines.first().unwrap_or(&"");
+        let mut cursor_row = div()
+            .flex()
+            .items_center()
+            .font_family(UI_FONT)
+            .text_size(px(13.0));
+        if !cursor_line_before.is_empty() {
+            cursor_row =
+                cursor_row.child(div().text_color(rgb(TEXT)).child(cursor_line_before.to_string()));
+        }
+        cursor_row = cursor_row.child(caret());
+        if !cursor_line_after.is_empty() {
+            cursor_row =
+                cursor_row.child(div().text_color(rgb(TEXT)).child(cursor_line_after.to_string()));
+        }
+        result.push(cursor_row.into_any_element());
+
+        // All lines after the cursor line
+        for line in &after_lines[1..] {
+            result.push(
+                div()
+                    .font_family(UI_FONT)
+                    .text_size(px(13.0))
+                    .text_color(rgb(TEXT))
+                    .child(if line.is_empty() { " ".to_string() } else { line.to_string() })
+                    .into_any_element(),
+            );
+        }
+        result
     } else {
         value
             .lines()
@@ -895,13 +979,7 @@ fn template_editor_text_area(
                     })
                     .into_any_element()
             })
-            .collect::<Vec<_>>()
-    };
-
-    let lines = if active {
-        append_caret_to_last_line(lines)
-    } else {
-        lines
+            .collect()
     };
 
     div()
@@ -925,29 +1003,6 @@ fn template_editor_text_area(
         .children(lines)
 }
 
-fn append_caret_to_last_line(mut lines: Vec<AnyElement>) -> Vec<AnyElement> {
-    let caret = div()
-        .w(px(1.5))
-        .h(px(18.0))
-        .bg(rgb(ACCENT))
-        .flex_shrink_0()
-        .into_any_element();
-
-    if let Some(last_line) = lines.pop() {
-        lines.push(
-            div()
-                .flex()
-                .items_center()
-                .gap(px(1.0))
-                .child(last_line)
-                .child(caret)
-                .into_any_element(),
-        );
-        return lines;
-    }
-
-    vec![div().child(caret).into_any_element()]
-}
 
 fn pop_last_grapheme(text: &mut String) -> bool {
     let Some((index, _)) = UnicodeSegmentation::grapheme_indices(text.as_str(), true).next_back()
