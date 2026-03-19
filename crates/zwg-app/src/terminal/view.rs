@@ -26,6 +26,7 @@ use super::grid_renderer::{
 };
 use super::pty::{ConPtyConfig, spawn_pty};
 use super::surface::TerminalSurface;
+use super::win32_input::encode_win32_input_text;
 #[cfg(feature = "ghostty_vt")]
 use parking_lot::Mutex;
 
@@ -577,17 +578,77 @@ fn terminal_layout_size(
     (width.max(1.0), (height - WINDOW_CHROME_HEIGHT).max(100.0))
 }
 
+#[cfg(target_os = "windows")]
+fn terminal_input_method_native_mode_active() -> bool {
+    use windows::Win32::UI::Input::Ime::{
+        IME_CMODE_FULLSHAPE, IME_CMODE_NATIVE, IME_CONVERSION_MODE, IME_SENTENCE_MODE,
+        ImmGetContext, ImmGetConversionStatus, ImmGetOpenStatus, ImmReleaseContext,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let himc = ImmGetContext(hwnd);
+        if himc.0.is_null() {
+            return false;
+        }
+
+        let open = ImmGetOpenStatus(himc).as_bool();
+        let mut conversion = IME_CONVERSION_MODE(0);
+        let mut sentence = IME_SENTENCE_MODE(0);
+        let has_conversion_status = ImmGetConversionStatus(
+            himc,
+            Some(&mut conversion as *mut IME_CONVERSION_MODE),
+            Some(&mut sentence as *mut IME_SENTENCE_MODE),
+        )
+        .as_bool();
+        let _ = ImmReleaseContext(hwnd, himc);
+
+        if !open {
+            return false;
+        }
+
+        if !has_conversion_status {
+            return true;
+        }
+
+        (conversion.0 & IME_CMODE_NATIVE.0) != 0 || (conversion.0 & IME_CMODE_FULLSHAPE.0) != 0
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn terminal_input_method_native_mode_active() -> bool {
+    false
+}
+
 fn should_defer_keystroke_to_ime(ks: &Keystroke, ime_processkey_pending: bool) -> bool {
+    should_defer_keystroke_to_ime_with_state(
+        ks,
+        ime_processkey_pending,
+        terminal_input_method_native_mode_active(),
+    )
+}
+
+fn should_defer_keystroke_to_ime_with_state(
+    ks: &Keystroke,
+    ime_processkey_pending: bool,
+    ime_native_mode_active: bool,
+) -> bool {
     if terminal_ime_trace_enabled() {
         log::debug!(
-            "IME_TERM should_defer_keystroke_to_ime key={} pending={} key_char={:?}",
+            "IME_TERM should_defer_keystroke_to_ime key={} pending={} ime_active={} key_char={:?}",
             ks.key,
             ime_processkey_pending,
+            ime_native_mode_active,
             ks.key_char
         );
     }
 
     if !ime_processkey_pending {
+        return false;
+    }
+
+    if !ime_native_mode_active {
         return false;
     }
 
@@ -660,6 +721,20 @@ fn should_forward_replace_text_to_terminal(text: &str, _ime_composing: bool) -> 
 #[cfg(not(target_os = "windows"))]
 fn should_forward_replace_text_to_terminal(text: &str, _ime_composing: bool) -> bool {
     !text.is_empty()
+}
+
+#[cfg(target_os = "windows")]
+fn text_to_terminal_bytes(text: &str, win32_input_mode: bool) -> Vec<u8> {
+    if win32_input_mode {
+        encode_win32_input_text(text)
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn text_to_terminal_bytes(text: &str, _win32_input_mode: bool) -> Vec<u8> {
+    text.as_bytes().to_vec()
 }
 
 /// Terminal connection state — two-phase init pattern
@@ -1733,6 +1808,15 @@ impl TerminalPane {
         self.write_terminal_bytes(data);
     }
 
+    fn write_user_input_text(&mut self, source: UserInputSource, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+
+        let bytes = text_to_terminal_bytes(text, self.surface.win32_input_mode());
+        self.write_user_input_bytes(source, &bytes);
+    }
+
     fn flush_ime_endcomposition_queue(&mut self) {
         #[cfg(target_os = "windows")]
         {
@@ -1760,7 +1844,7 @@ impl TerminalPane {
                 }
 
                 // Forward to PTY — duplicates are suppressed by should_drop_duplicate_user_input
-                self.write_user_input_bytes(UserInputSource::ImeEndComposition, text.as_bytes());
+                self.write_user_input_text(UserInputSource::ImeEndComposition, &text);
             }
         }
 
@@ -1808,7 +1892,15 @@ impl TerminalPane {
 
     /// Convert a keystroke to bytes for PTY. Returns None if the key should not
     /// be sent (e.g., modifier-only keys).
+    #[cfg(test)]
     fn keystroke_to_bytes(ks: &Keystroke) -> Option<Vec<u8>> {
+        Self::keystroke_to_bytes_with_win32_mode(ks, false)
+    }
+
+    fn keystroke_to_bytes_with_win32_mode(
+        ks: &Keystroke,
+        win32_input_mode: bool,
+    ) -> Option<Vec<u8>> {
         // IME VK_PROCESSKEY: hook already called TranslateMessage.
         // Only defer when this event is still part of IME processing.
         let ime_processkey_pending = IME_VK_PROCESSKEY.swap(false, Ordering::AcqRel);
@@ -1819,6 +1911,9 @@ impl TerminalPane {
         // key_char: actual character from ToUnicode (shift/layout aware)
         if let Some(ref kc) = ks.key_char {
             if !kc.is_empty() {
+                if win32_input_mode && !ks.modifiers.alt && !ks.modifiers.control {
+                    return Some(text_to_terminal_bytes(kc, true));
+                }
                 if ks.modifiers.alt {
                     let mut buf = vec![0x1b];
                     buf.extend_from_slice(kc.as_bytes());
@@ -1842,7 +1937,9 @@ impl TerminalPane {
             "tab" => Some(b"\t".to_vec()),
             "escape" => Some(vec![0x1b]),
             "space" => {
-                if alt {
+                if win32_input_mode && !alt && !ctrl {
+                    Some(text_to_terminal_bytes(" ", true))
+                } else if alt {
                     Some(vec![0x1b, b' '])
                 } else {
                     Some(vec![b' '])
@@ -1925,7 +2022,10 @@ impl TerminalPane {
             return;
         }
 
-        let bytes = match Self::keystroke_to_bytes(&event.keystroke) {
+        let bytes = match Self::keystroke_to_bytes_with_win32_mode(
+            &event.keystroke,
+            self.surface.win32_input_mode(),
+        ) {
             Some(b) => b,
             None => {
                 // IME key or unknown — stop propagation to prevent gpui's
@@ -2169,7 +2269,7 @@ impl EntityInputHandler for TerminalPane {
         if !should_forward {
             return;
         }
-        self.write_user_input_bytes(UserInputSource::TextCommit, text.as_bytes());
+        self.write_user_input_text(UserInputSource::TextCommit, text);
     }
 
     /// Preedit (composing) text from IME — currently not displayed,
@@ -2259,7 +2359,7 @@ fn slice_text_by_cols(text: &str, start_col: usize, end_col: usize) -> String {
 #[cfg(test)]
 mod snapshot_tests {
     use super::{
-        TerminalPane, scroll_lines_from_wheel_delta, should_defer_keystroke_to_ime,
+        TerminalPane, scroll_lines_from_wheel_delta, should_defer_keystroke_to_ime_with_state,
         should_forward_replace_text_to_terminal, should_route_keystroke_via_text_input_with_state,
         terminal_layout_size, viewport_rows_to_refresh,
     };
@@ -2313,18 +2413,51 @@ mod snapshot_tests {
         };
 
         // pending=false → always false
-        assert!(!should_defer_keystroke_to_ime(&process_key, false));
-        assert!(!should_defer_keystroke_to_ime(&ascii_key, false));
-        assert!(!should_defer_keystroke_to_ime(&non_ascii_key, false));
+        assert!(!should_defer_keystroke_to_ime_with_state(
+            &process_key,
+            false,
+            true
+        ));
+        assert!(!should_defer_keystroke_to_ime_with_state(
+            &ascii_key, false, true
+        ));
+        assert!(!should_defer_keystroke_to_ime_with_state(
+            &non_ascii_key,
+            false,
+            true
+        ));
 
         // pending=true, no key_char → defer (IME still processing)
-        assert!(should_defer_keystroke_to_ime(&process_key, true));
+        assert!(should_defer_keystroke_to_ime_with_state(
+            &process_key,
+            true,
+            true
+        ));
 
         // pending=true, ASCII key_char → defer (romaji input like a, k, i)
-        assert!(should_defer_keystroke_to_ime(&ascii_key, true));
+        assert!(should_defer_keystroke_to_ime_with_state(
+            &ascii_key, true, true
+        ));
 
         // pending=true, non-ASCII key_char → don't defer (committed char like あ)
-        assert!(!should_defer_keystroke_to_ime(&non_ascii_key, true));
+        assert!(!should_defer_keystroke_to_ime_with_state(
+            &non_ascii_key,
+            true,
+            true
+        ));
+    }
+
+    #[test]
+    fn should_defer_keystroke_to_ime_allows_ascii_when_ime_is_already_in_alnum_mode() {
+        let ascii_key = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "a".into(),
+            key_char: Some("a".into()),
+        };
+
+        assert!(!should_defer_keystroke_to_ime_with_state(
+            &ascii_key, true, false
+        ));
     }
 
     #[cfg(target_os = "windows")]
@@ -2457,6 +2590,24 @@ mod snapshot_tests {
             true,
             false
         ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn printable_windows_symbols_encode_as_win32_input_records_when_mode_is_enabled() {
+        let middle_dot = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "ime".into(),
+            key_char: Some("・".into()),
+        };
+
+        let encoded = TerminalPane::keystroke_to_bytes_with_win32_mode(&middle_dot, true)
+            .expect("unicode key should encode in win32 input mode");
+
+        assert_eq!(
+            String::from_utf8(encoded).expect("win32 input sequence should be utf8"),
+            "\x1b[0;0;12539;1;0;1_\x1b[0;0;12539;0;0;1_"
+        );
     }
 
     #[cfg(target_os = "windows")]

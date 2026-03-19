@@ -8,6 +8,7 @@ use flume::{Receiver, Sender};
 use parking_lot::Mutex;
 
 use super::pty::PtyPair;
+use super::win32_input::Win32InputModeTracker;
 use super::{DEFAULT_BG, DEFAULT_FG};
 
 /// Events emitted by the terminal
@@ -248,6 +249,7 @@ pub struct TerminalSurface {
     event_rx: Option<Receiver<TerminalEvent>>,
     event_tx: Sender<TerminalEvent>,
     output_event_pending: Arc<AtomicBool>,
+    win32_input_mode: Arc<AtomicBool>,
     pty: Option<Arc<PtyPair>>,
     reader_handle: Option<std::thread::JoinHandle<()>>,
     // H2: stop flag for clean reader thread shutdown
@@ -267,6 +269,7 @@ impl TerminalSurface {
             event_rx: Some(event_rx),
             event_tx,
             output_event_pending: Arc::new(AtomicBool::new(false)),
+            win32_input_mode: Arc::new(AtomicBool::new(false)),
             pty: None,
             reader_handle: None,
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -285,6 +288,10 @@ impl TerminalSurface {
 
     pub fn finish_output_event(&self) {
         self.output_event_pending.store(false, Ordering::Release);
+    }
+
+    pub fn win32_input_mode(&self) -> bool {
+        self.win32_input_mode.load(Ordering::Acquire)
     }
 
     /// Check if the async parser still has unprocessed data in its ring buffer.
@@ -329,6 +336,7 @@ impl TerminalSurface {
         let backend = self.backend.clone();
         let event_tx = self.event_tx.clone();
         let output_event_pending = self.output_event_pending.clone();
+        let win32_input_mode = self.win32_input_mode.clone();
         let stop_flag = self.stop_flag.clone();
 
         // Enable async I/O for attach_pty path
@@ -351,6 +359,7 @@ impl TerminalSurface {
             .name("zwg-pty-reader".into())
             .spawn(move || {
                 let mut buf = [0u8; 131_072];
+                let mut win32_input_tracker = Win32InputModeTracker::default();
                 loop {
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
@@ -363,6 +372,8 @@ impl TerminalSurface {
                             Err(_) => break,
                         }
                     };
+                    let win32_mode_active = win32_input_tracker.observe(&buf[..n]);
+                    win32_input_mode.store(win32_mode_active, Ordering::Release);
                     if let Some(raw_ptr) = async_ptr {
                         #[cfg(feature = "ghostty_vt")]
                         unsafe {
@@ -383,6 +394,7 @@ impl TerminalSurface {
                 }
                 log::debug!("PTY reader thread exiting");
                 output_event_pending.store(false, Ordering::Release);
+                win32_input_mode.store(false, Ordering::Release);
                 let _ = event_tx.send(TerminalEvent::ProcessExited(0));
             })?;
 

@@ -8,7 +8,6 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ConPtyConfig {
     pub shell: String,
-    pub working_directory: Option<String>,
     pub env: Vec<(String, String)>,
     pub cols: u16,
     pub rows: u16,
@@ -18,7 +17,6 @@ impl Default for ConPtyConfig {
     fn default() -> Self {
         Self {
             shell: String::new(),
-            working_directory: None,
             env: Vec::new(),
             cols: 80,
             rows: 24,
@@ -506,6 +504,307 @@ mod tests {
     use super::*;
     use std::io::{self, Cursor};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_pty_cmd_echo_produces_output() {
+        let pty = spawn_pty(ConPtyConfig {
+            shell: "cmd.exe /c echo ZWG_PTY_SMOKE_TEST".into(),
+            cols: 80,
+            rows: 24,
+            env: Vec::new(),
+        })
+        .expect("spawn_pty should succeed for cmd.exe smoke test");
+
+        let reader = pty.reader();
+        let mut output = Vec::new();
+        let mut buf = [0u8; 512];
+
+        loop {
+            let read = {
+                let mut guard = reader.lock();
+                guard.read(&mut buf)
+            }
+            .expect("reading PTY output should succeed");
+
+            if read == 0 {
+                break;
+            }
+
+            output.extend_from_slice(&buf[..read]);
+
+            if output
+                .windows("ZWG_PTY_SMOKE_TEST".len())
+                .any(|window| window == b"ZWG_PTY_SMOKE_TEST")
+            {
+                break;
+            }
+        }
+
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(
+            rendered.contains("ZWG_PTY_SMOKE_TEST"),
+            "expected cmd.exe output, got {:?}",
+            rendered
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_pty_powershell_read_host_accepts_unicode_input() {
+        let script_path = std::env::temp_dir().join(format!(
+            "zwg_unicode_input_{}_{}.ps1",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &script_path,
+            concat!(
+                "$line = [Console]::In.ReadLine()\n",
+                "[Console]::WriteLine('ZWG_UNICODE_TEST:' + ",
+                "[BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($line)))\n",
+            ),
+        )
+        .expect("writing unicode input powershell script should succeed");
+
+        let pty = spawn_pty(ConPtyConfig {
+            shell: format!(
+                "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+                script_path.display()
+            ),
+            cols: 120,
+            rows: 32,
+            env: Vec::new(),
+        })
+        .expect("spawn_pty should succeed for powershell unicode input test");
+
+        let unicode_line = "・→↓\r";
+        pty.write_input(unicode_line.as_bytes())
+            .expect("writing unicode input line should succeed");
+
+        let reader = pty.reader();
+        let mut output = Vec::new();
+        let mut buf = [0u8; 512];
+        let expected = "ZWG_UNICODE_TEST:E3-83-BB-E2-86-92-E2-86-93";
+
+        loop {
+            let read = {
+                let mut guard = reader.lock();
+                guard.read(&mut buf)
+            }
+            .expect("reading PTY output should succeed");
+
+            if read == 0 {
+                break;
+            }
+
+            output.extend_from_slice(&buf[..read]);
+
+            if output
+                .windows(expected.len())
+                .any(|window| window == expected.as_bytes())
+            {
+                break;
+            }
+        }
+
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(
+            rendered.contains(expected),
+            "expected powershell to echo unicode input as utf8 hex, got {:?}",
+            rendered
+        );
+
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_pty_powershell_read_key_ignores_raw_utf8_unicode_input() {
+        let script_path = std::env::temp_dir().join(format!(
+            "zwg_unicode_readkey_{}_{}.ps1",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &script_path,
+            concat!(
+                "$deadline = [DateTime]::UtcNow.AddSeconds(2)\n",
+                "$events = New-Object System.Collections.Generic.List[string]\n",
+                "while ([DateTime]::UtcNow -lt $deadline -and $events.Count -lt 4) {\n",
+                "  if ([Console]::KeyAvailable) {\n",
+                "    $key = [Console]::ReadKey($true)\n",
+                "    $events.Add(('char={0};key={1};vk={2}' -f [int][char]$key.KeyChar, $key.Key, $key.VirtualKeyCode))\n",
+                "  } else {\n",
+                "    Start-Sleep -Milliseconds 20\n",
+                "  }\n",
+                "}\n",
+                "[Console]::WriteLine('ZWG_READKEY_TEST:' + ($events -join '|'))\n",
+            ),
+        )
+        .expect("writing readkey powershell script should succeed");
+
+        let pty = spawn_pty(ConPtyConfig {
+            shell: format!(
+                "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+                script_path.display()
+            ),
+            cols: 120,
+            rows: 32,
+            env: Vec::new(),
+        })
+        .expect("spawn_pty should succeed for powershell readkey test");
+
+        let unicode_line = "・↓\r";
+        pty.write_input(unicode_line.as_bytes())
+            .expect("writing unicode readkey payload should succeed");
+
+        let reader = pty.reader();
+        let mut output = Vec::new();
+        let mut buf = [0u8; 512];
+        let expected_prefix = "ZWG_READKEY_TEST:";
+
+        loop {
+            let read = {
+                let mut guard = reader.lock();
+                guard.read(&mut buf)
+            }
+            .expect("reading PTY output should succeed");
+
+            if read == 0 {
+                break;
+            }
+
+            output.extend_from_slice(&buf[..read]);
+
+            if output
+                .windows(expected_prefix.len())
+                .any(|window| window == expected_prefix.as_bytes())
+            {
+                break;
+            }
+        }
+
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(
+            rendered.contains(expected_prefix),
+            "expected powershell to print readkey marker, got {:?}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("char=12539"),
+            "raw utf8 unexpectedly produced middle dot key event: {:?}",
+            rendered
+        );
+        assert!(
+            !rendered.contains("char=8595"),
+            "raw utf8 unexpectedly produced down arrow unicode key event: {:?}",
+            rendered
+        );
+        assert!(
+            rendered.contains("char=13;key=Enter"),
+            "expected raw readkey path to at least receive Enter, got {:?}",
+            rendered
+        );
+
+        let _ = std::fs::remove_file(script_path);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn spawn_pty_powershell_read_key_accepts_win32_unicode_input_records() {
+        let script_path = std::env::temp_dir().join(format!(
+            "zwg_unicode_readkey_win32_{}_{}.ps1",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::write(
+            &script_path,
+            concat!(
+                "$deadline = [DateTime]::UtcNow.AddSeconds(2)\n",
+                "$events = New-Object System.Collections.Generic.List[string]\n",
+                "while ([DateTime]::UtcNow -lt $deadline -and $events.Count -lt 4) {\n",
+                "  if ([Console]::KeyAvailable) {\n",
+                "    $key = [Console]::ReadKey($true)\n",
+                "    $events.Add(('char={0};key={1};vk={2}' -f [int][char]$key.KeyChar, $key.Key, $key.VirtualKeyCode))\n",
+                "  } else {\n",
+                "    Start-Sleep -Milliseconds 20\n",
+                "  }\n",
+                "}\n",
+                "[Console]::WriteLine('ZWG_READKEY_TEST:' + ($events -join '|'))\n",
+            ),
+        )
+        .expect("writing win32 readkey powershell script should succeed");
+
+        let pty = spawn_pty(ConPtyConfig {
+            shell: format!(
+                "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
+                script_path.display()
+            ),
+            cols: 120,
+            rows: 32,
+            env: Vec::new(),
+        })
+        .expect("spawn_pty should succeed for powershell win32 readkey test");
+
+        let payload = crate::terminal::win32_input::encode_win32_input_text("・↓");
+        pty.write_input(&payload)
+            .expect("writing win32 unicode input payload should succeed");
+
+        let reader = pty.reader();
+        let mut output = Vec::new();
+        let mut buf = [0u8; 512];
+        let expected_prefix = "ZWG_READKEY_TEST:";
+
+        loop {
+            let read = {
+                let mut guard = reader.lock();
+                guard.read(&mut buf)
+            }
+            .expect("reading PTY output should succeed");
+
+            if read == 0 {
+                break;
+            }
+
+            output.extend_from_slice(&buf[..read]);
+
+            if output
+                .windows(expected_prefix.len())
+                .any(|window| window == expected_prefix.as_bytes())
+            {
+                break;
+            }
+        }
+
+        let rendered = String::from_utf8_lossy(&output);
+        assert!(
+            rendered.contains(expected_prefix),
+            "expected powershell to print readkey marker, got {:?}",
+            rendered
+        );
+        assert!(
+            rendered.contains("char=12539"),
+            "expected middle dot key event from win32 input records, got {:?}",
+            rendered
+        );
+        assert!(
+            rendered.contains("char=8595"),
+            "expected down arrow unicode key event from win32 input records, got {:?}",
+            rendered
+        );
+
+        let _ = std::fs::remove_file(script_path);
+    }
 
     struct PartialWriter {
         writes: Arc<Mutex<Vec<u8>>>,

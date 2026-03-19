@@ -8,6 +8,7 @@ mod native_gpu_presenter;
 pub mod pty;
 pub mod surface;
 pub mod view;
+pub(crate) mod win32_input;
 #[cfg(not(feature = "ghostty_vt"))]
 pub mod vt_parser;
 
