@@ -1810,8 +1810,12 @@ impl TerminalPane {
         let key_str = ks.key.as_ref();
         let ctrl = ks.modifiers.control;
         let alt = ks.modifiers.alt;
+        let shift = ks.modifiers.shift;
 
         match key_str {
+            // Keep Enter as CR, but let Shift+Enter emulate Ctrl+J/LF so
+            // multiline terminal prompts such as Codex CLI can insert a newline.
+            "enter" if shift && !ctrl && !alt => Some(vec![b'\n']),
             "enter" => Some(b"\r".to_vec()),
             "backspace" => Some(vec![0x7f]),
             "tab" => Some(b"\t".to_vec()),
@@ -2234,7 +2238,7 @@ fn slice_text_by_cols(text: &str, start_col: usize, end_col: usize) -> String {
 #[cfg(test)]
 mod snapshot_tests {
     use super::{
-        scroll_lines_from_wheel_delta, should_defer_keystroke_to_ime,
+        TerminalPane, scroll_lines_from_wheel_delta, should_defer_keystroke_to_ime,
         should_forward_replace_text_to_terminal, should_route_keystroke_via_text_input,
         terminal_layout_size, viewport_rows_to_refresh,
     };
@@ -2300,6 +2304,59 @@ mod snapshot_tests {
 
         // pending=true, non-ASCII key_char → don't defer (committed char like あ)
         assert!(!should_defer_keystroke_to_ime(&non_ascii_key, true));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn shift_enter_maps_to_line_feed_for_multiline_prompts() {
+        let shift_enter = Keystroke {
+            modifiers: Modifiers {
+                shift: true,
+                ..Modifiers::default()
+            },
+            key: "enter".into(),
+            key_char: None,
+        };
+
+        assert_eq!(TerminalPane::keystroke_to_bytes(&shift_enter), Some(vec![b'\n']));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn enter_without_plain_shift_modifier_stays_carriage_return() {
+        let plain_enter = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "enter".into(),
+            key_char: None,
+        };
+        let ctrl_shift_enter = Keystroke {
+            modifiers: Modifiers {
+                control: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+            key: "enter".into(),
+            key_char: None,
+        };
+        let alt_shift_enter = Keystroke {
+            modifiers: Modifiers {
+                alt: true,
+                shift: true,
+                ..Modifiers::default()
+            },
+            key: "enter".into(),
+            key_char: None,
+        };
+
+        assert_eq!(TerminalPane::keystroke_to_bytes(&plain_enter), Some(vec![b'\r']));
+        assert_eq!(
+            TerminalPane::keystroke_to_bytes(&ctrl_shift_enter),
+            Some(vec![b'\r'])
+        );
+        assert_eq!(
+            TerminalPane::keystroke_to_bytes(&alt_shift_enter),
+            Some(vec![b'\r'])
+        );
     }
 
     #[cfg(target_os = "windows")]
