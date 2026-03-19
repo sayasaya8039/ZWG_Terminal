@@ -615,7 +615,22 @@ fn should_defer_keystroke_to_ime(ks: &Keystroke, ime_processkey_pending: bool) -
 
 #[cfg(target_os = "windows")]
 fn should_route_keystroke_via_text_input(ks: &Keystroke) -> bool {
+    should_route_keystroke_via_text_input_with_state(
+        ks,
+        IME_VK_PROCESSKEY.load(Ordering::Acquire),
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn should_route_keystroke_via_text_input_with_state(
+    ks: &Keystroke,
+    ime_processkey_pending: bool,
+) -> bool {
     if ks.modifiers.control || ks.modifiers.alt {
+        return false;
+    }
+
+    if !ime_processkey_pending {
         return false;
     }
 
@@ -2239,7 +2254,7 @@ fn slice_text_by_cols(text: &str, start_col: usize, end_col: usize) -> String {
 mod snapshot_tests {
     use super::{
         TerminalPane, scroll_lines_from_wheel_delta, should_defer_keystroke_to_ime,
-        should_forward_replace_text_to_terminal, should_route_keystroke_via_text_input,
+        should_forward_replace_text_to_terminal, should_route_keystroke_via_text_input_with_state,
         terminal_layout_size, viewport_rows_to_refresh,
     };
     use gpui::{Bounds, Keystroke, Modifiers, ScrollDelta, point, px, size};
@@ -2361,7 +2376,7 @@ mod snapshot_tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn printable_windows_keys_route_via_text_input() {
+    fn printable_windows_keys_stay_on_terminal_input_path_outside_ime_processing() {
         let printable_ascii = Keystroke {
             modifiers: Modifiers::default(),
             key: "a".into(),
@@ -2381,9 +2396,30 @@ mod snapshot_tests {
             key_char: Some("c".into()),
         };
 
-        assert!(!should_route_keystroke_via_text_input(&printable_ascii));
-        assert!(should_route_keystroke_via_text_input(&printable_non_ascii));
-        assert!(!should_route_keystroke_via_text_input(&ctrl));
+        assert!(!should_route_keystroke_via_text_input_with_state(
+            &printable_ascii,
+            false
+        ));
+        assert!(!should_route_keystroke_via_text_input_with_state(
+            &printable_non_ascii,
+            false
+        ));
+        assert!(!should_route_keystroke_via_text_input_with_state(&ctrl, false));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn printable_windows_keys_route_via_text_input_during_ime_processing() {
+        let printable_non_ascii = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "ime".into(),
+            key_char: Some("あ".into()),
+        };
+
+        assert!(should_route_keystroke_via_text_input_with_state(
+            &printable_non_ascii,
+            true
+        ));
     }
 
     #[cfg(target_os = "windows")]
