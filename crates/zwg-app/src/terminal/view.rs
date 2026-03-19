@@ -618,6 +618,7 @@ fn should_route_keystroke_via_text_input(ks: &Keystroke) -> bool {
     should_route_keystroke_via_text_input_with_state(
         ks,
         IME_VK_PROCESSKEY.load(Ordering::Acquire),
+        terminal_input_method_native_mode_active(),
     )
 }
 
@@ -625,12 +626,17 @@ fn should_route_keystroke_via_text_input(ks: &Keystroke) -> bool {
 fn should_route_keystroke_via_text_input_with_state(
     ks: &Keystroke,
     ime_processkey_pending: bool,
+    ime_native_mode_active: bool,
 ) -> bool {
     if ks.modifiers.control || ks.modifiers.alt {
         return false;
     }
 
     if !ime_processkey_pending {
+        return false;
+    }
+
+    if !ime_native_mode_active {
         return false;
     }
 
@@ -2398,13 +2404,17 @@ mod snapshot_tests {
 
         assert!(!should_route_keystroke_via_text_input_with_state(
             &printable_ascii,
-            false
+            false,
+            true
         ));
         assert!(!should_route_keystroke_via_text_input_with_state(
             &printable_non_ascii,
-            false
+            false,
+            true
         ));
-        assert!(!should_route_keystroke_via_text_input_with_state(&ctrl, false));
+        assert!(!should_route_keystroke_via_text_input_with_state(
+            &ctrl, false, true
+        ));
     }
 
     #[cfg(target_os = "windows")]
@@ -2418,7 +2428,34 @@ mod snapshot_tests {
 
         assert!(should_route_keystroke_via_text_input_with_state(
             &printable_non_ascii,
+            true,
             true
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn printable_windows_symbols_stay_on_keydown_path_when_ime_is_in_alnum_mode() {
+        let middle_dot = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "ime".into(),
+            key_char: Some("・".into()),
+        };
+        let right_arrow = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "ime".into(),
+            key_char: Some("→".into()),
+        };
+
+        assert!(!should_route_keystroke_via_text_input_with_state(
+            &middle_dot,
+            true,
+            false
+        ));
+        assert!(!should_route_keystroke_via_text_input_with_state(
+            &right_arrow,
+            true,
+            false
         ));
     }
 
