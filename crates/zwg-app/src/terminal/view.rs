@@ -1425,11 +1425,31 @@ impl TerminalPane {
         changed
     }
 
-    /// Create a full-size input overlay that registers IME and captures pointer input.
-    fn input_overlay(&self, cx: &mut Context<Self>) -> Div {
+    /// Create a canvas element that registers the IME input handler during paint.
+    fn ime_canvas(&self, cx: &mut Context<Self>) -> Canvas<()> {
         let entity = cx.entity().clone();
         let focus = self.focus_handle.clone();
         let suppressed = self.input_suppressed.clone();
+        canvas(
+            |_, _, _| (),
+            move |bounds, _, window, cx| {
+                let _ = entity.update(cx, |pane, _cx| {
+                    pane.last_bounds = Some(bounds);
+                });
+                // Don't register IME handler when input is suppressed
+                // (e.g., group editor overlay is open)
+                if !suppressed.load(Ordering::Relaxed) {
+                    log::trace!("IME_TERM register_input handler");
+                    let handler = ElementInputHandler::new(bounds, entity.clone());
+                    window.handle_input(&focus, handler, cx);
+                }
+            },
+        )
+        .size_full()
+    }
+
+    /// Transparent hitbox above the terminal canvas for selection/copy gestures.
+    fn mouse_overlay(&self, cx: &mut Context<Self>) -> Div {
         div()
             .absolute()
             .top_0()
@@ -1440,24 +1460,7 @@ impl TerminalPane {
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_right_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .child(
-                canvas(
-                    |_, _, _| (),
-                    move |bounds, _, window, cx| {
-                        let _ = entity.update(cx, |pane, _cx| {
-                            pane.last_bounds = Some(bounds);
-                        });
-                        // Don't register IME handler when input is suppressed
-                        // (e.g., group editor overlay is open)
-                        if !suppressed.load(Ordering::Relaxed) {
-                            log::trace!("IME_TERM register_input handler");
-                            let handler = ElementInputHandler::new(bounds, entity.clone());
-                            window.handle_input(&focus, handler, cx);
-                        }
-                    },
-                )
-                .size_full(),
-            )
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
     }
 
     /// Render the "Connecting..." placeholder (with key buffering support)
@@ -1492,7 +1495,8 @@ impl TerminalPane {
                             .child("Initializing ConPTY"),
                     ),
             )
-            .child(self.input_overlay(cx))
+            .child(self.ime_canvas(cx))
+            .child(self.mouse_overlay(cx))
     }
 
     /// Render the error state
@@ -1631,7 +1635,9 @@ impl TerminalPane {
             pane = pane.child(background);
         }
 
-        pane.child(terminal_element).child(self.input_overlay(cx))
+        pane.child(terminal_element)
+            .child(self.ime_canvas(cx))
+            .child(self.mouse_overlay(cx))
     }
 }
 
