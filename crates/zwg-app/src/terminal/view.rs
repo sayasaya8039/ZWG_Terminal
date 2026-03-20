@@ -1425,41 +1425,50 @@ impl TerminalPane {
         changed
     }
 
-    /// Create a canvas element that registers the IME input handler during paint
-    fn ime_canvas(&self, cx: &mut Context<Self>) -> Canvas<()> {
+    /// Create a full-size input overlay that registers IME and captures pointer input.
+    fn input_overlay(&self, cx: &mut Context<Self>) -> Div {
         let entity = cx.entity().clone();
         let focus = self.focus_handle.clone();
         let suppressed = self.input_suppressed.clone();
-        canvas(
-            |_, _, _| (),
-            move |bounds, _, window, cx| {
-                let _ = entity.update(cx, |pane, _cx| {
-                    pane.last_bounds = Some(bounds);
-                });
-                // Don't register IME handler when input is suppressed
-                // (e.g., group editor overlay is open)
-                if !suppressed.load(Ordering::Relaxed) {
-                    log::trace!("IME_TERM register_input handler");
-                    let handler = ElementInputHandler::new(bounds, entity.clone());
-                    window.handle_input(&focus, handler, cx);
-                }
-            },
-        )
-        .size_full()
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_right_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        let _ = entity.update(cx, |pane, _cx| {
+                            pane.last_bounds = Some(bounds);
+                        });
+                        // Don't register IME handler when input is suppressed
+                        // (e.g., group editor overlay is open)
+                        if !suppressed.load(Ordering::Relaxed) {
+                            log::trace!("IME_TERM register_input handler");
+                            let handler = ElementInputHandler::new(bounds, entity.clone());
+                            window.handle_input(&focus, handler, cx);
+                        }
+                    },
+                )
+                .size_full(),
+            )
     }
 
     /// Render the "Connecting..." placeholder (with key buffering support)
     fn render_pending(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let ime = self.ime_canvas(cx);
         div()
             .id("terminal-pane")
+            .relative()
             .size_full()
             .bg(rgb(self.bg_color))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_drop(cx.listener(Self::on_external_paths_drop))
             .flex()
             .items_center()
@@ -1483,7 +1492,7 @@ impl TerminalPane {
                             .child("Initializing ConPTY"),
                     ),
             )
-            .child(ime)
+            .child(self.input_overlay(cx))
     }
 
     /// Render the error state
@@ -1531,7 +1540,6 @@ impl TerminalPane {
         let mut render_snapshot = self.snapshot.clone();
         render_snapshot.cursor_visible &= self.cursor_blink_visible();
 
-        let ime = self.ime_canvas(cx);
         let config = GridRendererConfig {
             cell_width: self.cell_width,
             cell_height: self.cell_height,
@@ -1610,22 +1618,20 @@ impl TerminalPane {
         let mut pane = div()
             .image_cache(retain_all("terminal-background-image-cache"))
             .id("terminal-pane")
+            .relative()
             .size_full()
             .bg(rgb(self.bg_color))
             .overflow_hidden()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_drop(cx.listener(Self::on_external_paths_drop));
 
         if let Some(background) = self.render_background_image() {
             pane = pane.child(background);
         }
 
-        pane.child(terminal_element).child(ime)
+        pane.child(terminal_element).child(self.input_overlay(cx))
     }
 }
 
@@ -1644,15 +1650,7 @@ impl Render for TerminalPane {
 
 impl TerminalPane {
     fn selection_range(&self) -> Option<(SelectionPoint, SelectionPoint)> {
-        let start = self.selection_anchor?;
-        let end = self.selection_head?;
-        if start == end {
-            None
-        } else if start <= end {
-            Some((start, end))
-        } else {
-            Some((end, start))
-        }
+        selection_range_from_points(self.selection_anchor, self.selection_head)
     }
 
     fn clear_selection(&mut self) -> bool {
@@ -2083,6 +2081,24 @@ impl TerminalPane {
         }
     }
 
+    fn on_mouse_right_down(
+        &mut self,
+        _event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle);
+        if self.input_suppressed.load(Ordering::Relaxed) {
+            return;
+        }
+
+        if should_copy_selection_on_right_click(self.selection_range())
+            && self.copy_selection_to_clipboard(cx)
+        {
+            cx.stop_propagation();
+        }
+    }
+
     fn on_mouse_move(
         &mut self,
         event: &MouseMoveEvent,
@@ -2173,6 +2189,27 @@ impl Focusable for TerminalPane {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
+}
+
+fn selection_range_from_points(
+    start: Option<SelectionPoint>,
+    end: Option<SelectionPoint>,
+) -> Option<(SelectionPoint, SelectionPoint)> {
+    let start = start?;
+    let end = end?;
+    if start == end {
+        None
+    } else if start <= end {
+        Some((start, end))
+    } else {
+        Some((end, start))
+    }
+}
+
+fn should_copy_selection_on_right_click(
+    selection: Option<(SelectionPoint, SelectionPoint)>,
+) -> bool {
+    selection.is_some()
 }
 
 // ── IME support via EntityInputHandler ──────────────────────────────
@@ -2359,7 +2396,8 @@ fn slice_text_by_cols(text: &str, start_col: usize, end_col: usize) -> String {
 #[cfg(test)]
 mod snapshot_tests {
     use super::{
-        TerminalPane, scroll_lines_from_wheel_delta, should_defer_keystroke_to_ime_with_state,
+        TerminalPane, scroll_lines_from_wheel_delta, selection_range_from_points,
+        should_copy_selection_on_right_click, should_defer_keystroke_to_ime_with_state,
         should_forward_replace_text_to_terminal, should_route_keystroke_via_text_input_with_state,
         terminal_layout_size, viewport_rows_to_refresh,
     };
@@ -2472,7 +2510,10 @@ mod snapshot_tests {
             key_char: None,
         };
 
-        assert_eq!(TerminalPane::keystroke_to_bytes(&shift_enter), Some(vec![b'\n']));
+        assert_eq!(
+            TerminalPane::keystroke_to_bytes(&shift_enter),
+            Some(vec![b'\n'])
+        );
     }
 
     #[cfg(target_os = "windows")]
@@ -2502,7 +2543,10 @@ mod snapshot_tests {
             key_char: None,
         };
 
-        assert_eq!(TerminalPane::keystroke_to_bytes(&plain_enter), Some(vec![b'\r']));
+        assert_eq!(
+            TerminalPane::keystroke_to_bytes(&plain_enter),
+            Some(vec![b'\r'])
+        );
         assert_eq!(
             TerminalPane::keystroke_to_bytes(&ctrl_shift_enter),
             Some(vec![b'\r'])
@@ -2704,6 +2748,40 @@ mod snapshot_tests {
 
         assert_eq!(width, 1200.0);
         assert_eq!(height, 840.0);
+    }
+
+    #[test]
+    fn selection_range_from_points_orders_reversed_points() {
+        assert_eq!(
+            selection_range_from_points(
+                Some(super::SelectionPoint { row: 2, col: 8 }),
+                Some(super::SelectionPoint { row: 0, col: 3 })
+            ),
+            Some((
+                super::SelectionPoint { row: 0, col: 3 },
+                super::SelectionPoint { row: 2, col: 8 }
+            ))
+        );
+    }
+
+    #[test]
+    fn selection_range_from_points_ignores_single_cell_selection() {
+        assert_eq!(
+            selection_range_from_points(
+                Some(super::SelectionPoint { row: 1, col: 4 }),
+                Some(super::SelectionPoint { row: 1, col: 4 })
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn right_click_copy_requires_existing_selection() {
+        assert!(!should_copy_selection_on_right_click(None));
+        assert!(should_copy_selection_on_right_click(Some((
+            super::SelectionPoint { row: 0, col: 0 },
+            super::SelectionPoint { row: 0, col: 5 }
+        ))));
     }
 }
 
