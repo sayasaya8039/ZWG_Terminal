@@ -1456,23 +1456,6 @@ impl TerminalPane {
             )
     }
 
-    /// Transparent hitbox above the terminal canvas for selection/copy gestures.
-    fn mouse_overlay(&self, cx: &mut Context<Self>) -> Div {
-        div()
-            .absolute()
-            .top_0()
-            .left_0()
-            .size_full()
-            // Block hitboxes behind this layer so GPUI treats the overlay as the sole hover target
-            // for the terminal region (fixes mouse_move not firing when another hitbox "wins").
-            .occlude()
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
-            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_right_down))
-            .on_mouse_move(cx.listener(Self::on_mouse_move))
-            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
-            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-    }
-
     /// Render the "Connecting..." placeholder (with key buffering support)
     fn render_pending(&self, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -1482,6 +1465,11 @@ impl TerminalPane {
             .bg(rgb(self.bg_color))
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_right_down))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_drop(cx.listener(Self::on_external_paths_drop))
             .flex()
             .items_center()
@@ -1506,7 +1494,6 @@ impl TerminalPane {
                     ),
             )
             .child(self.ime_canvas(cx))
-            .child(self.mouse_overlay(cx))
     }
 
     /// Render the error state
@@ -1638,16 +1625,21 @@ impl TerminalPane {
             .overflow_hidden()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(Self::on_key_down))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_right_down))
             .on_scroll_wheel(cx.listener(Self::on_scroll_wheel))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_drop(cx.listener(Self::on_external_paths_drop));
 
         if let Some(background) = self.render_background_image() {
             pane = pane.child(background);
         }
 
-        pane.child(terminal_element)
-            .child(self.ime_canvas(cx))
-            .child(self.mouse_overlay(cx))
+        // Keep the IME registration canvas behind the terminal surface so the
+        // pane itself remains the mouse event owner for drag selection/copy.
+        pane.child(self.ime_canvas(cx)).child(terminal_element)
     }
 }
 
