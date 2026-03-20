@@ -1425,27 +1425,35 @@ impl TerminalPane {
         changed
     }
 
-    /// Create a canvas element that registers the IME input handler during paint.
-    fn ime_canvas(&self, cx: &mut Context<Self>) -> Canvas<()> {
+    /// Create a full-size IME registration layer matching terminal bounds.
+    fn ime_canvas(&self, cx: &mut Context<Self>) -> Div {
         let entity = cx.entity().clone();
         let focus = self.focus_handle.clone();
         let suppressed = self.input_suppressed.clone();
-        canvas(
-            |_, _, _| (),
-            move |bounds, _, window, cx| {
-                let _ = entity.update(cx, |pane, _cx| {
-                    pane.last_bounds = Some(bounds);
-                });
-                // Don't register IME handler when input is suppressed
-                // (e.g., group editor overlay is open)
-                if !suppressed.load(Ordering::Relaxed) {
-                    log::trace!("IME_TERM register_input handler");
-                    let handler = ElementInputHandler::new(bounds, entity.clone());
-                    window.handle_input(&focus, handler, cx);
-                }
-            },
-        )
-        .size_full()
+        div()
+            .absolute()
+            .top_0()
+            .left_0()
+            .right_0()
+            .bottom_0()
+            .child(
+                canvas(
+                    |_, _, _| (),
+                    move |bounds, _, window, cx| {
+                        let _ = entity.update(cx, |pane, _cx| {
+                            pane.last_bounds = Some(bounds);
+                        });
+                        // Don't register IME handler when input is suppressed
+                        // (e.g., group editor overlay is open)
+                        if !suppressed.load(Ordering::Relaxed) {
+                            log::trace!("IME_TERM register_input handler");
+                            let handler = ElementInputHandler::new(bounds, entity.clone());
+                            window.handle_input(&focus, handler, cx);
+                        }
+                    },
+                )
+                .size_full(),
+            )
     }
 
     /// Transparent hitbox above the terminal canvas for selection/copy gestures.
@@ -1455,6 +1463,9 @@ impl TerminalPane {
             .top_0()
             .left_0()
             .size_full()
+            // Block hitboxes behind this layer so GPUI treats the overlay as the sole hover target
+            // for the terminal region (fixes mouse_move not firing when another hitbox "wins").
+            .occlude()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_right_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -1684,14 +1695,16 @@ impl TerminalPane {
 
     fn mouse_to_selection_point(&self, position: Point<Pixels>) -> Option<SelectionPoint> {
         let bounds = self.last_bounds?;
-        let local = bounds.localize(&position)?;
         let row_count = self.snapshot.rows.len();
         if row_count == 0 {
             return None;
         }
 
-        let x = f32::from(local.x);
-        let y = f32::from(local.y);
+        // Clamp to terminal bounds. `Bounds::localize` uses strict `contains` and can drop
+        // borderline coordinates, which would stall or cancel drag selection.
+        let px = |p: Pixels| f32::from(p);
+        let x = px(position.x).clamp(px(bounds.left()), px(bounds.right())) - px(bounds.origin.x);
+        let y = px(position.y).clamp(px(bounds.top()), px(bounds.bottom())) - px(bounds.origin.y);
         let row = (y.max(0.0) / self.cell_height)
             .floor()
             .clamp(0.0, (row_count.saturating_sub(1)) as f32) as u16;
