@@ -1454,8 +1454,7 @@ impl TerminalPane {
             .absolute()
             .top_0()
             .left_0()
-            .right_0()
-            .bottom_0()
+            .size_full()
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_down(MouseButton::Right, cx.listener(Self::on_mouse_right_down))
             .on_mouse_move(cx.listener(Self::on_mouse_move))
@@ -2111,7 +2110,7 @@ impl TerminalPane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.is_selecting || event.pressed_button != Some(MouseButton::Left) {
+        if !self.is_selecting {
             return;
         }
         if let Some(point) = self.mouse_to_selection_point(event.position) {
