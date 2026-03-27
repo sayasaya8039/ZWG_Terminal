@@ -12,7 +12,8 @@ use windows::{
         },
         UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
-            SetWindowPos, ShowWindow, WS_CHILD, WS_CLIPSIBLINGS, WS_DISABLED, WS_VISIBLE,
+            SetWindowPos, ShowWindow, WS_CHILD, WS_CLIPSIBLINGS, WS_DISABLED, WS_EX_TRANSPARENT,
+            WS_VISIBLE,
         },
     },
     core::{Interface, w},
@@ -160,7 +161,7 @@ fn create_child_window(parent_hwnd: HWND, bounds: Bounds<Pixels>) -> Result<HWND
     let rect = bounds_to_rect(bounds);
     let hwnd = unsafe {
         CreateWindowExW(
-            Default::default(),
+            WS_EX_TRANSPARENT,
             w!("STATIC"),
             None,
             WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_DISABLED,

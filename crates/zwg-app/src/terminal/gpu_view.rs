@@ -18,7 +18,6 @@ use windows::Win32::Foundation::HWND;
 
 use super::grid_renderer::{
     GlyphCache, GridRendererConfig, SelectionPoint, TerminalSnapshot, glyph_requires_gpui_overlay,
-    paint_geometry_cell,
 };
 #[cfg(target_os = "windows")]
 use super::native_gpu_presenter::NativeGpuPresenter;
@@ -28,6 +27,13 @@ pub(super) struct CursorOverlay {
     pub row: u16,
     pub col: u16,
     pub width: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PackedRefresh {
+    Unchanged,
+    Full,
+    Partial,
 }
 
 /// Wraps the DX12 GpuRenderer with frame-to-frame image caching.
@@ -43,6 +49,8 @@ pub(super) struct GpuTerminalState {
     last_packed_revision: u64,
     /// Temporary frame payload with cursor/selection overlays applied.
     frame_cells: Vec<ghostty_vt::GpuCellData>,
+    last_cursor: Option<CursorOverlay>,
+    last_selection: Option<(SelectionPoint, SelectionPoint)>,
     #[cfg(target_os = "windows")]
     native_presenter: Option<NativeGpuPresenter>,
 }
@@ -65,6 +73,8 @@ impl GpuTerminalState {
             packed_row_offsets: Vec::new(),
             last_packed_revision: u64::MAX,
             frame_cells: Vec::new(),
+            last_cursor: None,
+            last_selection: None,
             #[cfg(target_os = "windows")]
             native_presenter: None,
         })
@@ -87,7 +97,7 @@ impl GpuTerminalState {
         term_cols: u16,
         default_fg: u32,
         default_bg: u32,
-    ) {
+    ) -> PackedRefresh {
         if self.last_packed_revision != snapshot.content_revision {
             let needs_full_rebuild = self.packed_rows.len() != snapshot.rows.len()
                 || self.last_packed_revision == u64::MAX
@@ -108,7 +118,7 @@ impl GpuTerminalState {
                     &mut self.packed_row_offsets,
                 );
                 self.last_packed_revision = snapshot.content_revision;
-                return;
+                return PackedRefresh::Full;
             } else {
                 let mut can_patch_flattened = true;
                 for &row_idx in &snapshot.damaged_rows {
@@ -136,7 +146,7 @@ impl GpuTerminalState {
                         &mut self.packed_cells,
                     );
                     self.last_packed_revision = snapshot.content_revision;
-                    return;
+                    return PackedRefresh::Partial;
                 } else {
                     rebuild_packed_cells_from_rows(
                         &self.packed_rows,
@@ -144,10 +154,11 @@ impl GpuTerminalState {
                         &mut self.packed_row_offsets,
                     );
                     self.last_packed_revision = snapshot.content_revision;
-                    return;
+                    return PackedRefresh::Full;
                 }
             }
         }
+        PackedRefresh::Unchanged
     }
 
     #[cfg(target_os = "windows")]
@@ -159,58 +170,57 @@ impl GpuTerminalState {
 
     fn prepare_frame_cells(
         &mut self,
+        snapshot: &TerminalSnapshot,
+        refresh: PackedRefresh,
         row_count: usize,
         term_cols: u16,
         cursor: Option<CursorOverlay>,
         selection: Option<(SelectionPoint, SelectionPoint)>,
     ) -> bool {
-        if cursor.is_none() && selection.is_none() {
+        if cursor.is_none()
+            && selection.is_none()
+            && self.last_cursor.is_none()
+            && self.last_selection.is_none()
+        {
             self.frame_cells.clear();
             return false;
         }
 
-        self.frame_cells.clear();
-        self.frame_cells.extend_from_slice(&self.packed_cells);
-
-        if let Some((sel_start, sel_end)) = selection {
-            let max_row = sel_end.row.min(row_count.saturating_sub(1) as u16);
-            for row in sel_start.row..=max_row {
-                let sc = if row == sel_start.row {
-                    sel_start.col
-                } else {
-                    0
-                };
-                let ec = if row == sel_end.row {
-                    sel_end.col
-                } else {
-                    term_cols
-                };
-                if sc >= ec {
-                    continue;
-                }
-                if let Some(&offset) = self.packed_row_offsets.get(row as usize) {
-                    for col in sc..ec {
-                        let index = offset + col as usize;
-                        if let Some(cell) = self.frame_cells.get_mut(index) {
-                            cell.bg_rgba = 0xFF2F_6FED;
-                        }
-                    }
-                }
-            }
+        let needs_full_copy = matches!(refresh, PackedRefresh::Full)
+            || self.frame_cells.len() != self.packed_cells.len();
+        if needs_full_copy {
+            self.frame_cells.clear();
+            self.frame_cells.extend_from_slice(&self.packed_cells);
+        } else {
+            patch_packed_cells_from_rows(
+                &self.packed_rows,
+                &snapshot.damaged_rows,
+                &self.packed_row_offsets,
+                &mut self.frame_cells,
+            );
+            let stale_overlay_rects =
+                overlay_damage_rects(term_cols, self.last_cursor, self.last_selection, None, None);
+            restore_damage_rects(
+                &self.packed_cells,
+                &mut self.frame_cells,
+                &self.packed_row_offsets,
+                &stale_overlay_rects,
+            );
         }
 
-        if let Some(cursor) = cursor {
-            if let Some(&offset) = self.packed_row_offsets.get(cursor.row as usize) {
-                let width = cursor.width.max(1.0).round() as usize;
-                for dx in 0..width {
-                    let index = offset + cursor.col as usize + dx;
-                    if let Some(cell) = self.frame_cells.get_mut(index) {
-                        cell.bg_rgba = 0xFFF5_F5F7;
-                        cell.fg_rgba = 0xFF00_0000;
-                    }
-                }
-            }
-        }
+        paint_selection_overlay(
+            &mut self.frame_cells,
+            &self.packed_row_offsets,
+            row_count,
+            term_cols,
+            selection,
+        );
+        paint_cursor_overlay(
+            &mut self.frame_cells,
+            &self.packed_row_offsets,
+            term_cols,
+            cursor,
+        );
 
         true
     }
@@ -246,13 +256,37 @@ impl GpuTerminalState {
             }
         }
 
-        self.refresh_packed_cells(snapshot, config.term_cols, config.fg_color, config.bg_color);
+        let refresh =
+            self.refresh_packed_cells(snapshot, config.term_cols, config.fg_color, config.bg_color);
         if self.packed_cells.is_empty() {
             return false;
         }
         let row_count = snapshot.rows.len();
-        let use_frame_cells =
-            self.prepare_frame_cells(row_count, config.term_cols, cursor, selection);
+        let use_frame_cells = self.prepare_frame_cells(
+            snapshot,
+            refresh,
+            row_count,
+            config.term_cols,
+            cursor,
+            selection,
+        );
+        let damage_rects = if matches!(refresh, PackedRefresh::Full) {
+            Vec::new()
+        } else {
+            compute_damage_rects(
+                snapshot,
+                config.term_cols,
+                cursor,
+                self.last_cursor,
+                selection,
+                self.last_selection,
+            )
+        };
+        let dirty_cells = if matches!(refresh, PackedRefresh::Full) {
+            Vec::new()
+        } else {
+            compute_dirty_cells_from_rects(&damage_rects, config.term_cols)
+        };
 
         if self.native_presenter.is_none() {
             self.native_presenter = NativeGpuPresenter::new(
@@ -276,18 +310,38 @@ impl GpuTerminalState {
         if presenter.sync_bounds(parent_hwnd, bounds).is_err() {
             return false;
         }
+        if matches!(refresh, PackedRefresh::Unchanged) && damage_rects.is_empty() {
+            self.last_cursor = cursor;
+            self.last_selection = selection;
+            return true;
+        }
         let Some(back_buffer_ptr) = presenter.current_back_buffer_ptr() else {
             return false;
         };
-        if !self.renderer.render_to_surface(
-            back_buffer_ptr,
-            cells,
-            config.term_cols as u32,
-            config.cell_width,
-            config.cell_height,
-        ) {
+        let rendered = if matches!(refresh, PackedRefresh::Full) {
+            self.renderer.render_to_surface(
+                back_buffer_ptr,
+                cells,
+                config.term_cols as u32,
+                config.cell_width,
+                config.cell_height,
+            )
+        } else {
+            self.renderer.render_to_surface_delta_cells(
+                back_buffer_ptr,
+                cells,
+                &dirty_cells,
+                &damage_rects,
+                config.term_cols as u32,
+                config.cell_width,
+                config.cell_height,
+            )
+        };
+        if !rendered {
             return false;
         }
+        self.last_cursor = cursor;
+        self.last_selection = selection;
         presenter.present().is_ok()
     }
 }
@@ -307,80 +361,6 @@ fn window_hwnd(window: &Window) -> anyhow::Result<HWND> {
     match handle.as_raw() {
         RawWindowHandle::Win32(raw) => Ok(HWND(raw.hwnd.get() as *mut core::ffi::c_void)),
         _ => Err(anyhow::anyhow!("GPUI window is not a Win32 window")),
-    }
-}
-
-fn paint_terminal_overlays(
-    bounds: Bounds<Pixels>,
-    row_count: usize,
-    cursor: Option<CursorOverlay>,
-    selection: Option<(SelectionPoint, SelectionPoint)>,
-    config: GridRendererConfig,
-    window: &mut Window,
-) {
-    if let Some((sel_start, sel_end)) = selection {
-        let max_row = sel_end.row.min(row_count.saturating_sub(1) as u16);
-        for row in sel_start.row..=max_row {
-            let sc = if row == sel_start.row {
-                sel_start.col
-            } else {
-                0
-            };
-            let ec = if row == sel_end.row {
-                sel_end.col
-            } else {
-                config.term_cols
-            };
-            if sc >= ec {
-                continue;
-            }
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(
-                        bounds.origin.x
-                            + px(config.horizontal_text_padding + sc as f32 * config.cell_width),
-                        bounds.origin.y + px(row as f32 * config.cell_height),
-                    ),
-                    size(
-                        px((ec - sc) as f32 * config.cell_width),
-                        px(config.cell_height),
-                    ),
-                ),
-                rgba(0x2F6FED55),
-            ));
-        }
-    }
-
-    if let Some(cursor) = cursor {
-        if (cursor.row as usize) < row_count {
-            window.paint_quad(fill(
-                Bounds::new(
-                    point(
-                        bounds.origin.x
-                            + px(config.horizontal_text_padding
-                                + cursor.col as f32 * config.cell_width),
-                        bounds.origin.y + px(cursor.row as f32 * config.cell_height),
-                    ),
-                    size(px(config.cell_width * cursor.width), px(config.cell_height)),
-                ),
-                rgba(0xF5F5F780),
-            ));
-        }
-    }
-}
-
-fn paint_geometry_rows(
-    snapshot: &TerminalSnapshot,
-    bounds: Bounds<Pixels>,
-    config: &GridRendererConfig,
-    window: &mut Window,
-) {
-    for (row_idx, row) in snapshot.rows.iter().enumerate() {
-        for cell in &row.cells {
-            if cell.kind == super::grid_renderer::GridCellKind::GeometricBlock {
-                paint_geometry_cell(row_idx as u16, cell, bounds, config, window);
-            }
-        }
     }
 }
 
@@ -479,6 +459,296 @@ fn patch_packed_cells_from_rows(
     }
 }
 
+fn restore_damage_rects(
+    packed_cells: &[ghostty_vt::GpuCellData],
+    frame_cells: &mut [ghostty_vt::GpuCellData],
+    packed_row_offsets: &[usize],
+    rects: &[ghostty_vt::GpuDamageRect],
+) {
+    for rect in rects {
+        for row in rect.row_start..rect.row_start + rect.row_count {
+            let Some(&offset) = packed_row_offsets.get(row as usize) else {
+                continue;
+            };
+            let start = offset + rect.start_col as usize;
+            let end = start + rect.col_count as usize;
+            if end <= packed_cells.len() && end <= frame_cells.len() {
+                frame_cells[start..end].copy_from_slice(&packed_cells[start..end]);
+            }
+        }
+    }
+}
+
+fn paint_selection_overlay(
+    frame_cells: &mut [ghostty_vt::GpuCellData],
+    packed_row_offsets: &[usize],
+    row_count: usize,
+    term_cols: u16,
+    selection: Option<(SelectionPoint, SelectionPoint)>,
+) {
+    if let Some((sel_start, sel_end)) = selection {
+        let max_row = sel_end.row.min(row_count.saturating_sub(1) as u16);
+        for row in sel_start.row..=max_row {
+            let sc = if row == sel_start.row {
+                sel_start.col
+            } else {
+                0
+            };
+            let ec = if row == sel_end.row {
+                sel_end.col
+            } else {
+                term_cols
+            };
+            if sc >= ec {
+                continue;
+            }
+            if let Some(&offset) = packed_row_offsets.get(row as usize) {
+                for col in sc..ec {
+                    let index = offset + col as usize;
+                    if let Some(cell) = frame_cells.get_mut(index) {
+                        cell.bg_rgba = 0xFF2F_6FED;
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn paint_cursor_overlay(
+    frame_cells: &mut [ghostty_vt::GpuCellData],
+    packed_row_offsets: &[usize],
+    term_cols: u16,
+    cursor: Option<CursorOverlay>,
+) {
+    if let Some(cursor) = cursor {
+        if let Some(&offset) = packed_row_offsets.get(cursor.row as usize) {
+            let width = cursor.width.max(1.0).round() as u16;
+            let end_col = (cursor.col + width).min(term_cols);
+            for col in cursor.col..end_col {
+                let index = offset + col as usize;
+                if let Some(cell) = frame_cells.get_mut(index) {
+                    cell.bg_rgba = 0xFFF5_F5F7;
+                    cell.fg_rgba = 0xFF00_0000;
+                }
+            }
+        }
+    }
+}
+
+fn push_rect(
+    rects: &mut Vec<ghostty_vt::GpuDamageRect>,
+    row_start: u32,
+    row_count: u32,
+    start_col: u32,
+    col_count: u32,
+) {
+    if row_count == 0 || col_count == 0 {
+        return;
+    }
+    rects.push(ghostty_vt::GpuDamageRect {
+        start_col,
+        col_count,
+        row_start,
+        row_count,
+    });
+}
+
+fn append_selection_rects(
+    rects: &mut Vec<ghostty_vt::GpuDamageRect>,
+    selection: Option<(SelectionPoint, SelectionPoint)>,
+    term_cols: u16,
+) {
+    let Some((sel_start, sel_end)) = selection else {
+        return;
+    };
+    for row in sel_start.row..=sel_end.row {
+        let start_col = if row == sel_start.row {
+            sel_start.col
+        } else {
+            0
+        };
+        let end_col = if row == sel_end.row {
+            sel_end.col
+        } else {
+            term_cols
+        };
+        if start_col >= end_col {
+            continue;
+        }
+        push_rect(
+            rects,
+            row as u32,
+            1,
+            start_col as u32,
+            (end_col - start_col) as u32,
+        );
+    }
+}
+
+fn append_cursor_rect(
+    rects: &mut Vec<ghostty_vt::GpuDamageRect>,
+    cursor: Option<CursorOverlay>,
+    term_cols: u16,
+) {
+    let Some(cursor) = cursor else {
+        return;
+    };
+    let width = cursor.width.max(1.0).round() as u16;
+    let end_col = (cursor.col + width).min(term_cols);
+    if cursor.col >= end_col {
+        return;
+    }
+    push_rect(
+        rects,
+        cursor.row as u32,
+        1,
+        cursor.col as u32,
+        (end_col - cursor.col) as u32,
+    );
+}
+
+fn merge_damage_rects(
+    mut rects: Vec<ghostty_vt::GpuDamageRect>,
+    term_cols: u16,
+) -> Vec<ghostty_vt::GpuDamageRect> {
+    rects.retain(|rect| {
+        rect.col_count != 0 && rect.row_count != 0 && rect.start_col < term_cols as u32
+    });
+    rects.sort_unstable_by_key(|rect| {
+        (
+            rect.row_start,
+            rect.row_count,
+            rect.start_col,
+            rect.col_count,
+        )
+    });
+
+    let mut row_merged: Vec<ghostty_vt::GpuDamageRect> = Vec::with_capacity(rects.len());
+    for rect in rects {
+        if let Some(last) = row_merged.last_mut() {
+            let last_col_end = last.start_col + last.col_count;
+            let rect_col_end = rect.start_col + rect.col_count;
+            if last.row_start == rect.row_start
+                && last.row_count == rect.row_count
+                && rect.start_col <= last_col_end
+            {
+                last.col_count = last
+                    .col_count
+                    .max(rect_col_end.saturating_sub(last.start_col));
+                continue;
+            }
+        }
+        row_merged.push(rect);
+    }
+
+    row_merged.sort_unstable_by_key(|rect| (rect.start_col, rect.col_count, rect.row_start));
+    let mut merged: Vec<ghostty_vt::GpuDamageRect> = Vec::with_capacity(row_merged.len());
+    for rect in row_merged {
+        if let Some(last) = merged.last_mut() {
+            let last_row_end = last.row_start + last.row_count;
+            if last.start_col == rect.start_col
+                && last.col_count == rect.col_count
+                && rect.row_start <= last_row_end
+            {
+                let rect_end = rect.row_start + rect.row_count;
+                last.row_count = last.row_count.max(rect_end.saturating_sub(last.row_start));
+                continue;
+            }
+        }
+        merged.push(rect);
+    }
+
+    merged
+}
+
+fn compute_damage_rects(
+    snapshot: &TerminalSnapshot,
+    term_cols: u16,
+    cursor: Option<CursorOverlay>,
+    previous_cursor: Option<CursorOverlay>,
+    selection: Option<(SelectionPoint, SelectionPoint)>,
+    previous_selection: Option<(SelectionPoint, SelectionPoint)>,
+) -> Vec<ghostty_vt::GpuDamageRect> {
+    let mut rects = Vec::new();
+
+    for &row_idx in &snapshot.damaged_rows {
+        let Some(row) = snapshot.rows.get(row_idx as usize) else {
+            continue;
+        };
+        if row.damage_spans.is_empty() {
+            push_rect(&mut rects, row_idx as u32, 1, 0, term_cols as u32);
+            continue;
+        }
+        for span in &row.damage_spans {
+            if span.start_col >= span.end_col {
+                continue;
+            }
+            push_rect(
+                &mut rects,
+                row_idx as u32,
+                1,
+                span.start_col as u32,
+                (span.end_col - span.start_col) as u32,
+            );
+        }
+    }
+
+    rects.extend(overlay_damage_rects(
+        term_cols,
+        cursor,
+        selection,
+        previous_cursor,
+        previous_selection,
+    ));
+
+    merge_damage_rects(rects, term_cols)
+}
+
+fn compute_dirty_cells_from_rects(
+    rects: &[ghostty_vt::GpuDamageRect],
+    term_cols: u16,
+) -> Vec<ghostty_vt::GpuDirtyCell> {
+    if term_cols == 0 || rects.is_empty() {
+        return Vec::new();
+    }
+
+    let term_cols_u32 = term_cols as u32;
+    let mut cells = Vec::new();
+    for rect in rects {
+        if rect.col_count == 0 || rect.row_count == 0 || rect.start_col >= term_cols_u32 {
+            continue;
+        }
+        let col_end = (rect.start_col + rect.col_count).min(term_cols_u32);
+        for row in rect.row_start..rect.row_start + rect.row_count {
+            let row_base = row * term_cols_u32;
+            for col in rect.start_col..col_end {
+                cells.push(ghostty_vt::GpuDirtyCell {
+                    instance_index: row_base + col,
+                });
+            }
+        }
+    }
+
+    cells.sort_unstable_by_key(|cell| cell.instance_index);
+    cells.dedup_by_key(|cell| cell.instance_index);
+    cells
+}
+
+fn overlay_damage_rects(
+    term_cols: u16,
+    cursor: Option<CursorOverlay>,
+    selection: Option<(SelectionPoint, SelectionPoint)>,
+    previous_cursor: Option<CursorOverlay>,
+    previous_selection: Option<(SelectionPoint, SelectionPoint)>,
+) -> Vec<ghostty_vt::GpuDamageRect> {
+    let mut rects = Vec::new();
+    append_cursor_rect(&mut rects, previous_cursor, term_cols);
+    append_cursor_rect(&mut rects, cursor, term_cols);
+    append_selection_rects(&mut rects, previous_selection, term_cols);
+    append_selection_rects(&mut rects, selection, term_cols);
+    merge_damage_rects(rects, term_cols)
+}
+
 /// Create a GPUI Canvas element that renders the terminal via DX12 GPU pipeline.
 ///
 /// This keeps GPUI alive for layout/input while the pixels are presented by a native DXGI swapchain.
@@ -521,9 +791,11 @@ mod tests {
     use gpui::SharedString;
 
     use super::{
+        CursorOverlay, compute_damage_rects, compute_dirty_cells_from_rects,
         patch_packed_cells_from_rows, rebuild_packed_cells_from_rows, row_to_gpu_cells,
         snapshot_can_present_natively,
     };
+    use crate::terminal::grid_renderer::SelectionPoint;
     use crate::terminal::grid_renderer::{
         CachedTerminalRow, DamageSpan, GridCell, GridCellKind, TerminalSnapshot,
     };
@@ -583,6 +855,35 @@ mod tests {
         let packed = row_to_gpu_cells(&row, 2, 2, 0xAABBCC, 0x112233);
         assert_eq!(packed.len(), 2);
         assert_eq!(packed[0].codepoint, '─' as u32);
+    }
+
+    #[test]
+    fn row_to_gpu_cells_preserves_cjk_codepoint() {
+        let row = CachedTerminalRow {
+            text: SharedString::from("漢"),
+            style_runs: Vec::new(),
+            cells: vec![GridCell {
+                col: 1,
+                width: 2,
+                glyph: "漢".into(),
+                fg_rgb: 0x223344,
+                bg_rgb: 0x556677,
+                flags: 0,
+                kind: GridCellKind::Text,
+            }],
+            glyph_instances: Vec::new(),
+            damage_spans: vec![DamageSpan {
+                start_col: 1,
+                end_col: 3,
+            }],
+            damaged_glyph_instances: Vec::new(),
+        };
+
+        let packed = row_to_gpu_cells(&row, 4, 4, 0xAABBCC, 0x112233);
+        assert_eq!(packed[1].codepoint, '漢' as u32);
+        assert_eq!(packed[2].codepoint, 0);
+        assert_eq!(packed[1].fg_rgba, 0xFF223344);
+        assert_eq!(packed[2].bg_rgba, 0xFF556677);
     }
 
     #[test]
@@ -661,6 +962,134 @@ mod tests {
         assert_eq!(packed[0].codepoint, 'A' as u32);
         assert_eq!(packed[1].codepoint, 'Z' as u32);
         assert_eq!(packed[1].fg_rgba, 9);
+    }
+
+    #[test]
+    fn compute_damage_rects_merges_adjacent_rows_with_same_columns() {
+        let mut snapshot = TerminalSnapshot::new(3);
+        snapshot.damaged_rows = vec![0, 1, 2];
+        snapshot.rows[0].damage_spans = vec![DamageSpan {
+            start_col: 2,
+            end_col: 5,
+        }];
+        snapshot.rows[1].damage_spans = vec![DamageSpan {
+            start_col: 2,
+            end_col: 5,
+        }];
+        snapshot.rows[2].damage_spans = vec![DamageSpan {
+            start_col: 6,
+            end_col: 8,
+        }];
+
+        let rects = compute_damage_rects(&snapshot, 10, None, None, None, None);
+        assert_eq!(rects.len(), 2);
+        assert_eq!(rects[0].start_col, 2);
+        assert_eq!(rects[0].col_count, 3);
+        assert_eq!(rects[0].row_start, 0);
+        assert_eq!(rects[0].row_count, 2);
+        assert_eq!(rects[1].start_col, 6);
+        assert_eq!(rects[1].row_start, 2);
+    }
+
+    #[test]
+    fn compute_damage_rects_merges_adjacent_spans_on_same_row_before_vertical_merge() {
+        let mut snapshot = TerminalSnapshot::new(2);
+        snapshot.damaged_rows = vec![0, 1];
+        snapshot.rows[0].damage_spans = vec![
+            DamageSpan {
+                start_col: 2,
+                end_col: 4,
+            },
+            DamageSpan {
+                start_col: 4,
+                end_col: 6,
+            },
+        ];
+        snapshot.rows[1].damage_spans = vec![DamageSpan {
+            start_col: 2,
+            end_col: 6,
+        }];
+
+        let rects = compute_damage_rects(&snapshot, 10, None, None, None, None);
+        assert_eq!(rects.len(), 1);
+        assert_eq!(rects[0].start_col, 2);
+        assert_eq!(rects[0].col_count, 4);
+        assert_eq!(rects[0].row_start, 0);
+        assert_eq!(rects[0].row_count, 2);
+    }
+
+    #[test]
+    fn compute_dirty_cells_from_rects_sorts_and_deduplicates_overlap() {
+        let rects = vec![
+            ghostty_vt::GpuDamageRect {
+                start_col: 1,
+                col_count: 3,
+                row_start: 2,
+                row_count: 1,
+            },
+            ghostty_vt::GpuDamageRect {
+                start_col: 3,
+                col_count: 2,
+                row_start: 2,
+                row_count: 1,
+            },
+        ];
+
+        let cells = compute_dirty_cells_from_rects(&rects, 8);
+        let indices: Vec<u32> = cells.into_iter().map(|cell| cell.instance_index).collect();
+        assert_eq!(indices, vec![17, 18, 19, 20]);
+    }
+
+    #[test]
+    fn compute_dirty_cells_from_rects_expands_scroll_like_full_rows() {
+        let rects = vec![ghostty_vt::GpuDamageRect {
+            start_col: 0,
+            col_count: 6,
+            row_start: 3,
+            row_count: 2,
+        }];
+
+        let cells = compute_dirty_cells_from_rects(&rects, 6);
+        let indices: Vec<u32> = cells.into_iter().map(|cell| cell.instance_index).collect();
+        assert_eq!(
+            indices,
+            vec![18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29]
+        );
+    }
+
+    #[test]
+    fn compute_damage_rects_includes_cursor_and_selection_changes() {
+        let snapshot = TerminalSnapshot::new(4);
+
+        let rects = compute_damage_rects(
+            &snapshot,
+            12,
+            Some(CursorOverlay {
+                row: 1,
+                col: 3,
+                width: 2.0,
+            }),
+            Some(CursorOverlay {
+                row: 0,
+                col: 1,
+                width: 1.0,
+            }),
+            Some((
+                SelectionPoint { row: 2, col: 4 },
+                SelectionPoint { row: 3, col: 7 },
+            )),
+            None,
+        );
+
+        assert!(rects.iter().any(|rect| {
+            rect.row_start == 0 && rect.row_count == 1 && rect.start_col == 1 && rect.col_count == 1
+        }));
+        assert!(rects.iter().any(|rect| {
+            rect.row_start == 1 && rect.row_count == 1 && rect.start_col == 3 && rect.col_count == 2
+        }));
+        assert!(rects.iter().any(|rect| {
+            rect.row_start == 2 && rect.row_count == 1 && rect.start_col == 4 && rect.col_count == 8
+        }));
     }
 
     #[test]

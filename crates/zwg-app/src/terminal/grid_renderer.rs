@@ -16,6 +16,7 @@ pub(super) type GlyphCache = Arc<Mutex<HashMap<GlyphKey, PreparedGlyphPlan>>>;
 #[cfg(not(feature = "ghostty_vt"))]
 pub(super) type GlyphCache = ();
 
+#[cfg(any(test, not(feature = "ghostty_vt")))]
 const BRAILLE_BLANK: char = '\u{2800}';
 
 #[cfg(feature = "ghostty_vt")]
@@ -239,6 +240,7 @@ pub(crate) fn is_geometry_char(ch: char) -> bool {
     is_geometric_block_char(ch) || is_box_drawing_char(ch)
 }
 
+#[cfg(any(test, not(feature = "ghostty_vt")))]
 pub(crate) fn sanitize_text_for_shaping(text: &str) -> String {
     text.chars()
         .map(|ch| {
@@ -589,7 +591,7 @@ pub(crate) fn patch_glyph_instances_in_damage(
     instances
 }
 
-#[cfg(feature = "ghostty_vt")]
+#[cfg(all(test, feature = "ghostty_vt"))]
 pub(crate) fn glyph_instances_from_row(
     row: &CachedTerminalRow,
     row_idx: u16,
@@ -790,62 +792,6 @@ fn paint_glyph_instance(
             glyph_color,
         ));
     }
-}
-
-#[cfg(feature = "ghostty_vt")]
-pub(super) fn paint_gpu_overlay_glyphs(
-    snapshot: &TerminalSnapshot,
-    bounds: Bounds<Pixels>,
-    config: &GridRendererConfig,
-    window: &mut Window,
-    cx: &mut App,
-    glyph_cache: &GlyphCache,
-) {
-    let text_system = window.text_system().clone();
-    let font_desc = font(config.font_family.clone());
-    let font_size = px(config.font_size);
-    let mut active_glyph_keys: HashSet<GlyphKey> = HashSet::new();
-    let mut glyph_layout_cache = {
-        let shared = glyph_cache.lock();
-        active_glyph_keys.extend(
-            snapshot
-                .rows
-                .iter()
-                .flat_map(|row| row.glyph_instances.iter())
-                .filter(|instance| glyph_requires_gpui_overlay(&instance.key.glyph))
-                .map(|instance| instance.key.clone()),
-        );
-        shared
-            .iter()
-            .filter_map(|(key, plan)| {
-                active_glyph_keys
-                    .contains(key)
-                    .then(|| (key.clone(), plan.clone()))
-            })
-            .collect::<HashMap<_, _>>()
-    };
-
-    for row_data in &snapshot.rows {
-        for instance in &row_data.glyph_instances {
-            if !glyph_requires_gpui_overlay(&instance.key.glyph) {
-                continue;
-            }
-            let layout = glyph_layout_for_key(
-                &instance.key,
-                &text_system,
-                &font_desc,
-                font_size,
-                config.cell_height,
-                &mut glyph_layout_cache,
-            );
-            paint_glyph_instance(instance, &layout, bounds, config, window);
-        }
-    }
-
-    let mut cache = glyph_cache.lock();
-    prune_glyph_cache(&mut cache, &active_glyph_keys);
-    persist_active_glyph_plans(&mut cache, &glyph_layout_cache, &active_glyph_keys);
-    let _ = cx;
 }
 
 fn paint_geometry_rect(
@@ -1157,7 +1103,7 @@ pub(crate) fn grid_cell_style_at(
         .unwrap_or_else(|| default_grid_cell_style(default_fg, default_bg))
 }
 
-#[cfg(feature = "ghostty_vt")]
+#[cfg(all(test, feature = "ghostty_vt"))]
 pub(crate) fn grid_cells_from_row(
     row: &CachedTerminalRow,
     max_cols: u16,
@@ -1417,7 +1363,7 @@ pub(super) fn terminal_canvas(
     .size_full()
 }
 
-#[cfg(feature = "ghostty_vt")]
+#[cfg(all(test, feature = "ghostty_vt"))]
 fn build_canvas_text_runs(
     text: &str,
     style_runs: &[ghostty_vt::StyleRun],

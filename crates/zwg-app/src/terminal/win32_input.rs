@@ -2,13 +2,12 @@ use std::fmt::Write as _;
 
 const WIN32_INPUT_MODE_ENABLE: &[u8] = b"\x1b[?9001h";
 const WIN32_INPUT_MODE_DISABLE: &[u8] = b"\x1b[?9001l";
-const WIN32_INPUT_MODE_TAIL_LEN: usize = if WIN32_INPUT_MODE_ENABLE.len()
-    > WIN32_INPUT_MODE_DISABLE.len()
-{
-    WIN32_INPUT_MODE_ENABLE.len() - 1
-} else {
-    WIN32_INPUT_MODE_DISABLE.len() - 1
-};
+const WIN32_INPUT_MODE_TAIL_LEN: usize =
+    if WIN32_INPUT_MODE_ENABLE.len() > WIN32_INPUT_MODE_DISABLE.len() {
+        WIN32_INPUT_MODE_ENABLE.len() - 1
+    } else {
+        WIN32_INPUT_MODE_DISABLE.len() - 1
+    };
 
 #[derive(Debug, Default)]
 pub(crate) struct Win32InputModeTracker {
@@ -86,8 +85,8 @@ mod tests {
 
     #[test]
     fn encode_win32_input_text_emits_key_records_for_each_utf16_unit() {
-        let encoded =
-            String::from_utf8(encode_win32_input_text("・")).expect("encoded sequence should be utf8");
+        let encoded = String::from_utf8(encode_win32_input_text("・"))
+            .expect("encoded sequence should be utf8");
 
         assert_eq!(encoded, "\x1b[0;0;12539;1;0;1_\x1b[0;0;12539;0;0;1_");
     }
