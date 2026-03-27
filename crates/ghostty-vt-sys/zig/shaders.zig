@@ -217,3 +217,26 @@ pub const PS_SOURCE: []const u8 =
     \\    return lerp(i.bg, float4(i.fg.rgb, 1), a);
     \\}
 ;
+
+/// Compute shader (cs_5_0)
+/// Applies compact dirty cell payloads into the persistent GPU cell buffer.
+pub const CS_SOURCE: []const u8 =
+    \\struct CellData {
+    \\    uint glyph_idx;
+    \\    uint codepoint;
+    \\    uint fg_rgba;
+    \\    uint bg_rgba;
+    \\    uint attrs;
+    \\};
+    \\
+    \\StructuredBuffer<CellData> dirty_values : register(t0);
+    \\StructuredBuffer<uint> dirty_indices : register(t1);
+    \\RWStructuredBuffer<CellData> dst_cells : register(u0);
+    \\
+    \\[numthreads(64, 1, 1)]
+    \\void main(uint3 dispatch_thread_id : SV_DispatchThreadID) {
+    \\    uint index = dispatch_thread_id.x;
+    \\    uint dst_index = dirty_indices[index];
+    \\    dst_cells[dst_index] = dirty_values[index];
+    \\}
+;

@@ -13,6 +13,8 @@ const std = @import("std");
 /// 4MB ring buffer capacity (power of 2 for bitmask modulo)
 pub const RING_CAPACITY: usize = 4 * 1024 * 1024;
 const RING_MASK: usize = RING_CAPACITY - 1;
+const OUTPUT_COALESCE_NS: u64 = 2 * std.time.ns_per_ms;
+const DRAIN_BUFFER_CAPACITY: usize = 256 * 1024;
 
 /// Single-Producer Single-Consumer lock-free ring buffer.
 ///
@@ -158,16 +160,23 @@ pub const AsyncFeeder = struct {
     }
 
     fn parserLoop(self: *AsyncFeeder) void {
-        // 64KB drain buffer — matches typical PTY burst sizes
-        var drain_buf: [65536]u8 = undefined;
+        // 256KB drain buffer to coalesce short PTY bursts into a single feed.
+        var drain_buf: [DRAIN_BUFFER_CAPACITY]u8 = undefined;
         var idle_count: u32 = 0;
 
         while (!@atomicLoad(bool, &self.stop_flag, .acquire)) {
             const n = self.ring.pop(&drain_buf);
             if (n > 0) {
                 idle_count = 0;
+                var total = n;
+                std.Thread.sleep(OUTPUT_COALESCE_NS);
+                while (total < drain_buf.len) {
+                    const drained = self.ring.pop(drain_buf[total..]);
+                    if (drained == 0) break;
+                    total += drained;
+                }
                 self.terminal_mutex.lock();
-                self.feed_fn(self.feed_ctx, drain_buf[0..n].ptr, n);
+                self.feed_fn(self.feed_ctx, drain_buf[0..total].ptr, total);
                 self.terminal_mutex.unlock();
                 @atomicStore(bool, &self.new_data_flag, true, .release);
             } else {

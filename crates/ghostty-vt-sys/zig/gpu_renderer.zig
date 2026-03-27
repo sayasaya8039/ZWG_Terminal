@@ -37,6 +37,24 @@ pub const GpuDirtyRange = extern struct {
     row_count: u32,
 };
 
+pub const GpuDamageRect = extern struct {
+    start_col: u32,
+    col_count: u32,
+    row_start: u32,
+    row_count: u32,
+};
+
+pub const GpuDirtyCell = extern struct {
+    instance_index: u32,
+};
+
+const PixelCopyRect = struct {
+    left: u32,
+    top: u32,
+    right: u32,
+    bottom: u32,
+};
+
 // ================================================================
 // Internal types
 // ================================================================
@@ -45,6 +63,11 @@ const ATLAS_SIZE: u32 = 2048;
 const GLYPH_MAP_CAP: usize = 4096;
 const GLYPH_PAD: u32 = 1;
 const MAX_CELLS: u32 = 400 * 120; // 400 cols × 120 rows max
+const COMMAND_FRAME_COUNT: usize = 2;
+const COPY_RECT_FULL_ROW_MIN_COUNT: usize = 6;
+const COPY_RECT_FULL_ROW_MIN_COVERAGE_NUM: u32 = 1;
+const COPY_RECT_FULL_ROW_MIN_COVERAGE_DEN: u32 = 2;
+const COMPUTE_THREADS_PER_GROUP: u32 = 64;
 
 /// Per-cell data uploaded to GPU (matches HLSL CellData).
 /// Position and atlas UVs are derived in the shader from the instance id and glyph index.
@@ -60,6 +83,13 @@ const GlyphSlot = struct {
     key: u32, // codepoint
     atlas_index: u32,
     occupied: bool,
+};
+
+const CommandFrame = struct {
+    cmd_alloc: *dx.ID3D12CommandAllocator,
+    cmd_list: *dx.ID3D12GraphicsCommandList,
+    fence_value: u64 = 0,
+    generation: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 };
 
 fn hr_hex(hr: dx.HRESULT) u32 {
@@ -82,8 +112,8 @@ pub const GpuRenderer = struct {
     // DX12 core objects (stored as opaque for safety)
     device: *dx.ID3D12Device,
     cmd_queue: *dx.ID3D12CommandQueue,
-    cmd_alloc: *dx.ID3D12CommandAllocator,
-    cmd_list: *dx.ID3D12GraphicsCommandList,
+    frames: [COMMAND_FRAME_COUNT]CommandFrame,
+    frame_cursor: std.atomic.Value(u32),
     fence: *dx.ID3D12Fence,
     fence_event: dx.HANDLE,
     fence_value: u64,
@@ -97,6 +127,8 @@ pub const GpuRenderer = struct {
     // Pipeline
     root_sig: *anyopaque, // ID3D12RootSignature
     pso: *anyopaque, // ID3D12PipelineState
+    compute_root_sig: *anyopaque, // ID3D12RootSignature
+    compute_pso: *anyopaque, // ID3D12PipelineState
 
     // Render target (offscreen RGBA8)
     rt_texture: *dx.ID3D12Resource,
@@ -109,17 +141,25 @@ pub const GpuRenderer = struct {
     cell_buf_upload: *dx.ID3D12Resource,
     cell_buf_gpu: *dx.ID3D12Resource,
     cell_mapped: ?[*]u8,
+    cell_buf_gpu_state: dx.D3D12_RESOURCE_STATES,
+    dirty_value_upload: *dx.ID3D12Resource,
+    dirty_value_mapped: ?[*]u8,
+    dirty_index_upload: *dx.ID3D12Resource,
+    dirty_index_mapped: ?[*]u8,
 
     // Glyph atlas
     atlas_bitmap: []u8, // CPU R8 bitmap
     atlas_texture: *dx.ID3D12Resource,
     atlas_upload: *dx.ID3D12Resource,
+    atlas_upload_mapped: ?[*]u8,
+    pending_glyphs: std.AutoHashMapUnmanaged(u32, void),
     glyph_map: []GlyphSlot,
     glyph_count: u32,
     atlas_cols: u32,
+    atlas_rows: u32,
+    atlas_slot_count: u32,
     atlas_dirty: bool,
-    atlas_dirty_start: u32,
-    atlas_dirty_end: u32,
+    atlas_dirty_words: []u64,
 
     // GDI font selection + DirectWrite glyph rasterization
     gdi_dc: dx.HDC,
@@ -148,13 +188,19 @@ pub const GpuRenderer = struct {
         self.width = width;
         self.height = height;
         self.fence_value = 0;
+        self.frame_cursor = std.atomic.Value(u32).init(0);
         self.atlas_dirty = false;
+        self.pending_glyphs = .empty;
         self.glyph_count = 0;
         self.atlas_cols = 0;
-        self.atlas_dirty_start = 0;
-        self.atlas_dirty_end = 0;
+        self.atlas_rows = 0;
+        self.atlas_slot_count = 0;
         self.readback_ptr = null;
         self.cell_mapped = null;
+        self.cell_buf_gpu_state = .COMMON;
+        self.dirty_value_mapped = null;
+        self.dirty_index_mapped = null;
+        self.atlas_upload_mapped = null;
         self.gdi_dc = null;
         self.gdi_font = null;
         self.dwrite_factory = null;
@@ -180,6 +226,7 @@ pub const GpuRenderer = struct {
             return null;
         };
         @memset(self.atlas_bitmap, 0);
+        self.atlas_dirty_words = &.{};
 
         // Init font selection and DirectWrite glyph rasterization
         if (!self.initGdi(font_size)) {
@@ -210,6 +257,7 @@ pub const GpuRenderer = struct {
         self.waitForGpu();
         self.deinitDx12();
         self.deinitGdi();
+        self.pending_glyphs.deinit(self.alloc);
         self.alloc.free(self.atlas_bitmap);
         self.alloc.free(self.glyph_map);
         self.alloc.destroy(self);
@@ -333,7 +381,8 @@ pub const GpuRenderer = struct {
             return false;
         }
         self.atlas_cols = ATLAS_SIZE / slot_pitch_w;
-        if (self.atlas_cols == 0 or (ATLAS_SIZE / slot_pitch_h) == 0) {
+        self.atlas_rows = ATLAS_SIZE / slot_pitch_h;
+        if (self.atlas_cols == 0 or self.atlas_rows == 0) {
             log.err(
                 "initGdi: atlas packing is invalid for glyph pitch {}x{}",
                 .{ slot_pitch_w, slot_pitch_h },
@@ -342,15 +391,26 @@ pub const GpuRenderer = struct {
             self.deinitGdi();
             return false;
         }
+        self.atlas_slot_count = self.atlas_cols * self.atlas_rows;
+        const atlas_dirty_word_count = @as(usize, @intCast((self.atlas_slot_count + 63) / 64));
+        self.atlas_dirty_words = self.alloc.alloc(u64, atlas_dirty_word_count) catch {
+            log.err("initGdi: failed to allocate atlas dirty bitset words={}", .{atlas_dirty_word_count});
+            setInitError(.alloc_atlas_bitmap, -1);
+            self.deinitGdi();
+            return false;
+        };
+        @memset(self.atlas_dirty_words, 0);
 
         log.info(
-            "DirectWrite glyph rasterizer ready glyph_cell={}x{} baseline={d:.2} atlas_cols={}",
-            .{ self.glyph_cell_w, self.glyph_cell_h, self.glyph_baseline, self.atlas_cols },
+            "DirectWrite glyph rasterizer ready glyph_cell={}x{} baseline={d:.2} atlas_cols={} atlas_rows={}",
+            .{ self.glyph_cell_w, self.glyph_cell_h, self.glyph_baseline, self.atlas_cols, self.atlas_rows },
         );
         return true;
     }
 
     fn deinitGdi(self: *GpuRenderer) void {
+        if (self.atlas_dirty_words.len != 0) self.alloc.free(self.atlas_dirty_words);
+        self.atlas_dirty_words = &.{};
         if (self.dwrite_font_face) |font_face| _ = font_face.Release();
         if (self.dwrite_gdi_interop) |interop| _ = interop.Release();
         if (self.dwrite_factory) |factory| _ = factory.Release();
@@ -374,8 +434,7 @@ pub const GpuRenderer = struct {
         const slot_pitch_w = w + GLYPH_PAD;
         const slot_pitch_h = h + GLYPH_PAD;
         if (self.atlas_cols == 0) return null;
-        const atlas_rows = ATLAS_SIZE / slot_pitch_h;
-        const total_slots = self.atlas_cols * atlas_rows;
+        const total_slots = self.atlas_cols * self.atlas_rows;
         if (self.glyph_count >= total_slots) return null;
         const atlas_index = self.glyph_count;
         const dst_x = (atlas_index % self.atlas_cols) * slot_pitch_w;
@@ -450,18 +509,20 @@ pub const GpuRenderer = struct {
     }
 
     fn markAtlasDirty(self: *GpuRenderer, atlas_index: u32) void {
+        if (atlas_index >= self.atlas_slot_count) return;
         if (!self.atlas_dirty) {
             self.atlas_dirty = true;
-            self.atlas_dirty_start = atlas_index;
-            self.atlas_dirty_end = atlas_index + 1;
-            return;
         }
-        self.atlas_dirty_start = @min(self.atlas_dirty_start, atlas_index);
-        self.atlas_dirty_end = @max(self.atlas_dirty_end, atlas_index + 1);
+        const word_index = atlas_index / 64;
+        const bit_index = @as(u6, @intCast(atlas_index % 64));
+        self.atlas_dirty_words[word_index] |= (@as(u64, 1) << bit_index);
     }
 
     fn hasAtlasDirtySlot(self: *const GpuRenderer, atlas_index: u32) bool {
-        return self.atlas_dirty and atlas_index >= self.atlas_dirty_start and atlas_index < self.atlas_dirty_end;
+        if (!self.atlas_dirty or atlas_index >= self.atlas_slot_count) return false;
+        const word_index = atlas_index / 64;
+        const bit_index = @as(u6, @intCast(atlas_index % 64));
+        return (self.atlas_dirty_words[word_index] & (@as(u64, 1) << bit_index)) != 0;
     }
 
     fn lookupGlyph(self: *const GpuRenderer, cp: u32) ?u32 {
@@ -563,16 +624,29 @@ pub const GpuRenderer = struct {
         }
         self.cmd_queue = @ptrCast(@alignCast(cq_raw.?));
 
-        // 3. Command allocator
-        log.info("initDx12: step 3 create command allocator", .{});
-        var ca_raw: ?*anyopaque = null;
-        const ca_hr = self.device.CreateCommandAllocator(.DIRECT, &dx.IID_ID3D12CommandAllocator, &ca_raw);
-        if (!dx.SUCCEEDED(ca_hr)) {
-            log.err("initDx12: CreateCommandAllocator failed hr=0x{x}", .{hr_hex(ca_hr)});
-            setInitError(.dx12_command_allocator, ca_hr);
-            return false;
+        // 3. Command allocators
+        log.info("initDx12: step 3 create command allocators", .{});
+        var frame_index: usize = 0;
+        while (frame_index < COMMAND_FRAME_COUNT) : (frame_index += 1) {
+            var ca_raw: ?*anyopaque = null;
+            const ca_hr = self.device.CreateCommandAllocator(
+                .DIRECT,
+                &dx.IID_ID3D12CommandAllocator,
+                &ca_raw,
+            );
+            if (!dx.SUCCEEDED(ca_hr)) {
+                log.err(
+                    "initDx12: CreateCommandAllocator[{}] failed hr=0x{x}",
+                    .{ frame_index, hr_hex(ca_hr) },
+                );
+                setInitError(.dx12_command_allocator, ca_hr);
+                return false;
+            }
+            self.frames[frame_index].cmd_alloc = @ptrCast(@alignCast(ca_raw.?));
+            self.frames[frame_index].cmd_list = undefined;
+            self.frames[frame_index].fence_value = 0;
+            self.frames[frame_index].generation = std.atomic.Value(u32).init(0);
         }
-        self.cmd_alloc = @ptrCast(@alignCast(ca_raw.?));
 
         // 4. Descriptor heaps
         log.info("initDx12: step 4 create descriptor heaps", .{});
@@ -587,7 +661,7 @@ pub const GpuRenderer = struct {
         self.rtv_heap = @ptrCast(@alignCast(rtv_raw.?));
         self.rtv_inc = self.device.GetDescriptorHandleIncrementSize(.RTV);
 
-        const srv_desc = dx.D3D12_DESCRIPTOR_HEAP_DESC{ .Type = .CBV_SRV_UAV, .NumDescriptors = 2, .Flags = .SHADER_VISIBLE };
+        const srv_desc = dx.D3D12_DESCRIPTOR_HEAP_DESC{ .Type = .CBV_SRV_UAV, .NumDescriptors = 5, .Flags = .SHADER_VISIBLE };
         var srv_raw: ?*anyopaque = null;
         const srv_hr = self.device.CreateDescriptorHeap(&srv_desc, &dx.IID_ID3D12DescriptorHeap, &srv_raw);
         if (!dx.SUCCEEDED(srv_hr)) {
@@ -646,25 +720,31 @@ pub const GpuRenderer = struct {
             return false;
         }
 
-        // 10. Create command list (initially closed)
-        log.info("initDx12: step 10 create command list", .{});
-        var cl_raw: ?*anyopaque = null;
-        const cl_hr = self.device.CreateCommandList(
-            0,
-            .DIRECT,
-            @ptrCast(self.cmd_alloc),
-            null,
-            &dx.IID_ID3D12GraphicsCommandList,
-            &cl_raw,
-        );
-        if (!dx.SUCCEEDED(cl_hr)) {
-            const removed_reason = self.device.GetDeviceRemovedReason();
-            log.err("initDx12: CreateCommandList failed hr=0x{x} DeviceRemovedReason=0x{x}", .{ hr_hex(cl_hr), hr_hex(removed_reason) });
-            setInitError(.dx12_command_list, cl_hr);
-            return false;
+        // 10. Create command lists (initially closed)
+        log.info("initDx12: step 10 create command list ring", .{});
+        frame_index = 0;
+        while (frame_index < COMMAND_FRAME_COUNT) : (frame_index += 1) {
+            var cl_raw: ?*anyopaque = null;
+            const cl_hr = self.device.CreateCommandList(
+                0,
+                .DIRECT,
+                @ptrCast(self.frames[frame_index].cmd_alloc),
+                null,
+                &dx.IID_ID3D12GraphicsCommandList,
+                &cl_raw,
+            );
+            if (!dx.SUCCEEDED(cl_hr)) {
+                const removed_reason = self.device.GetDeviceRemovedReason();
+                log.err(
+                    "initDx12: CreateCommandList[{}] failed hr=0x{x} DeviceRemovedReason=0x{x}",
+                    .{ frame_index, hr_hex(cl_hr), hr_hex(removed_reason) },
+                );
+                setInitError(.dx12_command_list, cl_hr);
+                return false;
+            }
+            self.frames[frame_index].cmd_list = @ptrCast(@alignCast(cl_raw.?));
+            _ = self.frames[frame_index].cmd_list.Close();
         }
-        self.cmd_list = @ptrCast(@alignCast(cl_raw.?));
-        _ = self.cmd_list.Close();
 
         // Pre-rasterize ASCII glyphs
         log.info("initDx12: step 11 pre-rasterize ASCII glyphs", .{});
@@ -835,6 +915,113 @@ pub const GpuRenderer = struct {
         }
         self.pso = pso_raw.?;
 
+        var compute_srv_ranges = [_]dx.D3D12_DESCRIPTOR_RANGE{
+            .{ .RangeType = .SRV, .NumDescriptors = 2, .BaseShaderRegister = 0 },
+        };
+        var compute_uav_ranges = [_]dx.D3D12_DESCRIPTOR_RANGE{
+            .{ .RangeType = .UAV, .NumDescriptors = 1, .BaseShaderRegister = 0 },
+        };
+        var compute_params = [_]dx.D3D12_ROOT_PARAMETER{
+            .{
+                .ParameterType = .DESCRIPTOR_TABLE,
+                .u = .{ .DescriptorTable = .{ .NumDescriptorRanges = 1, .pDescriptorRanges = &compute_srv_ranges } },
+                .ShaderVisibility = .ALL,
+            },
+            .{
+                .ParameterType = .DESCRIPTOR_TABLE,
+                .u = .{ .DescriptorTable = .{ .NumDescriptorRanges = 1, .pDescriptorRanges = &compute_uav_ranges } },
+                .ShaderVisibility = .ALL,
+            },
+        };
+        const compute_rs_desc = dx.D3D12_ROOT_SIGNATURE_DESC{
+            .NumParameters = 2,
+            .pParameters = &compute_params,
+            .NumStaticSamplers = 0,
+            .pStaticSamplers = null,
+            .Flags = .ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT,
+        };
+
+        var compute_sig_blob: ?*dx.ID3DBlob = null;
+        var compute_sig_err: ?*dx.ID3DBlob = null;
+        const compute_sig_hr = dx.D3D12SerializeRootSignature(&compute_rs_desc, .@"1_0", &compute_sig_blob, &compute_sig_err);
+        if (!dx.SUCCEEDED(compute_sig_hr)) {
+            if (compute_sig_err) |e| {
+                log.err(
+                    "createPipeline: compute root signature serialize failed hr=0x{x} message={s}",
+                    .{ hr_hex(compute_sig_hr), blob_message(e) },
+                );
+                _ = e.Release();
+            } else {
+                log.err("createPipeline: compute root signature serialize failed hr=0x{x}", .{hr_hex(compute_sig_hr)});
+            }
+            return false;
+        }
+        defer _ = compute_sig_blob.?.Release();
+        if (compute_sig_err) |e| _ = e.Release();
+
+        var compute_rs_raw: ?*anyopaque = null;
+        const compute_rs_hr = self.device.CreateRootSignature(
+            0,
+            compute_sig_blob.?.GetBufferPointer(),
+            compute_sig_blob.?.GetBufferSize(),
+            &dx.IID_ID3D12RootSignature,
+            &compute_rs_raw,
+        );
+        if (!dx.SUCCEEDED(compute_rs_hr)) {
+            log.err("createPipeline: CreateRootSignature compute failed hr=0x{x}", .{hr_hex(compute_rs_hr)});
+            return false;
+        }
+        self.compute_root_sig = compute_rs_raw.?;
+
+        var cs_blob: ?*dx.ID3DBlob = null;
+        var cs_err: ?*dx.ID3DBlob = null;
+        const cs_hr = dx.D3DCompile(
+            shaders.CS_SOURCE.ptr,
+            shaders.CS_SOURCE.len,
+            "cs",
+            null,
+            null,
+            "main",
+            "cs_5_0",
+            0,
+            0,
+            &cs_blob,
+            &cs_err,
+        );
+        if (!dx.SUCCEEDED(cs_hr)) {
+            if (cs_err) |e| {
+                log.err(
+                    "createPipeline: compute shader compile failed hr=0x{x} message={s}",
+                    .{ hr_hex(cs_hr), blob_message(e) },
+                );
+                _ = e.Release();
+            } else {
+                log.err("createPipeline: compute shader compile failed hr=0x{x}", .{hr_hex(cs_hr)});
+            }
+            return false;
+        }
+        defer _ = cs_blob.?.Release();
+        if (cs_err) |e| _ = e.Release();
+
+        var compute_pso_desc = dx.D3D12_COMPUTE_PIPELINE_STATE_DESC{};
+        compute_pso_desc.pRootSignature = self.compute_root_sig;
+        compute_pso_desc.CS = .{
+            .pShaderBytecode = cs_blob.?.GetBufferPointer(),
+            .BytecodeLength = cs_blob.?.GetBufferSize(),
+        };
+
+        var compute_pso_raw: ?*anyopaque = null;
+        const compute_pso_hr = self.device.CreateComputePipelineState(
+            &compute_pso_desc,
+            &dx.IID_ID3D12PipelineState,
+            &compute_pso_raw,
+        );
+        if (!dx.SUCCEEDED(compute_pso_hr)) {
+            log.err("createPipeline: CreateComputePipelineState failed hr=0x{x}", .{hr_hex(compute_pso_hr)});
+            return false;
+        }
+        self.compute_pso = compute_pso_raw.?;
+
         return true;
     }
 
@@ -954,13 +1141,19 @@ pub const GpuRenderer = struct {
             return false;
         }
 
-        // GPU buffer (default heap, SRV)
+        // GPU buffer (default heap, SRV/UAV)
         const heap_default = dx.D3D12_HEAP_PROPERTIES{ .Type = .DEFAULT };
+        const gpu_desc = dx.D3D12_RESOURCE_DESC{
+            .Dimension = .BUFFER,
+            .Width = buf_size,
+            .Layout = .ROW_MAJOR,
+            .Flags = .ALLOW_UNORDERED_ACCESS,
+        };
         var gpu_raw: ?*anyopaque = null;
         const gpu_hr = self.device.CreateCommittedResource(
             &heap_default,
             .NONE,
-            &buf_desc,
+            &gpu_desc,
             .COMMON,
             null,
             &dx.IID_ID3D12Resource,
@@ -987,7 +1180,98 @@ pub const GpuRenderer = struct {
             },
         };
         const handle = self.srv_heap.GetCPUDescriptorHandleForHeapStart();
-        self.device.CreateShaderResourceView(@ptrCast(self.cell_buf_upload), &srv_desc, handle);
+        self.device.CreateShaderResourceView(@ptrCast(self.cell_buf_gpu), &srv_desc, handle);
+
+        var dirty_value_raw: ?*anyopaque = null;
+        const dirty_value_hr = self.device.CreateCommittedResource(
+            &heap_upload,
+            .NONE,
+            &buf_desc,
+            .GENERIC_READ,
+            null,
+            &dx.IID_ID3D12Resource,
+            &dirty_value_raw,
+        );
+        if (!dx.SUCCEEDED(dirty_value_hr)) {
+            log.err("createCellBuffers: dirty value upload allocation failed hr=0x{x}", .{hr_hex(dirty_value_hr)});
+            return false;
+        }
+        self.dirty_value_upload = @ptrCast(@alignCast(dirty_value_raw.?));
+        mapped = null;
+        const dirty_value_map_hr = self.dirty_value_upload.Map(0, null, &mapped);
+        if (dx.SUCCEEDED(dirty_value_map_hr)) {
+            self.dirty_value_mapped = @ptrCast(mapped);
+        } else {
+            log.err("createCellBuffers: dirty value upload map failed hr=0x{x}", .{hr_hex(dirty_value_map_hr)});
+            return false;
+        }
+
+        var dirty_value_handle = self.srv_heap.GetCPUDescriptorHandleForHeapStart();
+        dirty_value_handle.ptr += self.srv_inc * 2;
+        self.device.CreateShaderResourceView(@ptrCast(self.dirty_value_upload), &srv_desc, dirty_value_handle);
+
+        const index_buf_size = @as(u64, MAX_CELLS) * @as(u64, @sizeOf(u32));
+        const index_buf_desc = dx.D3D12_RESOURCE_DESC{
+            .Dimension = .BUFFER,
+            .Width = index_buf_size,
+            .Layout = .ROW_MAJOR,
+        };
+        var dirty_index_raw: ?*anyopaque = null;
+        const dirty_index_hr = self.device.CreateCommittedResource(
+            &heap_upload,
+            .NONE,
+            &index_buf_desc,
+            .GENERIC_READ,
+            null,
+            &dx.IID_ID3D12Resource,
+            &dirty_index_raw,
+        );
+        if (!dx.SUCCEEDED(dirty_index_hr)) {
+            log.err("createCellBuffers: dirty index upload allocation failed hr=0x{x}", .{hr_hex(dirty_index_hr)});
+            return false;
+        }
+        self.dirty_index_upload = @ptrCast(@alignCast(dirty_index_raw.?));
+        mapped = null;
+        const dirty_index_map_hr = self.dirty_index_upload.Map(0, null, &mapped);
+        if (dx.SUCCEEDED(dirty_index_map_hr)) {
+            self.dirty_index_mapped = @ptrCast(mapped);
+        } else {
+            log.err("createCellBuffers: dirty index upload map failed hr=0x{x}", .{hr_hex(dirty_index_map_hr)});
+            return false;
+        }
+
+        const dirty_index_srv_desc = dx.D3D12_SHADER_RESOURCE_VIEW_DESC{
+            .Format = .UNKNOWN,
+            .ViewDimension = .BUFFER,
+            .u = .{
+                .Buffer = .{
+                    .FirstElement = 0,
+                    .NumElements = MAX_CELLS,
+                    .StructureByteStride = @sizeOf(u32),
+                    .Flags = 0,
+                },
+            },
+        };
+        var dirty_index_handle = self.srv_heap.GetCPUDescriptorHandleForHeapStart();
+        dirty_index_handle.ptr += self.srv_inc * 3;
+        self.device.CreateShaderResourceView(@ptrCast(self.dirty_index_upload), &dirty_index_srv_desc, dirty_index_handle);
+
+        const dirty_uav_desc = dx.D3D12_UNORDERED_ACCESS_VIEW_DESC{
+            .Format = .UNKNOWN,
+            .ViewDimension = .BUFFER,
+            .u = .{
+                .Buffer = .{
+                    .FirstElement = 0,
+                    .NumElements = MAX_CELLS,
+                    .StructureByteStride = @sizeOf(GpuCellGpu),
+                    .CounterOffsetInBytes = 0,
+                    .Flags = .NONE,
+                },
+            },
+        };
+        var dirty_uav_handle = self.srv_heap.GetCPUDescriptorHandleForHeapStart();
+        dirty_uav_handle.ptr += self.srv_inc * 4;
+        self.device.CreateUnorderedAccessView(@ptrCast(self.cell_buf_gpu), null, &dirty_uav_desc, dirty_uav_handle);
 
         return true;
     }
@@ -1043,6 +1327,13 @@ pub const GpuRenderer = struct {
             return false;
         }
         self.atlas_upload = @ptrCast(@alignCast(upload_raw.?));
+        var mapped: ?*anyopaque = null;
+        const map_hr = self.atlas_upload.Map(0, null, &mapped);
+        if (!dx.SUCCEEDED(map_hr)) {
+            log.err("createAtlasTexture: atlas upload buffer map failed hr=0x{x}", .{hr_hex(map_hr)});
+            return false;
+        }
+        self.atlas_upload_mapped = @ptrCast(mapped);
 
         // Create SRV for atlas texture (slot 1 in srv_heap). The pixel shader samples this at t1.
         const srv_desc = dx.D3D12_SHADER_RESOURCE_VIEW_DESC{
@@ -1064,23 +1355,103 @@ pub const GpuRenderer = struct {
         return true;
     }
 
-    fn uploadAtlas(self: *GpuRenderer) void {
+    fn transitionCellGpuBuffer(
+        self: *GpuRenderer,
+        frame: *CommandFrame,
+        next_state: dx.D3D12_RESOURCE_STATES,
+    ) void {
+        if (self.cell_buf_gpu_state == next_state) return;
+        const barrier = [_]dx.D3D12_RESOURCE_BARRIER{
+            dx.D3D12_RESOURCE_BARRIER.transition(@ptrCast(self.cell_buf_gpu), self.cell_buf_gpu_state, next_state),
+        };
+        frame.cmd_list.ResourceBarrier(1, &barrier);
+        self.cell_buf_gpu_state = next_state;
+    }
+
+    fn copyCellUploadToGpu(self: *GpuRenderer, frame: *CommandFrame) void {
+        self.transitionCellGpuBuffer(frame, .COPY_DEST);
+        frame.cmd_list.CopyResource(@ptrCast(self.cell_buf_gpu), @ptrCast(self.cell_buf_upload));
+        self.transitionCellGpuBuffer(frame, .GENERIC_READ);
+    }
+
+    fn encodeDirtyCellCompute(
+        self: *GpuRenderer,
+        frame: *CommandFrame,
+        cells: [*]const GpuCellData,
+        cell_count: u32,
+        dirty_cells: [*]const GpuDirtyCell,
+        dirty_cell_count: u32,
+    ) bool {
+        if (dirty_cell_count == 0) return true;
+        const dirty_value_ptr = self.dirty_value_mapped orelse return false;
+        const dirty_index_ptr = self.dirty_index_mapped orelse return false;
+        const dirty_values: [*]GpuCellGpu = @ptrCast(@alignCast(dirty_value_ptr));
+        const dirty_indices: [*]u32 = @ptrCast(@alignCast(dirty_index_ptr));
+        const clamped_cell_count = @min(cell_count, MAX_CELLS);
+        var last_codepoint: u32 = 0;
+        var last_glyph_idx: u32 = 0;
+        var last_valid = false;
+        var dirty_write_count: u32 = 0;
+        var dirty_index: u32 = 0;
+        while (dirty_index < dirty_cell_count) : (dirty_index += 1) {
+            const cell_index = dirty_cells[dirty_index].instance_index;
+            if (cell_index >= clamped_cell_count) continue;
+            const c = cells[cell_index];
+            const glyph_idx = self.resolveGlyphIndexCached(
+                c.codepoint,
+                &last_codepoint,
+                &last_glyph_idx,
+                &last_valid,
+            );
+            dirty_values[dirty_write_count] = .{
+                .glyph_idx = glyph_idx,
+                .codepoint = c.codepoint,
+                .fg_rgba = c.fg_rgba,
+                .bg_rgba = c.bg_rgba,
+                .attrs = c.flags,
+            };
+            dirty_indices[dirty_write_count] = cell_index;
+            dirty_write_count += 1;
+        }
+        if (dirty_write_count == 0) return true;
+
+        self.transitionCellGpuBuffer(frame, .UNORDERED_ACCESS);
+        const heaps = [_]*anyopaque{@ptrCast(self.srv_heap)};
+        frame.cmd_list.SetDescriptorHeaps(1, &heaps);
+        frame.cmd_list.SetComputeRootSignature(self.compute_root_sig);
+        frame.cmd_list.SetPipelineState(self.compute_pso);
+
+        var compute_srv_handle = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
+        compute_srv_handle.ptr += @as(u64, self.srv_inc) * 2;
+        frame.cmd_list.SetComputeRootDescriptorTable(0, compute_srv_handle);
+
+        var compute_uav_handle = self.srv_heap.GetGPUDescriptorHandleForHeapStart();
+        compute_uav_handle.ptr += @as(u64, self.srv_inc) * 4;
+        frame.cmd_list.SetComputeRootDescriptorTable(1, compute_uav_handle);
+
+        const group_count_x = (dirty_write_count + COMPUTE_THREADS_PER_GROUP - 1) / COMPUTE_THREADS_PER_GROUP;
+        frame.cmd_list.Dispatch(group_count_x, 1, 1);
+        self.transitionCellGpuBuffer(frame, .GENERIC_READ);
+        return true;
+    }
+
+    fn encodeAtlasUpload(self: *GpuRenderer, frame: *CommandFrame, transition_to_copy_dest: bool) void {
         if (!self.atlas_dirty) return;
 
-        var mapped: ?*anyopaque = null;
-        const map_hr = self.atlas_upload.Map(0, null, &mapped);
-        if (!dx.SUCCEEDED(map_hr)) {
-            log.err("uploadAtlas: atlas upload buffer map failed hr=0x{x}", .{hr_hex(map_hr)});
-            return;
+        if (transition_to_copy_dest) {
+            const to_copy_dest = [_]dx.D3D12_RESOURCE_BARRIER{
+                dx.D3D12_RESOURCE_BARRIER.transition(@ptrCast(self.atlas_texture), .PIXEL_SHADER_RESOURCE, .COPY_DEST),
+            };
+            frame.cmd_list.ResourceBarrier(1, &to_copy_dest);
         }
-        const dst: [*]u8 = @ptrCast(mapped orelse return);
-        _ = self.cmd_alloc.Reset();
-        _ = self.cmd_list.Reset(@ptrCast(self.cmd_alloc), null);
+
+        const dst = self.atlas_upload_mapped orelse {
+            log.err("encodeAtlasUpload: atlas upload buffer is not mapped", .{});
+            return;
+        };
         const slot_pitch_w = self.glyph_cell_w + GLYPH_PAD;
         const slot_pitch_h = self.glyph_cell_h + GLYPH_PAD;
         const upload_capacity = @as(u64, ((ATLAS_SIZE + 255) / 256) * 256) * @as(u64, ATLAS_SIZE);
-        const start_row = self.atlas_dirty_start / self.atlas_cols;
-        const end_row = (self.atlas_dirty_end - 1) / self.atlas_cols;
         const dst_loc = dx.D3D12_TEXTURE_COPY_LOCATION{
             .pResource = @ptrCast(self.atlas_texture),
             .Type = 0,
@@ -1088,88 +1459,170 @@ pub const GpuRenderer = struct {
         };
 
         var upload_offset: u64 = 0;
-        var row_index = start_row;
-        while (row_index <= end_row) : (row_index += 1) {
-            const row_slot_start = if (row_index == start_row) self.atlas_dirty_start % self.atlas_cols else 0;
-            const row_slot_end = if (row_index == end_row) self.atlas_dirty_end % self.atlas_cols else 0;
-            const row_slot_end_excl = if (row_index == end_row and row_slot_end != 0) row_slot_end else if (row_index == end_row) self.atlas_cols else self.atlas_cols;
-            const region_x = row_slot_start * slot_pitch_w;
-            const region_y = row_index * slot_pitch_h;
-            const region_w = (row_slot_end_excl - row_slot_start) * slot_pitch_w;
-            const region_h = slot_pitch_h;
-            if (region_w == 0 or region_h == 0) continue;
+        var row_index: u32 = 0;
+        while (row_index < self.atlas_rows) : (row_index += 1) {
+            var slot_index: u32 = 0;
+            while (slot_index < self.atlas_cols) {
+                while (slot_index < self.atlas_cols and !self.hasAtlasDirtySlot(row_index * self.atlas_cols + slot_index)) : (slot_index += 1) {}
+                if (slot_index >= self.atlas_cols) break;
+                const span_start = slot_index;
+                while (slot_index < self.atlas_cols and self.hasAtlasDirtySlot(row_index * self.atlas_cols + slot_index)) : (slot_index += 1) {}
+                const span_end = slot_index;
+                const region_x = span_start * slot_pitch_w;
+                const region_y = row_index * slot_pitch_h;
+                const region_w = (span_end - span_start) * slot_pitch_w;
+                const region_h = slot_pitch_h;
+                if (region_w == 0 or region_h == 0) continue;
 
-            const row_pitch = ((region_w + 255) / 256) * 256;
-            const region_bytes = @as(u64, row_pitch) * @as(u64, region_h);
-            const aligned_offset = ((upload_offset + 511) / 512) * 512;
-            if (aligned_offset + region_bytes > upload_capacity) {
-                _ = self.cmd_list.Close();
-                const lists = [_]*anyopaque{@ptrCast(self.cmd_list)};
-                self.cmd_queue.ExecuteCommandLists(1, &lists);
-                self.waitForGpu();
-                _ = self.cmd_alloc.Reset();
-                _ = self.cmd_list.Reset(@ptrCast(self.cmd_alloc), null);
-                upload_offset = 0;
-            } else {
-                upload_offset = aligned_offset;
-            }
+                const row_pitch = ((region_w + 255) / 256) * 256;
+                const region_bytes = @as(u64, row_pitch) * @as(u64, region_h);
+                const aligned_offset = ((upload_offset + 511) / 512) * 512;
+                if (aligned_offset + region_bytes > upload_capacity) {
+                    log.err("encodeAtlasUpload: atlas upload region exceeded capacity region_bytes={} aligned_offset={}", .{ region_bytes, aligned_offset });
+                    return;
+                } else {
+                    upload_offset = aligned_offset;
+                }
 
-            var row: u32 = 0;
-            while (row < region_h) : (row += 1) {
-                const src_off = (region_y + row) * ATLAS_SIZE + region_x;
-                const dst_off = @as(usize, @intCast(upload_offset + @as(u64, row) * @as(u64, row_pitch)));
-                @memcpy(dst[dst_off .. dst_off + region_w], self.atlas_bitmap[src_off .. src_off + region_w]);
-            }
+                var row: u32 = 0;
+                while (row < region_h) : (row += 1) {
+                    const src_off = (region_y + row) * ATLAS_SIZE + region_x;
+                    const dst_off = @as(usize, @intCast(upload_offset + @as(u64, row) * @as(u64, row_pitch)));
+                    @memcpy(dst[dst_off .. dst_off + region_w], self.atlas_bitmap[src_off .. src_off + region_w]);
+                }
 
-            const src_loc = dx.D3D12_TEXTURE_COPY_LOCATION{
-                .pResource = @ptrCast(self.atlas_upload),
-                .Type = 1,
-                .u = .{
-                    .PlacedFootprint = .{
-                        .Offset = upload_offset,
-                        .Format = .R8_UNORM,
-                        .Width = region_w,
-                        .Height = region_h,
-                        .RowPitch = row_pitch,
+                const src_loc = dx.D3D12_TEXTURE_COPY_LOCATION{
+                    .pResource = @ptrCast(self.atlas_upload),
+                    .Type = 1,
+                    .u = .{
+                        .PlacedFootprint = .{
+                            .Offset = upload_offset,
+                            .Format = .R8_UNORM,
+                            .Width = region_w,
+                            .Height = region_h,
+                            .RowPitch = row_pitch,
+                        },
                     },
-                },
-            };
-            self.cmd_list.CopyTextureRegion(&dst_loc, region_x, region_y, 0, &src_loc, null);
-            upload_offset += region_bytes;
+                };
+                frame.cmd_list.CopyTextureRegion(&dst_loc, region_x, region_y, 0, &src_loc, null);
+                upload_offset += region_bytes;
+            }
         }
-        self.atlas_upload.Unmap(0, null);
-
         const barrier = [_]dx.D3D12_RESOURCE_BARRIER{
             dx.D3D12_RESOURCE_BARRIER.transition(@ptrCast(self.atlas_texture), .COPY_DEST, .PIXEL_SHADER_RESOURCE),
         };
-        self.cmd_list.ResourceBarrier(1, &barrier);
-
-        _ = self.cmd_list.Close();
-        const lists = [_]*anyopaque{@ptrCast(self.cmd_list)};
-        self.cmd_queue.ExecuteCommandLists(1, &lists);
-        self.waitForGpu();
+        frame.cmd_list.ResourceBarrier(1, &barrier);
 
         self.atlas_dirty = false;
-        self.atlas_dirty_start = 0;
-        self.atlas_dirty_end = 0;
+        @memset(self.atlas_dirty_words, 0);
+    }
+
+    fn uploadAtlas(self: *GpuRenderer) void {
+        if (!self.atlas_dirty) return;
+        const frame = self.acquireFrame();
+        self.encodeAtlasUpload(frame, false);
+        self.submitFrame(frame, true);
     }
 
     // ---- Frame rendering ----
 
     fn uploadAtlasIfDirty(self: *GpuRenderer) void {
         if (!self.atlas_dirty) return;
+        const frame = self.acquireFrame();
+        self.encodeAtlasUpload(frame, true);
+        self.submitFrame(frame, true);
+    }
 
-        _ = self.cmd_alloc.Reset();
-        _ = self.cmd_list.Reset(@ptrCast(self.cmd_alloc), null);
-        const barrier = [_]dx.D3D12_RESOURCE_BARRIER{
-            dx.D3D12_RESOURCE_BARRIER.transition(@ptrCast(self.atlas_texture), .PIXEL_SHADER_RESOURCE, .COPY_DEST),
-        };
-        self.cmd_list.ResourceBarrier(1, &barrier);
-        _ = self.cmd_list.Close();
-        const lists = [_]*anyopaque{@ptrCast(self.cmd_list)};
-        self.cmd_queue.ExecuteCommandLists(1, &lists);
-        self.waitForGpu();
-        self.uploadAtlas();
+    fn collectMissingGlyphsInRange(
+        self: *GpuRenderer,
+        cells: [*]const GpuCellData,
+        start_instance: u32,
+        instance_count: u32,
+    ) void {
+        if (instance_count == 0) return;
+        var i: u32 = 0;
+        while (i < instance_count) : (i += 1) {
+            const cell_index = start_instance + i;
+            const codepoint = cells[cell_index].codepoint;
+            if (codepoint == 0) continue;
+            if (self.lookupGlyph(codepoint) == null) {
+                self.pending_glyphs.put(self.alloc, codepoint, {}) catch {};
+            }
+        }
+    }
+
+    fn collectMissingGlyphsInDamageRects(
+        self: *GpuRenderer,
+        cells: [*]const GpuCellData,
+        cell_count: u32,
+        damage_rects: [*]const GpuDamageRect,
+        damage_rect_count: u32,
+        term_cols: u32,
+    ) void {
+        if (damage_rect_count == 0) return;
+        const clamped_cell_count = @min(cell_count, MAX_CELLS);
+        var rect_index: u32 = 0;
+        while (rect_index < damage_rect_count) : (rect_index += 1) {
+            const rect = damage_rects[rect_index];
+            if (rect.col_count == 0 or rect.row_count == 0) continue;
+            if (rect.start_col >= term_cols) continue;
+            const col_end = @min(term_cols, rect.start_col + rect.col_count);
+            var row = rect.row_start;
+            while (row < rect.row_start + rect.row_count) : (row += 1) {
+                const row_start_index = row * term_cols + rect.start_col;
+                if (row_start_index >= clamped_cell_count) break;
+                const row_span_len = @min(clamped_cell_count - row_start_index, col_end - rect.start_col);
+                self.collectMissingGlyphsInRange(cells, row_start_index, row_span_len);
+            }
+        }
+    }
+
+    fn collectMissingGlyphsInDirtyCells(
+        self: *GpuRenderer,
+        cells: [*]const GpuCellData,
+        cell_count: u32,
+        dirty_cells: [*]const GpuDirtyCell,
+        dirty_cell_count: u32,
+    ) void {
+        if (dirty_cell_count == 0) return;
+        const clamped_cell_count = @min(cell_count, MAX_CELLS);
+        var dirty_index: u32 = 0;
+        while (dirty_index < dirty_cell_count) : (dirty_index += 1) {
+            const instance_index = dirty_cells[dirty_index].instance_index;
+            if (instance_index >= clamped_cell_count) continue;
+            self.collectMissingGlyphsInRange(cells, instance_index, 1);
+        }
+    }
+
+    fn rasterizePendingGlyphs(self: *GpuRenderer) void {
+        var iterator = self.pending_glyphs.keyIterator();
+        while (iterator.next()) |codepoint| {
+            if (self.lookupGlyph(codepoint.*) == null) {
+                _ = self.rasterizeGlyph(codepoint.*);
+            }
+        }
+        self.pending_glyphs.clearRetainingCapacity();
+    }
+
+    fn resolveGlyphIndexCached(
+        self: *GpuRenderer,
+        codepoint: u32,
+        last_codepoint: *u32,
+        last_glyph_idx: *u32,
+        last_valid: *bool,
+    ) u32 {
+        if (codepoint == 0) {
+            last_valid.* = false;
+            return 0;
+        }
+        if (last_valid.* and last_codepoint.* == codepoint) {
+            return last_glyph_idx.*;
+        }
+        const glyph_idx = self.lookupGlyph(codepoint) orelse 0;
+        last_codepoint.* = codepoint;
+        last_glyph_idx.* = glyph_idx;
+        last_valid.* = true;
+        return glyph_idx;
     }
 
     fn uploadCellRange(
@@ -1183,15 +1636,20 @@ pub const GpuRenderer = struct {
         if (instance_count == 0) return;
         if (self.cell_mapped) |mapped| {
             const gpu_cells: [*]GpuCellGpu = @ptrCast(@alignCast(mapped));
+            var last_codepoint: u32 = 0;
+            var last_glyph_idx: u32 = 0;
+            var last_valid = false;
 
             var i: u32 = 0;
             while (i < instance_count) : (i += 1) {
                 const cell_index = start_instance + i;
                 const c = cells[cell_index];
-                const glyph_idx = if (c.codepoint == 0)
-                    0
-                else
-                    self.rasterizeGlyph(c.codepoint) orelse 0;
+                const glyph_idx = self.resolveGlyphIndexCached(
+                    c.codepoint,
+                    &last_codepoint,
+                    &last_glyph_idx,
+                    &last_valid,
+                );
 
                 gpu_cells[cell_index] = .{
                     .glyph_idx = glyph_idx,
@@ -1202,6 +1660,289 @@ pub const GpuRenderer = struct {
                 };
             }
         }
+    }
+
+    fn uploadDamageRects(
+        self: *GpuRenderer,
+        cells: [*]const GpuCellData,
+        cell_count: u32,
+        damage_rects: [*]const GpuDamageRect,
+        damage_rect_count: u32,
+        term_cols: u32,
+    ) void {
+        if (damage_rect_count == 0) return;
+        if (self.cell_mapped) |mapped| {
+            const gpu_cells: [*]GpuCellGpu = @ptrCast(@alignCast(mapped));
+            const clamped_cell_count = @min(cell_count, MAX_CELLS);
+            var last_codepoint: u32 = 0;
+            var last_glyph_idx: u32 = 0;
+            var last_valid = false;
+            var rect_index: u32 = 0;
+            while (rect_index < damage_rect_count) : (rect_index += 1) {
+                const rect = damage_rects[rect_index];
+                if (rect.col_count == 0 or rect.row_count == 0) continue;
+                if (rect.start_col >= term_cols) continue;
+                const col_end = @min(term_cols, rect.start_col + rect.col_count);
+                var row = rect.row_start;
+                while (row < rect.row_start + rect.row_count) : (row += 1) {
+                    const row_start_index = row * term_cols + rect.start_col;
+                    if (row_start_index >= clamped_cell_count) break;
+                    const row_span_len = @min(clamped_cell_count - row_start_index, col_end - rect.start_col);
+                    var col_offset: u32 = 0;
+                    while (col_offset < row_span_len) : (col_offset += 1) {
+                        const cell_index = row_start_index + col_offset;
+                        const c = cells[cell_index];
+                        const glyph_idx = self.resolveGlyphIndexCached(
+                            c.codepoint,
+                            &last_codepoint,
+                            &last_glyph_idx,
+                            &last_valid,
+                        );
+                        gpu_cells[cell_index] = .{
+                            .glyph_idx = glyph_idx,
+                            .codepoint = c.codepoint,
+                            .fg_rgba = c.fg_rgba,
+                            .bg_rgba = c.bg_rgba,
+                            .attrs = c.flags,
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    fn uploadDirtyCells(
+        self: *GpuRenderer,
+        cells: [*]const GpuCellData,
+        cell_count: u32,
+        dirty_cells: [*]const GpuDirtyCell,
+        dirty_cell_count: u32,
+    ) void {
+        if (dirty_cell_count == 0) return;
+        if (self.cell_mapped) |mapped| {
+            const gpu_cells: [*]GpuCellGpu = @ptrCast(@alignCast(mapped));
+            const clamped_cell_count = @min(cell_count, MAX_CELLS);
+            var last_codepoint: u32 = 0;
+            var last_glyph_idx: u32 = 0;
+            var last_valid = false;
+            var dirty_index: u32 = 0;
+            while (dirty_index < dirty_cell_count) : (dirty_index += 1) {
+                const cell_index = dirty_cells[dirty_index].instance_index;
+                if (cell_index >= clamped_cell_count) continue;
+                const c = cells[cell_index];
+                const glyph_idx = self.resolveGlyphIndexCached(
+                    c.codepoint,
+                    &last_codepoint,
+                    &last_glyph_idx,
+                    &last_valid,
+                );
+                gpu_cells[cell_index] = .{
+                    .glyph_idx = glyph_idx,
+                    .codepoint = c.codepoint,
+                    .fg_rgba = c.fg_rgba,
+                    .bg_rgba = c.bg_rgba,
+                    .attrs = c.flags,
+                };
+            }
+        }
+    }
+
+    fn damageRectsFromDirtyRanges(
+        self: *GpuRenderer,
+        dirty_ranges: [*]const GpuDirtyRange,
+        dirty_range_count: u32,
+        cell_count: u32,
+        term_cols: u32,
+    ) !std.ArrayList(GpuDamageRect) {
+        var rects = std.ArrayList(GpuDamageRect).empty;
+        errdefer rects.deinit(self.alloc);
+
+        if (term_cols == 0) return rects;
+
+        var range_index: u32 = 0;
+        while (range_index < dirty_range_count) : (range_index += 1) {
+            const range = dirty_ranges[range_index];
+            if (range.instance_count == 0 or range.row_count == 0) continue;
+            if (range.start_instance >= cell_count) continue;
+
+            var remaining = @min(range.instance_count, cell_count - range.start_instance);
+            var instance = range.start_instance;
+            var row_offset: u32 = 0;
+            while (row_offset < range.row_count and remaining > 0) : (row_offset += 1) {
+                const start_col = if (row_offset == 0) instance % term_cols else 0;
+                const col_count = @min(remaining, term_cols - start_col);
+                if (col_count == 0) break;
+                try rects.append(self.alloc, .{
+                    .start_col = start_col,
+                    .col_count = col_count,
+                    .row_start = range.row_start + row_offset,
+                    .row_count = 1,
+                });
+                remaining -= col_count;
+                instance += col_count;
+            }
+        }
+
+        if (rects.items.len <= 1) return rects;
+
+        std.mem.sort(GpuDamageRect, rects.items, {}, struct {
+            fn lessThan(_: void, lhs: GpuDamageRect, rhs: GpuDamageRect) bool {
+                return if (lhs.start_col != rhs.start_col)
+                    lhs.start_col < rhs.start_col
+                else if (lhs.col_count != rhs.col_count)
+                    lhs.col_count < rhs.col_count
+                else
+                    lhs.row_start < rhs.row_start;
+            }
+        }.lessThan);
+
+        var write_index: usize = 0;
+        for (rects.items) |rect| {
+            if (write_index == 0) {
+                rects.items[0] = rect;
+                write_index = 1;
+                continue;
+            }
+            var last = &rects.items[write_index - 1];
+            const last_row_end = last.row_start + last.row_count;
+            if (last.start_col == rect.start_col and
+                last.col_count == rect.col_count and
+                rect.row_start <= last_row_end)
+            {
+                const rect_end = rect.row_start + rect.row_count;
+                last.row_count = @max(last.row_count, rect_end - last.row_start);
+            } else {
+                rects.items[write_index] = rect;
+                write_index += 1;
+            }
+        }
+        rects.items.len = write_index;
+        return rects;
+    }
+
+    fn mergePixelCopyRects(
+        self: *GpuRenderer,
+        rects: *std.ArrayList(PixelCopyRect),
+    ) !void {
+        if (rects.items.len <= 1) return;
+
+        std.mem.sort(PixelCopyRect, rects.items, {}, struct {
+            fn lessThan(_: void, lhs: PixelCopyRect, rhs: PixelCopyRect) bool {
+                return if (lhs.top != rhs.top)
+                    lhs.top < rhs.top
+                else if (lhs.bottom != rhs.bottom)
+                    lhs.bottom < rhs.bottom
+                else if (lhs.left != rhs.left)
+                    lhs.left < rhs.left
+                else
+                    lhs.right < rhs.right;
+            }
+        }.lessThan);
+
+        var band_write_index: usize = 0;
+        var band_start: usize = 0;
+        while (band_start < rects.items.len) {
+            const band_top = rects.items[band_start].top;
+            const band_bottom = rects.items[band_start].bottom;
+            var band_end = band_start + 1;
+            var total_width: u32 = rects.items[band_start].right - rects.items[band_start].left;
+            while (band_end < rects.items.len and
+                rects.items[band_end].top == band_top and
+                rects.items[band_end].bottom == band_bottom)
+            {
+                total_width += rects.items[band_end].right - rects.items[band_end].left;
+                band_end += 1;
+            }
+
+            const band_count = band_end - band_start;
+            const collapse_to_full_row = band_count >= COPY_RECT_FULL_ROW_MIN_COUNT or
+                (band_count >= 3 and total_width * COPY_RECT_FULL_ROW_MIN_COVERAGE_DEN >= self.width * COPY_RECT_FULL_ROW_MIN_COVERAGE_NUM);
+            if (collapse_to_full_row) {
+                rects.items[band_write_index] = .{
+                    .left = 0,
+                    .top = band_top,
+                    .right = self.width,
+                    .bottom = band_bottom,
+                };
+                band_write_index += 1;
+            } else {
+                var index = band_start;
+                while (index < band_end) : (index += 1) {
+                    rects.items[band_write_index] = rects.items[index];
+                    band_write_index += 1;
+                }
+            }
+            band_start = band_end;
+        }
+        rects.items.len = band_write_index;
+        if (rects.items.len <= 1) return;
+
+        std.mem.sort(PixelCopyRect, rects.items, {}, struct {
+            fn lessThan(_: void, lhs: PixelCopyRect, rhs: PixelCopyRect) bool {
+                return if (lhs.left != rhs.left)
+                    lhs.left < rhs.left
+                else if (lhs.right != rhs.right)
+                    lhs.right < rhs.right
+                else if (lhs.top != rhs.top)
+                    lhs.top < rhs.top
+                else
+                    lhs.bottom < rhs.bottom;
+            }
+        }.lessThan);
+
+        var write_index: usize = 0;
+        for (rects.items) |rect| {
+            if (write_index == 0) {
+                rects.items[0] = rect;
+                write_index = 1;
+                continue;
+            }
+            var last = &rects.items[write_index - 1];
+            if (last.left == rect.left and
+                last.right == rect.right and
+                rect.top <= last.bottom)
+            {
+                last.bottom = @max(last.bottom, rect.bottom);
+            } else {
+                rects.items[write_index] = rect;
+                write_index += 1;
+            }
+        }
+        rects.items.len = write_index;
+        if (rects.items.len <= 1) return;
+
+        std.mem.sort(PixelCopyRect, rects.items, {}, struct {
+            fn lessThan(_: void, lhs: PixelCopyRect, rhs: PixelCopyRect) bool {
+                return if (lhs.top != rhs.top)
+                    lhs.top < rhs.top
+                else if (lhs.bottom != rhs.bottom)
+                    lhs.bottom < rhs.bottom
+                else if (lhs.left != rhs.left)
+                    lhs.left < rhs.left
+                else
+                    lhs.right < rhs.right;
+            }
+        }.lessThan);
+
+        write_index = 0;
+        for (rects.items) |rect| {
+            if (write_index == 0) {
+                rects.items[0] = rect;
+                write_index = 1;
+                continue;
+            }
+            var last = &rects.items[write_index - 1];
+            if (last.top == rect.top and
+                last.bottom == rect.bottom and
+                rect.left <= last.right)
+            {
+                last.right = @max(last.right, rect.right);
+            } else {
+                rects.items[write_index] = rect;
+                write_index += 1;
+            }
+        }
+        rects.items.len = write_index;
     }
 
     /// Render terminal cells to offscreen buffer. Returns RGBA pixel pointer.
@@ -1238,13 +1979,9 @@ pub const GpuRenderer = struct {
                 },
             },
         };
-        self.cmd_list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, null);
-
-        // Close & execute
-        _ = self.cmd_list.Close();
-        const lists = [_]*anyopaque{@ptrCast(self.cmd_list)};
-        self.cmd_queue.ExecuteCommandLists(1, &lists);
-        self.waitForGpu();
+        const frame = self.acquireFrame();
+        frame.cmd_list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, null);
+        self.submitFrame(frame, true);
 
         return self.readback_ptr;
     }
@@ -1294,60 +2031,87 @@ pub const GpuRenderer = struct {
         );
     }
 
-    fn renderToTarget(
+    pub fn renderToSurfaceDelta(
         self: *GpuRenderer,
         target_resource: *anyopaque,
-        before_clear: dx.D3D12_RESOURCE_STATES,
-        draw_state: dx.D3D12_RESOURCE_STATES,
-        before_finish: dx.D3D12_RESOURCE_STATES,
-        after_finish: dx.D3D12_RESOURCE_STATES,
         cells: [*]const GpuCellData,
         cell_count: u32,
+        damage_rects: [*]const GpuDamageRect,
+        damage_rect_count: u32,
         term_cols: u32,
         cell_width: f32,
         cell_height: f32,
     ) bool {
         const count = @min(cell_count, MAX_CELLS);
-        if (count == 0) return true;
+        if (count == 0 or damage_rect_count == 0) return true;
 
-        self.uploadAtlasIfDirty();
-        self.uploadCellRange(cells, 0, count, cell_width, cell_height);
+        self.pending_glyphs.clearRetainingCapacity();
+        self.collectMissingGlyphsInDamageRects(cells, count, damage_rects, damage_rect_count, term_cols);
+        self.rasterizePendingGlyphs();
+        self.uploadDamageRects(cells, count, damage_rects, damage_rect_count, term_cols);
         self.uploadAtlasIfDirty();
 
-        _ = self.cmd_alloc.Reset();
-        _ = self.cmd_list.Reset(@ptrCast(self.cmd_alloc), null);
+        var clear_rects = std.ArrayList(dx.RECT).empty;
+        defer clear_rects.deinit(self.alloc);
+
+        var rect_index: u32 = 0;
+        while (rect_index < damage_rect_count) : (rect_index += 1) {
+            const rect = damage_rects[rect_index];
+            if (rect.col_count == 0 or rect.row_count == 0) continue;
+            if (rect.start_col >= term_cols) continue;
+
+            const left_f = @as(f32, @floatFromInt(rect.start_col)) * cell_width;
+            const right_f = @as(f32, @floatFromInt(@min(term_cols, rect.start_col + rect.col_count))) * cell_width;
+            const top_f = @as(f32, @floatFromInt(rect.row_start)) * cell_height;
+            const bottom_f = @as(f32, @floatFromInt(rect.row_start + rect.row_count)) * cell_height;
+            const left = @as(i32, @intFromFloat(@floor(left_f)));
+            const right = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.width)), right_f))));
+            const top = @as(i32, @intFromFloat(@floor(top_f)));
+            const bottom = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.height)), bottom_f))));
+            if (right <= left or bottom <= top) continue;
+
+            clear_rects.append(self.alloc, .{
+                .left = left,
+                .top = top,
+                .right = right,
+                .bottom = bottom,
+            }) catch return false;
+        }
+
+        if (clear_rects.items.len == 0) return true;
+
+        const frame = self.acquireFrame();
+        self.copyCellUploadToGpu(frame);
 
         const b_rt = [_]dx.D3D12_RESOURCE_BARRIER{
-            dx.D3D12_RESOURCE_BARRIER.transition(target_resource, before_clear, draw_state),
+            dx.D3D12_RESOURCE_BARRIER.transition(target_resource, .COMMON, .RENDER_TARGET),
         };
-        self.cmd_list.ResourceBarrier(1, &b_rt);
+        frame.cmd_list.ResourceBarrier(1, &b_rt);
 
         const rtv = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
         self.device.CreateRenderTargetView(target_resource, null, rtv);
         const clear_color = [4]f32{ 0.0, 0.0, 0.0, 1.0 };
-        self.cmd_list.ClearRenderTargetView(rtv, &clear_color, 0, null);
-        self.cmd_list.OMSetRenderTargets(1, @ptrCast(&rtv), dx.FALSE, null);
+        frame.cmd_list.ClearRenderTargetView(
+            rtv,
+            &clear_color,
+            @intCast(clear_rects.items.len),
+            clear_rects.items.ptr,
+        );
+        frame.cmd_list.OMSetRenderTargets(1, @ptrCast(&rtv), dx.FALSE, null);
 
         const viewport = [_]dx.D3D12_VIEWPORT{.{
             .Width = @floatFromInt(self.width),
             .Height = @floatFromInt(self.height),
         }};
-        const scissor = [_]dx.RECT{.{
-            .left = 0,
-            .top = 0,
-            .right = @intCast(self.width),
-            .bottom = @intCast(self.height),
-        }};
-        self.cmd_list.RSSetViewports(1, &viewport);
-        self.cmd_list.RSSetScissorRects(1, &scissor);
+        frame.cmd_list.RSSetViewports(1, &viewport);
 
-        self.cmd_list.SetGraphicsRootSignature(self.root_sig);
-        self.cmd_list.SetPipelineState(self.pso);
-        self.cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
+        frame.cmd_list.SetGraphicsRootSignature(self.root_sig);
+        frame.cmd_list.SetPipelineState(self.pso);
+        frame.cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
 
         const heaps = [_]*anyopaque{@ptrCast(self.srv_heap)};
-        self.cmd_list.SetDescriptorHeaps(1, &heaps);
-        self.cmd_list.SetGraphicsRootDescriptorTable(0, self.srv_heap.GetGPUDescriptorHandleForHeapStart());
+        frame.cmd_list.SetDescriptorHeaps(1, &heaps);
+        frame.cmd_list.SetGraphicsRootDescriptorTable(0, self.srv_heap.GetGPUDescriptorHandleForHeapStart());
 
         const slot_pitch_w = @as(f32, @floatFromInt(self.glyph_cell_w + GLYPH_PAD));
         const slot_pitch_h = @as(f32, @floatFromInt(self.glyph_cell_h + GLYPH_PAD));
@@ -1365,18 +2129,269 @@ pub const GpuRenderer = struct {
             0,
             0,
         };
-        self.cmd_list.SetGraphicsRoot32BitConstants(1, 12, &constants, 0);
-        self.cmd_list.DrawInstanced(6, count, 0, 0);
+        frame.cmd_list.SetGraphicsRoot32BitConstants(1, 12, &constants, 0);
+
+        rect_index = 0;
+        while (rect_index < damage_rect_count) : (rect_index += 1) {
+            const rect = damage_rects[rect_index];
+            if (rect.col_count == 0 or rect.row_count == 0) continue;
+            if (rect.start_col >= term_cols) continue;
+            const col_end = @min(term_cols, rect.start_col + rect.col_count);
+            const draw_scissor = [_]dx.RECT{.{
+                .left = @as(i32, @intFromFloat(@floor(@as(f32, @floatFromInt(rect.start_col)) * cell_width))),
+                .top = @as(i32, @intFromFloat(@floor(@as(f32, @floatFromInt(rect.row_start)) * cell_height))),
+                .right = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.width)), @as(f32, @floatFromInt(col_end)) * cell_width)))),
+                .bottom = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.height)), @as(f32, @floatFromInt(rect.row_start + rect.row_count)) * cell_height)))),
+            }};
+            frame.cmd_list.RSSetScissorRects(1, &draw_scissor);
+            var row = rect.row_start;
+            while (row < rect.row_start + rect.row_count) : (row += 1) {
+                const instance_start = row * term_cols + rect.start_col;
+                if (instance_start >= count) break;
+                const available = count - instance_start;
+                const instance_count = @min(available, col_end - rect.start_col);
+                if (instance_count == 0) continue;
+                frame.cmd_list.DrawInstanced(6, instance_count, 0, instance_start);
+            }
+        }
+
+        const b_present = [_]dx.D3D12_RESOURCE_BARRIER{
+            dx.D3D12_RESOURCE_BARRIER.transition(target_resource, .RENDER_TARGET, .COMMON),
+        };
+        frame.cmd_list.ResourceBarrier(1, &b_present);
+        self.submitFrame(frame, false);
+        return true;
+    }
+
+    pub fn renderToSurfaceDeltaCells(
+        self: *GpuRenderer,
+        target_resource: *anyopaque,
+        cells: [*]const GpuCellData,
+        cell_count: u32,
+        dirty_cells: [*]const GpuDirtyCell,
+        dirty_cell_count: u32,
+        damage_rects: [*]const GpuDamageRect,
+        damage_rect_count: u32,
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) bool {
+        const count = @min(cell_count, MAX_CELLS);
+        if (count == 0 or damage_rect_count == 0) return true;
+        if (dirty_cell_count == 0) {
+            return self.renderToSurfaceDelta(
+                target_resource,
+                cells,
+                cell_count,
+                damage_rects,
+                damage_rect_count,
+                term_cols,
+                cell_width,
+                cell_height,
+            );
+        }
+
+        self.pending_glyphs.clearRetainingCapacity();
+        self.collectMissingGlyphsInDirtyCells(cells, count, dirty_cells, dirty_cell_count);
+        self.rasterizePendingGlyphs();
+        self.uploadAtlasIfDirty();
+
+        var clear_rects = std.ArrayList(dx.RECT).empty;
+        defer clear_rects.deinit(self.alloc);
+
+        var rect_index: u32 = 0;
+        while (rect_index < damage_rect_count) : (rect_index += 1) {
+            const rect = damage_rects[rect_index];
+            if (rect.col_count == 0 or rect.row_count == 0) continue;
+            if (rect.start_col >= term_cols) continue;
+
+            const left_f = @as(f32, @floatFromInt(rect.start_col)) * cell_width;
+            const right_f = @as(f32, @floatFromInt(@min(term_cols, rect.start_col + rect.col_count))) * cell_width;
+            const top_f = @as(f32, @floatFromInt(rect.row_start)) * cell_height;
+            const bottom_f = @as(f32, @floatFromInt(rect.row_start + rect.row_count)) * cell_height;
+            const left = @as(i32, @intFromFloat(@floor(left_f)));
+            const right = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.width)), right_f))));
+            const top = @as(i32, @intFromFloat(@floor(top_f)));
+            const bottom = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.height)), bottom_f))));
+            if (right <= left or bottom <= top) continue;
+
+            clear_rects.append(self.alloc, .{
+                .left = left,
+                .top = top,
+                .right = right,
+                .bottom = bottom,
+            }) catch return false;
+        }
+
+        if (clear_rects.items.len == 0) return true;
+
+        const frame = self.acquireFrame();
+
+        if (!self.encodeDirtyCellCompute(frame, cells, count, dirty_cells, dirty_cell_count)) {
+            return false;
+        }
+
+        const b_rt = [_]dx.D3D12_RESOURCE_BARRIER{
+            dx.D3D12_RESOURCE_BARRIER.transition(target_resource, .COMMON, .RENDER_TARGET),
+        };
+        frame.cmd_list.ResourceBarrier(1, &b_rt);
+
+        const rtv = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        self.device.CreateRenderTargetView(target_resource, null, rtv);
+        const clear_color = [4]f32{ 0.0, 0.0, 0.0, 1.0 };
+        frame.cmd_list.ClearRenderTargetView(
+            rtv,
+            &clear_color,
+            @intCast(clear_rects.items.len),
+            clear_rects.items.ptr,
+        );
+        frame.cmd_list.OMSetRenderTargets(1, @ptrCast(&rtv), dx.FALSE, null);
+
+        const viewport = [_]dx.D3D12_VIEWPORT{.{
+            .Width = @floatFromInt(self.width),
+            .Height = @floatFromInt(self.height),
+        }};
+        frame.cmd_list.RSSetViewports(1, &viewport);
+
+        frame.cmd_list.SetGraphicsRootSignature(self.root_sig);
+        frame.cmd_list.SetPipelineState(self.pso);
+        frame.cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
+
+        const heaps = [_]*anyopaque{@ptrCast(self.srv_heap)};
+        frame.cmd_list.SetDescriptorHeaps(1, &heaps);
+        frame.cmd_list.SetGraphicsRootDescriptorTable(0, self.srv_heap.GetGPUDescriptorHandleForHeapStart());
+
+        const slot_pitch_w = @as(f32, @floatFromInt(self.glyph_cell_w + GLYPH_PAD));
+        const slot_pitch_h = @as(f32, @floatFromInt(self.glyph_cell_h + GLYPH_PAD));
+        const constants = [12]f32{
+            @floatFromInt(self.width),
+            @floatFromInt(self.height),
+            cell_width,
+            cell_height,
+            slot_pitch_w / @as(f32, @floatFromInt(ATLAS_SIZE)),
+            slot_pitch_h / @as(f32, @floatFromInt(ATLAS_SIZE)),
+            @as(f32, @floatFromInt(self.glyph_cell_w)) / @as(f32, @floatFromInt(ATLAS_SIZE)),
+            @as(f32, @floatFromInt(self.glyph_cell_h)) / @as(f32, @floatFromInt(ATLAS_SIZE)),
+            @floatFromInt(term_cols),
+            @floatFromInt(self.atlas_cols),
+            0,
+            0,
+        };
+        frame.cmd_list.SetGraphicsRoot32BitConstants(1, 12, &constants, 0);
+
+        rect_index = 0;
+        while (rect_index < damage_rect_count) : (rect_index += 1) {
+            const rect = damage_rects[rect_index];
+            if (rect.col_count == 0 or rect.row_count == 0) continue;
+            if (rect.start_col >= term_cols) continue;
+            const col_end = @min(term_cols, rect.start_col + rect.col_count);
+            const draw_scissor = [_]dx.RECT{.{
+                .left = @as(i32, @intFromFloat(@floor(@as(f32, @floatFromInt(rect.start_col)) * cell_width))),
+                .top = @as(i32, @intFromFloat(@floor(@as(f32, @floatFromInt(rect.row_start)) * cell_height))),
+                .right = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.width)), @as(f32, @floatFromInt(col_end)) * cell_width)))),
+                .bottom = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.height)), @as(f32, @floatFromInt(rect.row_start + rect.row_count)) * cell_height)))),
+            }};
+            frame.cmd_list.RSSetScissorRects(1, &draw_scissor);
+            var row = rect.row_start;
+            while (row < rect.row_start + rect.row_count) : (row += 1) {
+                const instance_start = row * term_cols + rect.start_col;
+                if (instance_start >= count) break;
+                const available = count - instance_start;
+                const instance_count = @min(available, col_end - rect.start_col);
+                if (instance_count == 0) continue;
+                frame.cmd_list.DrawInstanced(6, instance_count, 0, instance_start);
+            }
+        }
+
+        const b_present = [_]dx.D3D12_RESOURCE_BARRIER{
+            dx.D3D12_RESOURCE_BARRIER.transition(target_resource, .RENDER_TARGET, .COMMON),
+        };
+        frame.cmd_list.ResourceBarrier(1, &b_present);
+        self.submitFrame(frame, false);
+        return true;
+    }
+
+    fn renderToTarget(
+        self: *GpuRenderer,
+        target_resource: *anyopaque,
+        before_clear: dx.D3D12_RESOURCE_STATES,
+        draw_state: dx.D3D12_RESOURCE_STATES,
+        before_finish: dx.D3D12_RESOURCE_STATES,
+        after_finish: dx.D3D12_RESOURCE_STATES,
+        cells: [*]const GpuCellData,
+        cell_count: u32,
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) bool {
+        const count = @min(cell_count, MAX_CELLS);
+        if (count == 0) return true;
+
+        self.pending_glyphs.clearRetainingCapacity();
+        self.collectMissingGlyphsInRange(cells, 0, count);
+        self.rasterizePendingGlyphs();
+        self.uploadCellRange(cells, 0, count, cell_width, cell_height);
+        self.uploadAtlasIfDirty();
+
+        const frame = self.acquireFrame();
+        self.copyCellUploadToGpu(frame);
+
+        const b_rt = [_]dx.D3D12_RESOURCE_BARRIER{
+            dx.D3D12_RESOURCE_BARRIER.transition(target_resource, before_clear, draw_state),
+        };
+        frame.cmd_list.ResourceBarrier(1, &b_rt);
+
+        const rtv = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
+        self.device.CreateRenderTargetView(target_resource, null, rtv);
+        const clear_color = [4]f32{ 0.0, 0.0, 0.0, 1.0 };
+        frame.cmd_list.ClearRenderTargetView(rtv, &clear_color, 0, null);
+        frame.cmd_list.OMSetRenderTargets(1, @ptrCast(&rtv), dx.FALSE, null);
+
+        const viewport = [_]dx.D3D12_VIEWPORT{.{
+            .Width = @floatFromInt(self.width),
+            .Height = @floatFromInt(self.height),
+        }};
+        const scissor = [_]dx.RECT{.{
+            .left = 0,
+            .top = 0,
+            .right = @intCast(self.width),
+            .bottom = @intCast(self.height),
+        }};
+        frame.cmd_list.RSSetViewports(1, &viewport);
+        frame.cmd_list.RSSetScissorRects(1, &scissor);
+
+        frame.cmd_list.SetGraphicsRootSignature(self.root_sig);
+        frame.cmd_list.SetPipelineState(self.pso);
+        frame.cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
+
+        const heaps = [_]*anyopaque{@ptrCast(self.srv_heap)};
+        frame.cmd_list.SetDescriptorHeaps(1, &heaps);
+        frame.cmd_list.SetGraphicsRootDescriptorTable(0, self.srv_heap.GetGPUDescriptorHandleForHeapStart());
+
+        const slot_pitch_w = @as(f32, @floatFromInt(self.glyph_cell_w + GLYPH_PAD));
+        const slot_pitch_h = @as(f32, @floatFromInt(self.glyph_cell_h + GLYPH_PAD));
+        const constants = [12]f32{
+            @floatFromInt(self.width),
+            @floatFromInt(self.height),
+            cell_width,
+            cell_height,
+            slot_pitch_w / @as(f32, @floatFromInt(ATLAS_SIZE)),
+            slot_pitch_h / @as(f32, @floatFromInt(ATLAS_SIZE)),
+            @as(f32, @floatFromInt(self.glyph_cell_w)) / @as(f32, @floatFromInt(ATLAS_SIZE)),
+            @as(f32, @floatFromInt(self.glyph_cell_h)) / @as(f32, @floatFromInt(ATLAS_SIZE)),
+            @floatFromInt(term_cols),
+            @floatFromInt(self.atlas_cols),
+            0,
+            0,
+        };
+        frame.cmd_list.SetGraphicsRoot32BitConstants(1, 12, &constants, 0);
+        frame.cmd_list.DrawInstanced(6, count, 0, 0);
 
         const b_copy = [_]dx.D3D12_RESOURCE_BARRIER{
             dx.D3D12_RESOURCE_BARRIER.transition(target_resource, before_finish, after_finish),
         };
-        self.cmd_list.ResourceBarrier(1, &b_copy);
-
-        _ = self.cmd_list.Close();
-        const lists = [_]*anyopaque{@ptrCast(self.cmd_list)};
-        self.cmd_queue.ExecuteCommandLists(1, &lists);
-        self.waitForGpu();
+        frame.cmd_list.ResourceBarrier(1, &b_copy);
+        self.submitFrame(frame, after_finish != .COMMON);
         return true;
     }
 
@@ -1394,57 +2409,58 @@ pub const GpuRenderer = struct {
         if (count == 0) return self.readback_ptr;
         if (dirty_range_count == 0) return self.renderFrame(cells, cell_count, term_cols, cell_width, cell_height);
 
+        var damage_rects = self.damageRectsFromDirtyRanges(
+            dirty_ranges,
+            dirty_range_count,
+            count,
+            term_cols,
+        ) catch return null;
+        defer damage_rects.deinit(self.alloc);
+        if (damage_rects.items.len == 0) return self.readback_ptr;
+
+        self.pending_glyphs.clearRetainingCapacity();
+        self.collectMissingGlyphsInDamageRects(cells, count, damage_rects.items.ptr, @intCast(damage_rects.items.len), term_cols);
+        self.rasterizePendingGlyphs();
+        self.uploadDamageRects(cells, count, damage_rects.items.ptr, @intCast(damage_rects.items.len), term_cols);
         self.uploadAtlasIfDirty();
 
-        var dirty_rects = std.ArrayList(dx.RECT).empty;
-        defer dirty_rects.deinit(self.alloc);
-
-        var i: u32 = 0;
-        while (i < dirty_range_count) : (i += 1) {
-            const range = dirty_ranges[i];
-            if (range.row_count == 0 or range.row_start >= MAX_CELLS) continue;
-            if (range.start_instance >= count) continue;
-
-            const instance_end = @min(count, range.start_instance + range.instance_count);
-            const instance_count_clamped = instance_end - range.start_instance;
-            self.uploadCellRange(cells, range.start_instance, instance_count_clamped, cell_width, cell_height);
-
-            const top = @as(i32, @intFromFloat(@floor(@as(f32, @floatFromInt(range.row_start)) * cell_height)));
-            const row_end = range.row_start + range.row_count;
-            const bottom_f = @min(
-                @as(f32, @floatFromInt(self.height)),
-                @as(f32, @floatFromInt(row_end)) * cell_height,
-            );
-            const bottom = @as(i32, @intFromFloat(@ceil(bottom_f)));
-            if (bottom <= top) continue;
-            dirty_rects.append(self.alloc, .{
-                .left = 0,
-                .top = top,
-                .right = @intCast(self.width),
-                .bottom = bottom,
-            }) catch return null;
-        }
-
-        self.uploadAtlasIfDirty();
-        if (dirty_rects.items.len == 0) return self.readback_ptr;
-
-        _ = self.cmd_alloc.Reset();
-        _ = self.cmd_list.Reset(@ptrCast(self.cmd_alloc), null);
+        const frame = self.acquireFrame();
+        self.copyCellUploadToGpu(frame);
 
         const b_rt = [_]dx.D3D12_RESOURCE_BARRIER{
             dx.D3D12_RESOURCE_BARRIER.transition(@ptrCast(self.rt_texture), .COPY_SOURCE, .RENDER_TARGET),
         };
-        self.cmd_list.ResourceBarrier(1, &b_rt);
+        frame.cmd_list.ResourceBarrier(1, &b_rt);
 
         const rtv = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
         const clear_color = [4]f32{ 0.0, 0.0, 0.0, 1.0 };
-        self.cmd_list.ClearRenderTargetView(
+        var dirty_rects = std.ArrayList(dx.RECT).empty;
+        defer dirty_rects.deinit(self.alloc);
+        for (damage_rects.items) |rect| {
+            const left_f = @as(f32, @floatFromInt(rect.start_col)) * cell_width;
+            const right_f = @as(f32, @floatFromInt(@min(term_cols, rect.start_col + rect.col_count))) * cell_width;
+            const top_f = @as(f32, @floatFromInt(rect.row_start)) * cell_height;
+            const bottom_f = @as(f32, @floatFromInt(rect.row_start + rect.row_count)) * cell_height;
+            const left = @as(i32, @intFromFloat(@floor(left_f)));
+            const right = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.width)), right_f))));
+            const top = @as(i32, @intFromFloat(@floor(top_f)));
+            const bottom = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.height)), bottom_f))));
+            if (right <= left or bottom <= top) continue;
+            dirty_rects.append(self.alloc, .{
+                .left = left,
+                .top = top,
+                .right = right,
+                .bottom = bottom,
+            }) catch return null;
+        }
+        if (dirty_rects.items.len == 0) return self.readback_ptr;
+        frame.cmd_list.ClearRenderTargetView(
             rtv,
             &clear_color,
             @intCast(dirty_rects.items.len),
             dirty_rects.items.ptr,
         );
-        self.cmd_list.OMSetRenderTargets(1, @ptrCast(&rtv), dx.FALSE, null);
+        frame.cmd_list.OMSetRenderTargets(1, @ptrCast(&rtv), dx.FALSE, null);
 
         const viewport = [_]dx.D3D12_VIEWPORT{.{
             .Width = @floatFromInt(self.width),
@@ -1456,15 +2472,15 @@ pub const GpuRenderer = struct {
             .right = @intCast(self.width),
             .bottom = @intCast(self.height),
         }};
-        self.cmd_list.RSSetViewports(1, &viewport);
-        self.cmd_list.RSSetScissorRects(1, &scissor);
-        self.cmd_list.SetGraphicsRootSignature(self.root_sig);
-        self.cmd_list.SetPipelineState(self.pso);
-        self.cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
+        frame.cmd_list.RSSetViewports(1, &viewport);
+        frame.cmd_list.RSSetScissorRects(1, &scissor);
+        frame.cmd_list.SetGraphicsRootSignature(self.root_sig);
+        frame.cmd_list.SetPipelineState(self.pso);
+        frame.cmd_list.IASetPrimitiveTopology(.TRIANGLELIST);
 
         const heaps = [_]*anyopaque{@ptrCast(self.srv_heap)};
-        self.cmd_list.SetDescriptorHeaps(1, &heaps);
-        self.cmd_list.SetGraphicsRootDescriptorTable(0, self.srv_heap.GetGPUDescriptorHandleForHeapStart());
+        frame.cmd_list.SetDescriptorHeaps(1, &heaps);
+        frame.cmd_list.SetGraphicsRootDescriptorTable(0, self.srv_heap.GetGPUDescriptorHandleForHeapStart());
 
         const slot_pitch_w = @as(f32, @floatFromInt(self.glyph_cell_w + GLYPH_PAD));
         const slot_pitch_h = @as(f32, @floatFromInt(self.glyph_cell_h + GLYPH_PAD));
@@ -1482,97 +2498,152 @@ pub const GpuRenderer = struct {
             0,
             0,
         };
-        self.cmd_list.SetGraphicsRoot32BitConstants(1, 12, &constants, 0);
+        frame.cmd_list.SetGraphicsRoot32BitConstants(1, 12, &constants, 0);
 
-        i = 0;
-        while (i < dirty_range_count) : (i += 1) {
-            const range = dirty_ranges[i];
-            if (range.start_instance >= count) continue;
-            const instance_end = @min(count, range.start_instance + range.instance_count);
-            const instance_count_clamped = instance_end - range.start_instance;
-            if (instance_count_clamped == 0) continue;
-            self.cmd_list.DrawInstanced(6, instance_count_clamped, 0, range.start_instance);
+        for (damage_rects.items) |rect| {
+            if (rect.start_col >= term_cols) continue;
+            const col_end = @min(term_cols, rect.start_col + rect.col_count);
+            const draw_scissor = [_]dx.RECT{.{
+                .left = @as(i32, @intFromFloat(@floor(@as(f32, @floatFromInt(rect.start_col)) * cell_width))),
+                .top = @as(i32, @intFromFloat(@floor(@as(f32, @floatFromInt(rect.row_start)) * cell_height))),
+                .right = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.width)), @as(f32, @floatFromInt(col_end)) * cell_width)))),
+                .bottom = @as(i32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.height)), @as(f32, @floatFromInt(rect.row_start + rect.row_count)) * cell_height)))),
+            }};
+            frame.cmd_list.RSSetScissorRects(1, &draw_scissor);
+            var row = rect.row_start;
+            while (row < rect.row_start + rect.row_count) : (row += 1) {
+                const instance_start = row * term_cols + rect.start_col;
+                if (instance_start >= count) break;
+                const available = count - instance_start;
+                const instance_count = @min(available, col_end - rect.start_col);
+                if (instance_count == 0) continue;
+                frame.cmd_list.DrawInstanced(6, instance_count, 0, instance_start);
+            }
         }
 
         const b_copy = [_]dx.D3D12_RESOURCE_BARRIER{
             dx.D3D12_RESOURCE_BARRIER.transition(@ptrCast(self.rt_texture), .RENDER_TARGET, .COPY_SOURCE),
         };
-        self.cmd_list.ResourceBarrier(1, &b_copy);
+        frame.cmd_list.ResourceBarrier(1, &b_copy);
         const row_pitch = self.pixelStride();
-        i = 0;
-        while (i < dirty_range_count) : (i += 1) {
-            const range = dirty_ranges[i];
-            if (range.row_count == 0) continue;
-            const row_end = @min(self.height, range.row_start + range.row_count);
-            if (range.row_start >= row_end) continue;
-            const row_count_clamped = row_end - range.row_start;
-
-            const src_loc = dx.D3D12_TEXTURE_COPY_LOCATION{
-                .pResource = @ptrCast(self.rt_texture),
-                .Type = 0,
-                .u = .{ .SubresourceIndex = 0 },
-            };
-            const dst_loc = dx.D3D12_TEXTURE_COPY_LOCATION{
-                .pResource = @ptrCast(self.readback_buf),
-                .Type = 1,
-                .u = .{
-                    .PlacedFootprint = .{
-                        .Offset = @as(u64, range.row_start) * @as(u64, row_pitch),
-                        .Format = .R8G8B8A8_UNORM,
-                        .Width = self.width,
-                        .Height = row_count_clamped,
-                        .RowPitch = row_pitch,
-                    },
+        const src_loc = dx.D3D12_TEXTURE_COPY_LOCATION{
+            .pResource = @ptrCast(self.rt_texture),
+            .Type = 0,
+            .u = .{ .SubresourceIndex = 0 },
+        };
+        const dst_loc = dx.D3D12_TEXTURE_COPY_LOCATION{
+            .pResource = @ptrCast(self.readback_buf),
+            .Type = 1,
+            .u = .{
+                .PlacedFootprint = .{
+                    .Offset = 0,
+                    .Format = .R8G8B8A8_UNORM,
+                    .Width = self.width,
+                    .Height = self.height,
+                    .RowPitch = row_pitch,
                 },
-            };
+            },
+        };
+        var copy_rects = std.ArrayList(PixelCopyRect).empty;
+        defer copy_rects.deinit(self.alloc);
+        for (damage_rects.items) |rect| {
+            if (rect.start_col >= term_cols) continue;
+            const col_end = @min(term_cols, rect.start_col + rect.col_count);
+            const src_left = @min(self.width, @as(u32, @intFromFloat(@floor(@as(f32, @floatFromInt(rect.start_col)) * cell_width))));
+            const src_top = @min(self.height, @as(u32, @intFromFloat(@floor(@as(f32, @floatFromInt(rect.row_start)) * cell_height))));
+            const src_right = @min(self.width, @as(u32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.width)), @as(f32, @floatFromInt(col_end)) * cell_width)))));
+            const src_bottom = @min(self.height, @as(u32, @intFromFloat(@ceil(@min(@as(f32, @floatFromInt(self.height)), @as(f32, @floatFromInt(rect.row_start + rect.row_count)) * cell_height)))));
+            if (src_right <= src_left or src_bottom <= src_top) continue;
+            copy_rects.append(self.alloc, .{
+                .left = src_left,
+                .top = src_top,
+                .right = src_right,
+                .bottom = src_bottom,
+            }) catch return null;
+        }
+        try self.mergePixelCopyRects(&copy_rects);
+        for (copy_rects.items) |rect| {
             const src_box = dx.D3D12_BOX{
-                .left = 0,
-                .top = range.row_start,
-                .right = self.width,
-                .bottom = row_end,
+                .left = rect.left,
+                .top = rect.top,
+                .right = rect.right,
+                .bottom = rect.bottom,
             };
-            self.cmd_list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &src_box);
+            frame.cmd_list.CopyTextureRegion(&dst_loc, rect.left, rect.top, 0, &src_loc, &src_box);
         }
 
-        _ = self.cmd_list.Close();
-        const lists = [_]*anyopaque{@ptrCast(self.cmd_list)};
-        self.cmd_queue.ExecuteCommandLists(1, &lists);
-        self.waitForGpu();
+        self.submitFrame(frame, true);
 
         return self.readback_ptr;
     }
 
     // ---- Helpers ----
 
-    fn waitForGpu(self: *GpuRenderer) void {
+    fn acquireFrame(self: *GpuRenderer) *CommandFrame {
+        const frame_idx = self.frame_cursor.fetchAdd(1, .monotonic) % COMMAND_FRAME_COUNT;
+        const frame = &self.frames[frame_idx];
+        self.waitForFrame(frame);
+        _ = frame.cmd_alloc.Reset();
+        _ = frame.cmd_list.Reset(@ptrCast(frame.cmd_alloc), null);
+        return frame;
+    }
+
+    fn submitFrame(self: *GpuRenderer, frame: *CommandFrame, wait: bool) void {
+        _ = frame.cmd_list.Close();
+        const lists = [_]*anyopaque{@ptrCast(frame.cmd_list)};
+        self.cmd_queue.ExecuteCommandLists(1, &lists);
         self.fence_value += 1;
-        _ = self.cmd_queue.Signal(@ptrCast(self.fence), self.fence_value);
-        if (self.fence.GetCompletedValue() < self.fence_value) {
-            _ = self.fence.SetEventOnCompletion(self.fence_value, self.fence_event);
+        frame.fence_value = self.fence_value;
+        _ = frame.generation.fetchAdd(1, .monotonic);
+        _ = self.cmd_queue.Signal(@ptrCast(self.fence), frame.fence_value);
+        if (wait) self.waitForFrame(frame);
+    }
+
+    fn waitForFrame(self: *GpuRenderer, frame: *CommandFrame) void {
+        if (frame.fence_value == 0) return;
+        if (self.fence.GetCompletedValue() < frame.fence_value) {
+            _ = self.fence.SetEventOnCompletion(frame.fence_value, self.fence_event);
             _ = dx.WaitForSingleObject(self.fence_event, dx.INFINITE);
+        }
+    }
+
+    fn waitForGpu(self: *GpuRenderer) void {
+        for (&self.frames) |*frame| {
+            self.waitForFrame(frame);
         }
     }
 
     fn deinitDx12(self: *GpuRenderer) void {
         // Release in reverse order
+        if (self.atlas_upload_mapped != null) self.atlas_upload.Unmap(0, null);
         _ = self.atlas_upload.Release();
         _ = self.atlas_texture.Release();
+        if (self.dirty_index_mapped != null) self.dirty_index_upload.Unmap(0, null);
+        _ = self.dirty_index_upload.Release();
+        if (self.dirty_value_mapped != null) self.dirty_value_upload.Unmap(0, null);
+        _ = self.dirty_value_upload.Release();
         if (self.cell_mapped != null) self.cell_buf_upload.Unmap(0, null);
         _ = self.cell_buf_upload.Release();
         _ = self.cell_buf_gpu.Release();
         if (self.readback_ptr != null) self.readback_buf.Unmap(0, null);
         _ = self.readback_buf.Release();
         _ = self.rt_texture.Release();
+        const compute_pso: *dx.IUnknown = @ptrCast(@alignCast(self.compute_pso));
+        _ = compute_pso.Release();
+        const compute_rs: *dx.IUnknown = @ptrCast(@alignCast(self.compute_root_sig));
+        _ = compute_rs.Release();
         const pso: *dx.IUnknown = @ptrCast(@alignCast(self.pso));
         _ = pso.Release();
         const rs: *dx.IUnknown = @ptrCast(@alignCast(self.root_sig));
         _ = rs.Release();
-        _ = self.cmd_list.Release();
         _ = self.fence.Release();
         _ = dx.CloseHandle(self.fence_event);
         _ = self.srv_heap.Release();
         _ = self.rtv_heap.Release();
-        _ = self.cmd_alloc.Release();
+        for (self.frames) |frame| {
+            _ = frame.cmd_list.Release();
+            _ = frame.cmd_alloc.Release();
+        }
         _ = self.cmd_queue.Release();
         _ = self.device.Release();
     }
@@ -1741,6 +2812,88 @@ export fn ghostty_gpu_renderer_render_to_surface(
     if (r) |v| {
         if (target_resource) |target| {
             if (cells) |c| {
+                return @intFromBool(v.renderToSurface(target, c, cell_count, term_cols, cell_width, cell_height));
+            }
+        }
+    }
+    return 0;
+}
+
+export fn ghostty_gpu_renderer_render_to_surface_delta(
+    r: ?*GpuRenderer,
+    target_resource: ?*anyopaque,
+    cells: ?[*]const GpuCellData,
+    cell_count: u32,
+    damage_rects: ?[*]const GpuDamageRect,
+    damage_rect_count: u32,
+    term_cols: u32,
+    cell_width: f32,
+    cell_height: f32,
+) u8 {
+    if (r) |v| {
+        if (target_resource) |target| {
+            if (cells) |c| {
+                if (damage_rects) |rects| {
+                    return @intFromBool(v.renderToSurfaceDelta(
+                        target,
+                        c,
+                        cell_count,
+                        rects,
+                        damage_rect_count,
+                        term_cols,
+                        cell_width,
+                        cell_height,
+                    ));
+                }
+                return @intFromBool(v.renderToSurface(target, c, cell_count, term_cols, cell_width, cell_height));
+            }
+        }
+    }
+    return 0;
+}
+
+export fn ghostty_gpu_renderer_render_to_surface_delta_cells(
+    r: ?*GpuRenderer,
+    target_resource: ?*anyopaque,
+    cells: ?[*]const GpuCellData,
+    cell_count: u32,
+    dirty_cells: ?[*]const GpuDirtyCell,
+    dirty_cell_count: u32,
+    damage_rects: ?[*]const GpuDamageRect,
+    damage_rect_count: u32,
+    term_cols: u32,
+    cell_width: f32,
+    cell_height: f32,
+) u8 {
+    if (r) |v| {
+        if (target_resource) |target| {
+            if (cells) |c| {
+                if (damage_rects) |rects| {
+                    if (dirty_cells) |indices| {
+                        return @intFromBool(v.renderToSurfaceDeltaCells(
+                            target,
+                            c,
+                            cell_count,
+                            indices,
+                            dirty_cell_count,
+                            rects,
+                            damage_rect_count,
+                            term_cols,
+                            cell_width,
+                            cell_height,
+                        ));
+                    }
+                    return @intFromBool(v.renderToSurfaceDelta(
+                        target,
+                        c,
+                        cell_count,
+                        rects,
+                        damage_rect_count,
+                        term_cols,
+                        cell_width,
+                        cell_height,
+                    ));
+                }
                 return @intFromBool(v.renderToSurface(target, c, cell_count, term_cols, cell_width, cell_height));
             }
         }

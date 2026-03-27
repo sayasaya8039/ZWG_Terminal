@@ -29,6 +29,21 @@ pub struct GpuDirtyRange {
     pub row_count: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuDamageRect {
+    pub start_col: u32,
+    pub col_count: u32,
+    pub row_start: u32,
+    pub row_count: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GpuDirtyCell {
+    pub instance_index: u32,
+}
+
 unsafe extern "C" {
     pub fn ghostty_vt_terminal_new(cols: u16, rows: u16) -> *mut core::ffi::c_void;
     pub fn ghostty_vt_terminal_new_with_scrollback(
@@ -175,6 +190,30 @@ unsafe extern "C" {
         target_resource: *mut core::ffi::c_void,
         cells: *const GpuCellData,
         cell_count: u32,
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> u8;
+    pub fn ghostty_gpu_renderer_render_to_surface_delta(
+        renderer: *mut core::ffi::c_void,
+        target_resource: *mut core::ffi::c_void,
+        cells: *const GpuCellData,
+        cell_count: u32,
+        damage_rects: *const GpuDamageRect,
+        damage_rect_count: u32,
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> u8;
+    pub fn ghostty_gpu_renderer_render_to_surface_delta_cells(
+        renderer: *mut core::ffi::c_void,
+        target_resource: *mut core::ffi::c_void,
+        cells: *const GpuCellData,
+        cell_count: u32,
+        dirty_cells: *const GpuDirtyCell,
+        dirty_cell_count: u32,
+        damage_rects: *const GpuDamageRect,
+        damage_rect_count: u32,
         term_cols: u32,
         cell_width: f32,
         cell_height: f32,

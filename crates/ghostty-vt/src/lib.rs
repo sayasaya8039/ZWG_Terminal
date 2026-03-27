@@ -441,7 +441,7 @@ pub fn classify_content(bytes: &[u8]) -> ContentStats {
 
 // ── DX12 GPU Renderer ──────────────────────────────────────────────────
 
-pub use ghostty_vt_sys::{GpuCellData, GpuDirtyRange};
+pub use ghostty_vt_sys::{GpuCellData, GpuDamageRect, GpuDirtyCell, GpuDirtyRange};
 
 pub struct GpuRenderer {
     ptr: NonNull<c_void>,
@@ -557,6 +557,57 @@ impl GpuRenderer {
                 target_resource,
                 cells.as_ptr(),
                 cells.len() as u32,
+                term_cols,
+                cell_width,
+                cell_height,
+            ) != 0
+        }
+    }
+
+    pub fn render_to_surface_delta(
+        &mut self,
+        target_resource: *mut c_void,
+        cells: &[GpuCellData],
+        damage_rects: &[GpuDamageRect],
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> bool {
+        unsafe {
+            ghostty_vt_sys::ghostty_gpu_renderer_render_to_surface_delta(
+                self.ptr.as_ptr(),
+                target_resource,
+                cells.as_ptr(),
+                cells.len() as u32,
+                damage_rects.as_ptr(),
+                damage_rects.len() as u32,
+                term_cols,
+                cell_width,
+                cell_height,
+            ) != 0
+        }
+    }
+
+    pub fn render_to_surface_delta_cells(
+        &mut self,
+        target_resource: *mut c_void,
+        cells: &[GpuCellData],
+        dirty_cells: &[GpuDirtyCell],
+        damage_rects: &[GpuDamageRect],
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> bool {
+        unsafe {
+            ghostty_vt_sys::ghostty_gpu_renderer_render_to_surface_delta_cells(
+                self.ptr.as_ptr(),
+                target_resource,
+                cells.as_ptr(),
+                cells.len() as u32,
+                dirty_cells.as_ptr(),
+                dirty_cells.len() as u32,
+                damage_rects.as_ptr(),
+                damage_rects.len() as u32,
                 term_cols,
                 cell_width,
                 cell_height,

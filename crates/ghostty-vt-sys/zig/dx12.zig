@@ -232,6 +232,7 @@ pub const D3D12_RESOURCE_STATES = enum(u32) {
     COPY_SOURCE = 0x800,
     GENERIC_READ = 0x1 | 0x2 | 0x40 | 0x80 | 0x200 | 0x800,
     PIXEL_SHADER_RESOURCE = 0x80,
+    UNORDERED_ACCESS = 0x8,
     _,
 };
 
@@ -354,6 +355,12 @@ pub const D3D12_STATIC_BORDER_COLOR = enum(u32) {
 };
 
 pub const D3D12_SRV_DIMENSION = enum(u32) {
+    BUFFER = 1,
+    TEXTURE2D = 4,
+    _,
+};
+
+pub const D3D12_UAV_DIMENSION = enum(u32) {
     BUFFER = 1,
     TEXTURE2D = 4,
     _,
@@ -555,6 +562,14 @@ pub const D3D12_GRAPHICS_PIPELINE_STATE_DESC = extern struct {
     Flags: u32 = 0,
 };
 
+pub const D3D12_COMPUTE_PIPELINE_STATE_DESC = extern struct {
+    pRootSignature: ?*anyopaque = null,
+    CS: D3D12_SHADER_BYTECODE = .{},
+    NodeMask: u32 = 0,
+    CachedPSO: D3D12_CACHED_PIPELINE_STATE = .{},
+    Flags: u32 = 0,
+};
+
 pub const D3D12_DESCRIPTOR_RANGE = extern struct {
     RangeType: D3D12_DESCRIPTOR_RANGE_TYPE,
     NumDescriptors: u32,
@@ -627,6 +642,32 @@ pub const D3D12_SHADER_RESOURCE_VIEW_DESC = extern struct {
         },
     } = .{
         .Texture2D = .{},
+    },
+};
+
+pub const D3D12_BUFFER_UAV_FLAGS = enum(u32) {
+    NONE = 0,
+    RAW = 0x1,
+    _,
+};
+
+pub const D3D12_UNORDERED_ACCESS_VIEW_DESC = extern struct {
+    Format: DXGI_FORMAT = .UNKNOWN,
+    ViewDimension: D3D12_UAV_DIMENSION,
+    u: extern union {
+        Buffer: extern struct {
+            FirstElement: u64 = 0,
+            NumElements: u32 = 0,
+            StructureByteStride: u32 = 0,
+            CounterOffsetInBytes: u64 = 0,
+            Flags: D3D12_BUFFER_UAV_FLAGS = .NONE,
+        },
+        Texture2D: extern struct {
+            MipSlice: u32 = 0,
+            PlaneSlice: u32 = 0,
+        },
+    } = .{
+        .Buffer = .{},
     },
 };
 
@@ -773,6 +814,9 @@ pub const ID3D12Device = extern struct {
     pub fn CreateGraphicsPipelineState(self: *ID3D12Device, desc: *const D3D12_GRAPHICS_PIPELINE_STATE_DESC, riid: *const GUID, out: *?*anyopaque) HRESULT {
         return vtCall(self.lpVtbl, 10, *const fn (*ID3D12Device, *const D3D12_GRAPHICS_PIPELINE_STATE_DESC, *const GUID, *?*anyopaque) callconv(.c) HRESULT)(self, desc, riid, out);
     }
+    pub fn CreateComputePipelineState(self: *ID3D12Device, desc: *const D3D12_COMPUTE_PIPELINE_STATE_DESC, riid: *const GUID, out: *?*anyopaque) HRESULT {
+        return vtCall(self.lpVtbl, 11, *const fn (*ID3D12Device, *const D3D12_COMPUTE_PIPELINE_STATE_DESC, *const GUID, *?*anyopaque) callconv(.c) HRESULT)(self, desc, riid, out);
+    }
     pub fn CreateCommandList(self: *ID3D12Device, node_mask: u32, typ: D3D12_COMMAND_LIST_TYPE, alloc: *anyopaque, initial_pso: ?*anyopaque, riid: *const GUID, out: *?*anyopaque) HRESULT {
         return vtCall(self.lpVtbl, 12, *const fn (*ID3D12Device, u32, D3D12_COMMAND_LIST_TYPE, *anyopaque, ?*anyopaque, *const GUID, *?*anyopaque) callconv(.c) HRESULT)(self, node_mask, typ, alloc, initial_pso, riid, out);
     }
@@ -787,6 +831,9 @@ pub const ID3D12Device = extern struct {
     }
     pub fn CreateShaderResourceView(self: *ID3D12Device, resource: ?*anyopaque, desc: ?*const D3D12_SHADER_RESOURCE_VIEW_DESC, handle: D3D12_CPU_DESCRIPTOR_HANDLE) void {
         vtCall(self.lpVtbl, 18, *const fn (*ID3D12Device, ?*anyopaque, ?*const D3D12_SHADER_RESOURCE_VIEW_DESC, D3D12_CPU_DESCRIPTOR_HANDLE) callconv(.c) void)(self, resource, desc, handle);
+    }
+    pub fn CreateUnorderedAccessView(self: *ID3D12Device, resource: ?*anyopaque, counter_resource: ?*anyopaque, desc: ?*const D3D12_UNORDERED_ACCESS_VIEW_DESC, handle: D3D12_CPU_DESCRIPTOR_HANDLE) void {
+        vtCall(self.lpVtbl, 19, *const fn (*ID3D12Device, ?*anyopaque, ?*anyopaque, ?*const D3D12_UNORDERED_ACCESS_VIEW_DESC, D3D12_CPU_DESCRIPTOR_HANDLE) callconv(.c) void)(self, resource, counter_resource, desc, handle);
     }
     pub fn CreateRenderTargetView(self: *ID3D12Device, resource: ?*anyopaque, desc: ?*anyopaque, handle: D3D12_CPU_DESCRIPTOR_HANDLE) void {
         vtCall(self.lpVtbl, 20, *const fn (*ID3D12Device, ?*anyopaque, ?*anyopaque, D3D12_CPU_DESCRIPTOR_HANDLE) callconv(.c) void)(self, resource, desc, handle);
@@ -872,11 +919,23 @@ pub const ID3D12GraphicsCommandList = extern struct {
     pub fn SetGraphicsRootSignature(self: *@This(), sig: *anyopaque) void {
         vtCall(self.lpVtbl, 30, *const fn (*@This(), *anyopaque) callconv(.c) void)(self, sig);
     }
+    pub fn SetComputeRootSignature(self: *@This(), sig: *anyopaque) void {
+        vtCall(self.lpVtbl, 31, *const fn (*@This(), *anyopaque) callconv(.c) void)(self, sig);
+    }
     pub fn SetGraphicsRootDescriptorTable(self: *@This(), index: u32, base_descriptor: D3D12_GPU_DESCRIPTOR_HANDLE) void {
         vtCall(self.lpVtbl, 32, *const fn (*@This(), u32, D3D12_GPU_DESCRIPTOR_HANDLE) callconv(.c) void)(self, index, base_descriptor);
     }
+    pub fn SetComputeRootDescriptorTable(self: *@This(), index: u32, base_descriptor: D3D12_GPU_DESCRIPTOR_HANDLE) void {
+        vtCall(self.lpVtbl, 33, *const fn (*@This(), u32, D3D12_GPU_DESCRIPTOR_HANDLE) callconv(.c) void)(self, index, base_descriptor);
+    }
     pub fn SetGraphicsRoot32BitConstants(self: *@This(), index: u32, num: u32, data: ?*const anyopaque, offset: u32) void {
         vtCall(self.lpVtbl, 36, *const fn (*@This(), u32, u32, ?*const anyopaque, u32) callconv(.c) void)(self, index, num, data, offset);
+    }
+    pub fn SetComputeRoot32BitConstants(self: *@This(), index: u32, num: u32, data: ?*const anyopaque, offset: u32) void {
+        vtCall(self.lpVtbl, 37, *const fn (*@This(), u32, u32, ?*const anyopaque, u32) callconv(.c) void)(self, index, num, data, offset);
+    }
+    pub fn Dispatch(self: *@This(), thread_group_count_x: u32, thread_group_count_y: u32, thread_group_count_z: u32) void {
+        vtCall(self.lpVtbl, 38, *const fn (*@This(), u32, u32, u32) callconv(.c) void)(self, thread_group_count_x, thread_group_count_y, thread_group_count_z);
     }
     pub fn IASetVertexBuffers(self: *@This(), start_slot: u32, num: u32, views: [*]const D3D12_VERTEX_BUFFER_VIEW) void {
         vtCall(self.lpVtbl, 44, *const fn (*@This(), u32, u32, [*]const D3D12_VERTEX_BUFFER_VIEW) callconv(.c) void)(self, start_slot, num, views);
