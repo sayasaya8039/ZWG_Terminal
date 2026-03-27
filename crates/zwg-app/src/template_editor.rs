@@ -2,12 +2,13 @@ use std::ops::Range;
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
+#[cfg(test)]
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::app::{
-    byte_range_to_utf16_range, consume_input_method_vk_processkey,
-    direct_text_from_input_keystroke, should_route_keystroke_via_text_input, toggle_ime_via_imm,
-    utf16_range_to_byte_range,
+    byte_index_to_utf16_offset, byte_range_to_utf16_range, direct_text_from_input_keystroke,
+    should_defer_keystroke_to_input_method, should_route_keystroke_via_text_input,
+    toggle_ime_via_imm, utf16_range_to_byte_range,
 };
 
 fn debug_write(msg: String) {
@@ -144,7 +145,6 @@ pub(crate) struct TemplateEditorModal {
     preedit_text: String,
     marked_range: Option<Range<usize>>,
     pending_outcome: Option<TemplateEditorOutcome>,
-    needs_focus: bool,
 }
 
 impl TemplateEditorModal {
@@ -158,7 +158,6 @@ impl TemplateEditorModal {
             preedit_text: String::new(),
             marked_range: None,
             pending_outcome: None,
-            needs_focus: true,
         }
     }
 
@@ -187,7 +186,6 @@ impl TemplateEditorModal {
             preedit_text: String::new(),
             marked_range: None,
             pending_outcome: None,
-            needs_focus: true,
         }
     }
 
@@ -217,11 +215,27 @@ impl TemplateEditorModal {
     }
 
     fn display_text_for(&self, field: TemplateEditorField) -> String {
-        let mut text = self.draft.field(field).to_string();
+        let text = self.draft.field(field).to_string();
         if self.active_field == field && !self.preedit_text.is_empty() {
-            text.push_str(&self.preedit_text);
+            let insert_pos = self.cursor.min(text.len());
+            // Snap to char boundary
+            let insert_pos = if insert_pos == 0 || text.is_char_boundary(insert_pos) {
+                insert_pos
+            } else {
+                text[..insert_pos]
+                    .char_indices()
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0)
+            };
+            let mut result = String::with_capacity(text.len() + self.preedit_text.len());
+            result.push_str(&text[..insert_pos]);
+            result.push_str(&self.preedit_text);
+            result.push_str(&text[insert_pos..]);
+            result
+        } else {
+            text
         }
-        text
     }
 
     fn request_cancel(&mut self, cx: &mut Context<Self>) {
@@ -260,11 +274,24 @@ impl TemplateEditorModal {
         cx.notify();
     }
 
-    /// Clamp cursor to valid position within active field.
+    /// Clamp cursor to valid char-boundary position within active field.
     fn clamp_cursor(&mut self) {
-        let len = self.active_text().len();
+        let len = self.draft.field(self.active_field).len();
         if self.cursor > len {
             self.cursor = len;
+        } else if self.cursor > 0
+            && !self
+                .draft
+                .field(self.active_field)
+                .is_char_boundary(self.cursor)
+        {
+            // Snap backward to the nearest char boundary
+            let snapped = self.draft.field(self.active_field)[..self.cursor]
+                .char_indices()
+                .last()
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            self.cursor = snapped;
         }
     }
 
@@ -275,7 +302,9 @@ impl TemplateEditorModal {
         self.clear_preedit();
         self.clamp_cursor();
         let cur = self.cursor;
-        self.draft.field_mut(self.active_field).insert_str(cur, text);
+        self.draft
+            .field_mut(self.active_field)
+            .insert_str(cur, text);
         self.cursor = cur + text.len();
         cx.notify();
     }
@@ -288,7 +317,11 @@ impl TemplateEditorModal {
         let cur = self.cursor;
         let prev = {
             let t = self.draft.field(self.active_field);
-            t[..cur].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
+            t[..cur]
+                .char_indices()
+                .next_back()
+                .map(|(i, _)| i)
+                .unwrap_or(0)
         };
         self.draft.field_mut(self.active_field).drain(prev..cur);
         self.cursor = prev;
@@ -300,8 +333,14 @@ impl TemplateEditorModal {
         let cur = self.cursor;
         let next = {
             let t = self.draft.field(self.active_field);
-            if cur >= t.len() { return; }
-            t[cur..].char_indices().nth(1).map(|(i, _)| cur + i).unwrap_or(t.len())
+            if cur >= t.len() {
+                return;
+            }
+            t[cur..]
+                .char_indices()
+                .nth(1)
+                .map(|(i, _)| cur + i)
+                .unwrap_or(t.len())
         };
         self.draft.field_mut(self.active_field).drain(cur..next);
         cx.notify();
@@ -313,9 +352,17 @@ impl TemplateEditorModal {
         let new_pos = {
             let t = self.draft.field(self.active_field);
             if direction < 0 {
-                t[..cur].char_indices().next_back().map(|(i, _)| i).unwrap_or(0)
+                t[..cur]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
             } else {
-                t[cur..].char_indices().nth(1).map(|(i, _)| cur + i).unwrap_or(t.len())
+                t[cur..]
+                    .char_indices()
+                    .nth(1)
+                    .map(|(i, _)| cur + i)
+                    .unwrap_or(t.len())
             }
         };
         self.cursor = new_pos;
@@ -343,16 +390,16 @@ impl TemplateEditorModal {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
-        if consume_input_method_vk_processkey() {
-            cx.notify();
-            return true;
-        }
-
         if event.keystroke.modifiers.control
             && !event.keystroke.modifiers.alt
             && event.keystroke.key == "space"
         {
             toggle_ime_via_imm();
+            cx.notify();
+            return true;
+        }
+
+        if should_defer_keystroke_to_input_method(&event.keystroke) {
             cx.notify();
             return true;
         }
@@ -473,7 +520,11 @@ impl TemplateEditorModal {
             self.active_text(),
         ));
         let handled = self.handle_key_down(event, window, cx);
-        debug_write(format!("[TMED] handled={} text_after={:?}\n", handled, self.active_text()));
+        debug_write(format!(
+            "[TMED] handled={} text_after={:?}\n",
+            handled,
+            self.active_text()
+        ));
         if handled {
             cx.stop_propagation();
         }
@@ -506,10 +557,11 @@ impl EntityInputHandler for TemplateEditorModal {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
+        self.clamp_cursor();
         let text = self.active_text();
-        let len = text.encode_utf16().count();
+        let cursor_utf16 = byte_index_to_utf16_offset(text, self.cursor);
         Some(UTF16Selection {
-            range: len..len,
+            range: cursor_utf16..cursor_utf16,
             reversed: false,
         })
     }
@@ -536,9 +588,41 @@ impl EntityInputHandler for TemplateEditorModal {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let _ = range_utf16;
         let had_composition = self.is_composing();
         self.clear_preedit();
+        self.clamp_cursor();
+
+        if let Some(range) = range_utf16 {
+            let field_text = self.active_text().to_string();
+            let byte_range = utf16_range_to_byte_range(&field_text, &range);
+            let start = byte_range.start.min(field_text.len());
+            let end = byte_range.end.min(field_text.len());
+            // Snap to char boundaries
+            let start = if start == 0 || field_text.is_char_boundary(start) {
+                start
+            } else {
+                field_text[..start]
+                    .char_indices()
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0)
+            };
+            let end = if end == 0 || field_text.is_char_boundary(end) {
+                end
+            } else {
+                field_text[..end]
+                    .char_indices()
+                    .last()
+                    .map(|(i, c)| i + c.len_utf8())
+                    .unwrap_or(0)
+            };
+            let field = self.draft.field_mut(self.active_field);
+            field.drain(start..end);
+            field.insert_str(start, text);
+            self.cursor = start + text.len();
+            cx.notify();
+            return;
+        }
 
         if text.is_empty() && had_composition {
             cx.notify();
@@ -550,28 +634,40 @@ impl EntityInputHandler for TemplateEditorModal {
             return;
         }
 
-        if !text.is_empty() {
-            self.active_text_mut().push_str(text);
-            cx.notify();
-        }
+        // No range specified — insert at cursor position
+        let cur = self.cursor.min(self.active_text().len());
+        let cur = if cur == 0 || self.active_text().is_char_boundary(cur) {
+            cur
+        } else {
+            self.active_text()[..cur]
+                .char_indices()
+                .last()
+                .map(|(i, c)| i + c.len_utf8())
+                .unwrap_or(0)
+        };
+        self.draft
+            .field_mut(self.active_field)
+            .insert_str(cur, text);
+        self.cursor = cur + text.len();
+        cx.notify();
     }
 
     fn replace_and_mark_text_in_range(
         &mut self,
-        range_utf16: Option<Range<usize>>,
+        _range_utf16: Option<Range<usize>>,
         new_text: &str,
-        new_selected_range_utf16: Option<Range<usize>>,
+        _new_selected_range_utf16: Option<Range<usize>>,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let _ = range_utf16;
-        let _ = new_selected_range_utf16;
+        self.clamp_cursor();
         self.preedit_text = new_text.to_string();
-        let utf16_len = new_text.encode_utf16().count();
-        self.marked_range = if utf16_len == 0 {
+        let cursor_utf16 = byte_index_to_utf16_offset(self.active_text(), self.cursor);
+        let preedit_utf16_len = new_text.encode_utf16().count();
+        self.marked_range = if preedit_utf16_len == 0 {
             None
         } else {
-            Some(0..utf16_len)
+            Some(cursor_utf16..cursor_utf16 + preedit_utf16_len)
         };
         cx.notify();
     }
@@ -707,7 +803,11 @@ impl Render for TemplateEditorModal {
                                 self.display_text_for(TemplateEditorField::Name),
                                 "例: メールの署名",
                                 self.active_field == TemplateEditorField::Name,
-                                if self.active_field == TemplateEditorField::Name { Some(self.cursor) } else { None },
+                                if self.active_field == TemplateEditorField::Name {
+                                    Some(self.cursor)
+                                } else {
+                                    None
+                                },
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                     this.focus_field(TemplateEditorField::Name, window, cx);
                                 }),
@@ -718,7 +818,11 @@ impl Render for TemplateEditorModal {
                                 "定型文の内容を入力...",
                                 self.active_field == TemplateEditorField::Content,
                                 180.0,
-                                if self.active_field == TemplateEditorField::Content { Some(self.cursor) } else { None },
+                                if self.active_field == TemplateEditorField::Content {
+                                    Some(self.cursor)
+                                } else {
+                                    None
+                                },
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                     this.focus_field(TemplateEditorField::Content, window, cx);
                                 }),
@@ -728,7 +832,11 @@ impl Render for TemplateEditorModal {
                                 self.display_text_for(TemplateEditorField::Note),
                                 "この定型文の用途",
                                 self.active_field == TemplateEditorField::Note,
-                                if self.active_field == TemplateEditorField::Note { Some(self.cursor) } else { None },
+                                if self.active_field == TemplateEditorField::Note {
+                                    Some(self.cursor)
+                                } else {
+                                    None
+                                },
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                     this.focus_field(TemplateEditorField::Note, window, cx);
                                 }),
@@ -738,7 +846,11 @@ impl Render for TemplateEditorModal {
                                 self.display_text_for(TemplateEditorField::Tags),
                                 "タグをカンマ区切りで入力: 仕事,メール",
                                 self.active_field == TemplateEditorField::Tags,
-                                if self.active_field == TemplateEditorField::Tags { Some(self.cursor) } else { None },
+                                if self.active_field == TemplateEditorField::Tags {
+                                    Some(self.cursor)
+                                } else {
+                                    None
+                                },
                                 cx.listener(|this, _: &MouseDownEvent, window, cx| {
                                     this.focus_field(TemplateEditorField::Tags, window, cx);
                                 }),
@@ -768,7 +880,11 @@ impl Render for TemplateEditorModal {
                                 }),
                             ))
                             .child(template_editor_footer_button(
-                                if self.editing_id.is_some() { "保存" } else { "追加" },
+                                if self.editing_id.is_some() {
+                                    "保存"
+                                } else {
+                                    "追加"
+                                },
                                 true,
                                 can_submit,
                                 cx.listener(|this, _: &MouseDownEvent, _window, cx| {
@@ -911,30 +1027,28 @@ fn template_editor_text_area(
     cursor_byte: Option<usize>,
     listener: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> Div {
-    let caret = || {
-        div()
-            .w(px(1.5))
-            .h(px(18.0))
-            .bg(rgb(ACCENT))
-            .flex_shrink_0()
-    };
+    let caret = || div().w(px(1.5)).h(px(18.0)).bg(rgb(ACCENT)).flex_shrink_0();
 
     let lines: Vec<AnyElement> = if value.is_empty() && !active {
-        vec![div()
-            .font_family(UI_FONT)
-            .text_size(px(13.0))
-            .text_color(rgb(SUBTEXT1))
-            .child(placeholder)
-            .into_any_element()]
+        vec![
+            div()
+                .font_family(UI_FONT)
+                .text_size(px(13.0))
+                .text_color(rgb(SUBTEXT1))
+                .child(placeholder)
+                .into_any_element(),
+        ]
     } else if value.is_empty() && active {
-        vec![div()
-            .flex()
-            .items_center()
-            .font_family(UI_FONT)
-            .text_size(px(13.0))
-            .child(caret())
-            .child(div().text_color(rgb(SUBTEXT1)).child(placeholder))
-            .into_any_element()]
+        vec![
+            div()
+                .flex()
+                .items_center()
+                .font_family(UI_FONT)
+                .text_size(px(13.0))
+                .child(caret())
+                .child(div().text_color(rgb(SUBTEXT1)).child(placeholder))
+                .into_any_element(),
+        ]
     } else if active {
         let cursor_pos = cursor_byte
             .map(|c| c.min(value.len()))
@@ -966,7 +1080,11 @@ fn template_editor_text_area(
                     .font_family(UI_FONT)
                     .text_size(px(13.0))
                     .text_color(rgb(TEXT))
-                    .child(if line.is_empty() { " ".to_string() } else { line.to_string() })
+                    .child(if line.is_empty() {
+                        " ".to_string()
+                    } else {
+                        line.to_string()
+                    })
                     .into_any_element(),
             );
         }
@@ -980,13 +1098,19 @@ fn template_editor_text_area(
             .font_family(UI_FONT)
             .text_size(px(13.0));
         if !cursor_line_before.is_empty() {
-            cursor_row =
-                cursor_row.child(div().text_color(rgb(TEXT)).child(cursor_line_before.to_string()));
+            cursor_row = cursor_row.child(
+                div()
+                    .text_color(rgb(TEXT))
+                    .child(cursor_line_before.to_string()),
+            );
         }
         cursor_row = cursor_row.child(caret());
         if !cursor_line_after.is_empty() {
-            cursor_row =
-                cursor_row.child(div().text_color(rgb(TEXT)).child(cursor_line_after.to_string()));
+            cursor_row = cursor_row.child(
+                div()
+                    .text_color(rgb(TEXT))
+                    .child(cursor_line_after.to_string()),
+            );
         }
         result.push(cursor_row.into_any_element());
 
@@ -997,7 +1121,11 @@ fn template_editor_text_area(
                     .font_family(UI_FONT)
                     .text_size(px(13.0))
                     .text_color(rgb(TEXT))
-                    .child(if line.is_empty() { " ".to_string() } else { line.to_string() })
+                    .child(if line.is_empty() {
+                        " ".to_string()
+                    } else {
+                        line.to_string()
+                    })
                     .into_any_element(),
             );
         }
@@ -1051,7 +1179,7 @@ fn template_editor_text_area(
         )
 }
 
-
+#[cfg(test)]
 fn pop_last_grapheme(text: &mut String) -> bool {
     let Some((index, _)) = UnicodeSegmentation::grapheme_indices(text.as_str(), true).next_back()
     else {
@@ -1176,6 +1304,7 @@ mod tests {
         assert_eq!(
             draft.submission(),
             Some(TemplateEditorSubmission {
+                editing_id: None,
                 name: "署名".into(),
                 content: "本文です".into(),
                 note: Some("メール用".into()),

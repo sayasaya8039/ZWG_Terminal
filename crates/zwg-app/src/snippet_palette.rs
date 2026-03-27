@@ -295,13 +295,7 @@ impl SnippetPaletteModel {
             return None;
         }
 
-        let next_index = self
-            .snippets
-            .iter()
-            .filter(|snippet| snippet.section == SnippetSection::Template)
-            .count()
-            + 1;
-        let new_id = format!("template-new-{next_index}");
+        let new_id = format!("template-{}", Uuid::new_v4().simple());
         let cleaned_note = note.and_then(|value| {
             let trimmed = value.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_string())
