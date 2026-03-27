@@ -110,15 +110,93 @@ pub(crate) fn toggle_ime_via_imm() {
 pub(crate) fn toggle_ime_via_imm() {}
 
 #[cfg(target_os = "windows")]
-pub(crate) fn consume_input_method_vk_processkey() -> bool {
-    INPUT_METHOD_VK_PROCESSKEY
-        .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
-        .is_ok()
+fn input_method_native_mode_active() -> bool {
+    use windows::Win32::UI::Input::Ime::{
+        IME_CMODE_FULLSHAPE, IME_CMODE_NATIVE, IME_CONVERSION_MODE, IME_SENTENCE_MODE,
+        ImmGetContext, ImmGetConversionStatus, ImmGetOpenStatus, ImmReleaseContext,
+    };
+    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+
+    unsafe {
+        let hwnd = GetForegroundWindow();
+        let himc = ImmGetContext(hwnd);
+        if himc.0.is_null() {
+            return false;
+        }
+
+        let open = ImmGetOpenStatus(himc).as_bool();
+        let mut conversion = IME_CONVERSION_MODE(0);
+        let mut sentence = IME_SENTENCE_MODE(0);
+        let has_conversion_status = ImmGetConversionStatus(
+            himc,
+            Some(&mut conversion as *mut IME_CONVERSION_MODE),
+            Some(&mut sentence as *mut IME_SENTENCE_MODE),
+        )
+        .as_bool();
+        let _ = ImmReleaseContext(hwnd, himc);
+
+        if !open {
+            return false;
+        }
+
+        if !has_conversion_status {
+            return true;
+        }
+
+        (conversion.0 & IME_CMODE_NATIVE.0) != 0 || (conversion.0 & IME_CMODE_FULLSHAPE.0) != 0
+    }
 }
 
 #[cfg(not(target_os = "windows"))]
-pub(crate) fn consume_input_method_vk_processkey() -> bool {
+fn input_method_native_mode_active() -> bool {
     false
+}
+
+fn should_defer_keystroke_to_input_method_with_state(
+    keystroke: &Keystroke,
+    ime_processkey_pending: bool,
+    ime_native_mode_active: bool,
+) -> bool {
+    if !ime_processkey_pending {
+        log_input_method_keystroke(
+            "should_defer_keystroke_to_input_method",
+            keystroke,
+            "processkey not pending -> direct",
+        );
+        return false;
+    }
+
+    if !ime_native_mode_active {
+        log_input_method_keystroke(
+            "should_defer_keystroke_to_input_method",
+            keystroke,
+            "processkey pending but IME is in direct/alnum mode -> direct",
+        );
+        return false;
+    }
+
+    if let Some(text) = direct_text_from_input_keystroke(keystroke) {
+        // Keep direct IME-resolved non-ASCII characters (e.g. あ, 漢字候補確定) in snippet inputs,
+        // but continue deferring ASCII keystrokes during IME processing.
+        let defer = text.chars().all(|ch| ch.is_ascii());
+        log_input_method_keystroke(
+            "should_defer_keystroke_to_input_method",
+            keystroke,
+            &format!("direct_text={:?}, defer={}", text, defer),
+        );
+        return defer;
+    }
+
+    let defer = !keystroke
+        .key_char
+        .as_ref()
+        .is_some_and(|key_char| !key_char.is_empty());
+    log_input_method_keystroke(
+        "should_defer_keystroke_to_input_method",
+        keystroke,
+        &format!("fallback key_char defer={}", defer),
+    );
+    defer
 }
 
 #[cfg(target_os = "windows")]
@@ -260,37 +338,11 @@ fn log_input_method_text(context: &str, target: Option<RootImeTarget>, text: &st
 
 pub(crate) fn should_defer_keystroke_to_input_method(keystroke: &Keystroke) -> bool {
     let ime_processkey_pending = INPUT_METHOD_VK_PROCESSKEY.swap(false, Ordering::AcqRel);
-    if !ime_processkey_pending {
-        log_input_method_keystroke(
-            "should_defer_keystroke_to_input_method",
-            keystroke,
-            "processkey not pending -> direct",
-        );
-        return false;
-    }
-
-    if let Some(text) = direct_text_from_input_keystroke(keystroke) {
-        // Keep direct IME-resolved non-ASCII characters (e.g. あ, 漢字候補確定) in snippet inputs,
-        // but continue deferring ASCII keystrokes during IME processing.
-        let defer = text.chars().all(|ch| ch.is_ascii());
-        log_input_method_keystroke(
-            "should_defer_keystroke_to_input_method",
-            keystroke,
-            &format!("direct_text={:?}, defer={}", text, defer),
-        );
-        return defer;
-    }
-
-    let defer = !keystroke
-        .key_char
-        .as_ref()
-        .is_some_and(|key_char| !key_char.is_empty());
-    log_input_method_keystroke(
-        "should_defer_keystroke_to_input_method",
+    should_defer_keystroke_to_input_method_with_state(
         keystroke,
-        &format!("fallback key_char defer={}", defer),
-    );
-    defer
+        ime_processkey_pending,
+        input_method_native_mode_active(),
+    )
 }
 
 pub(crate) fn direct_text_from_input_keystroke(keystroke: &Keystroke) -> Option<String> {
@@ -363,7 +415,6 @@ enum ZoomAction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SnippetPrimaryAction {
-    CopyToClipboard,
     PasteToTerminal,
 }
 
@@ -650,11 +701,11 @@ pub(crate) fn utf16_range_to_byte_range(text: &str, range: &Range<usize>) -> Ran
     utf16_offset_to_byte_index(text, range.start)..utf16_offset_to_byte_index(text, range.end)
 }
 
-fn byte_index_to_utf16_offset(text: &str, byte_index: usize) -> usize {
+pub(crate) fn byte_index_to_utf16_offset(text: &str, byte_index: usize) -> usize {
     text[..byte_index.min(text.len())].encode_utf16().count()
 }
 
-fn utf16_offset_to_byte_index(text: &str, utf16_offset: usize) -> usize {
+pub(crate) fn utf16_offset_to_byte_index(text: &str, utf16_offset: usize) -> usize {
     if utf16_offset == 0 {
         return 0;
     }
@@ -1612,9 +1663,7 @@ impl RootView {
     fn toggle_snippet_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let next_visible = !self.show_snippet_palette;
         self.show_snippet_palette = next_visible;
-        if !next_visible {
-            self.template_editor = None;
-        }
+        self.template_editor = None;
         self.show_shell_menu = false;
         self.show_settings = false;
         if next_visible {
@@ -1645,6 +1694,12 @@ impl RootView {
             return;
         };
         if item.section != SnippetSection::Template {
+            self.show_app_notice(
+                "履歴は編集できません",
+                "定型文セクションに切り替えてください。".to_string(),
+                1800,
+                cx,
+            );
             return;
         }
         let tags_str = item.tags.join(", ");
@@ -1680,16 +1735,6 @@ impl RootView {
             return;
         };
         match snippet_primary_action_for_section(self.snippet_palette.active_section()) {
-            SnippetPrimaryAction::CopyToClipboard => {
-                let section_label = self.snippet_palette.active_section().title();
-                cx.write_to_clipboard(ClipboardItem::new_string(item.content.clone()));
-                self.show_app_notice(
-                    format!("{section_label}をコピーしました"),
-                    format!("{} をクリップボードへ送信しました。", item.title),
-                    2200,
-                    cx,
-                );
-            }
             SnippetPrimaryAction::PasteToTerminal => {
                 let section_label = self.snippet_palette.active_section().title();
                 if self.paste_snippet_into_active_terminal(&item.content, window, cx) {
@@ -1790,14 +1835,15 @@ impl RootView {
                         submission.favorite,
                     )
                 } else {
-                    self.snippet_palette.create_template_item(
-                        submission.name.clone(),
-                        submission.content.clone(),
-                        submission.note.clone(),
-                        submission.tags.clone(),
-                        submission.favorite,
-                    )
-                    .is_some()
+                    self.snippet_palette
+                        .create_template_item(
+                            submission.name.clone(),
+                            submission.content.clone(),
+                            submission.note.clone(),
+                            submission.tags.clone(),
+                            submission.favorite,
+                        )
+                        .is_some()
                 };
                 let is_edit = submission.editing_id.is_some();
 
@@ -1805,7 +1851,11 @@ impl RootView {
                     self.template_editor = None;
                     window.focus(&self.focus_handle);
                     self.show_app_notice(
-                        if is_edit { "定型文を更新しました" } else { "定型文を追加しました" },
+                        if is_edit {
+                            "定型文を更新しました"
+                        } else {
+                            "定型文を追加しました"
+                        },
                         if is_edit {
                             format!("{} を保存しました。", submission.name)
                         } else {
@@ -1816,6 +1866,8 @@ impl RootView {
                     );
                     cx.notify();
                 } else {
+                    self.template_editor = None;
+                    window.focus(&self.focus_handle);
                     self.show_app_notice(
                         "定型文を追加できませんでした",
                         "入力内容を確認してください。".to_string(),
@@ -2037,6 +2089,10 @@ impl RootView {
             }
             "l" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
                 self.clear_snippet_search_text(cx);
+                true
+            }
+            "e" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.open_template_editor_for_edit(window, cx);
                 true
             }
             "p" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
@@ -2608,6 +2664,12 @@ impl RootView {
         let pinned_count = self.snippet_palette.pinned_count();
         let active_section = self.snippet_palette.active_section();
         let active_section_label = active_section.title().to_string();
+        let compact_sidebar = frame.height <= 580.0;
+        let sidebar_section_padding = if compact_sidebar { 12.0 } else { 16.0 };
+        let sidebar_section_gap = if compact_sidebar { 8.0 } else { 12.0 };
+        let search_box_height = if compact_sidebar { 32.0 } else { 34.0 };
+        let section_chip_y_padding = if compact_sidebar { 6.0 } else { 8.0 };
+        let sidebar_footer_height = if compact_sidebar { 32.0 } else { 40.0 };
 
         let list_items = if visible.is_empty() {
             vec![
@@ -2648,11 +2710,11 @@ impl RootView {
                     let item_id = item.id.clone();
                     let is_selected = selected_id.as_deref() == Some(item.id.as_str());
                     let relative_created_label = item.relative_created_label();
-                    let wrapped_title = wrap_sidebar_preview(&item.title, 24.0, 2);
+                    let wrapped_title = wrap_sidebar_preview(&item.title, 20.0, 2);
                     let wrapped_summary = if item.summary.is_empty() {
                         None
                     } else {
-                        Some(wrap_sidebar_preview(&item.summary, 28.0, 2))
+                        Some(wrap_sidebar_preview(&item.summary, 24.0, 2))
                     };
                     let meta_row = if active_section == SnippetSection::History {
                         div()
@@ -2695,6 +2757,10 @@ impl RootView {
 
                     let mut row = div()
                         .id(ElementId::Name(format!("snippet-item-{}", item.id).into()))
+                        .debug_selector({
+                            let selector = format!("snippet-item-{}", item.id);
+                            move || selector.clone()
+                        })
                         .w_full()
                         .rounded(px(12.0))
                         .border_1()
@@ -2808,6 +2874,7 @@ impl RootView {
         };
 
         let detail = if let Some(item) = self.snippet_palette.selected_snippet().cloned() {
+            let is_template = item.section == SnippetSection::Template;
             let detail_meta = format!("{} • {}", item.kind_label, item.source);
             let content_lines = item
                 .content
@@ -2827,8 +2894,11 @@ impl RootView {
                 .collect::<Vec<_>>();
 
             div()
+                .debug_selector(|| "snippet-detail".to_string())
                 .flex_1()
                 .min_w(px(0.0))
+                .h_full()
+                .min_h(px(0.0))
                 .bg(rgb(PANEL_BG))
                 .flex()
                 .flex_col()
@@ -2866,15 +2936,17 @@ impl RootView {
                                     }),
                                 ),
                         )
-                        .child(
-                            panel_icon_button("snippet-detail-edit", "ui/edit.svg", false)
-                                .on_mouse_down(
-                                    MouseButton::Left,
-                                    cx.listener(|this, _: &MouseDownEvent, window, cx| {
-                                        this.open_template_editor_for_edit(window, cx);
-                                    }),
-                                ),
-                        )
+                        .when(is_template, |el| {
+                            el.child(
+                                panel_icon_button("snippet-detail-edit", "ui/edit.svg", false)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                            this.open_template_editor_for_edit(window, cx);
+                                        }),
+                                    ),
+                            )
+                        })
                         .child(
                             panel_icon_button("snippet-detail-copy", "ui/copy.svg", false)
                                 .on_mouse_down(
@@ -2930,7 +3002,11 @@ impl RootView {
                                 .font_family(UI_FONT)
                                 .text_size(px(11.0))
                                 .text_color(rgb(SUBTEXT1))
-                                .child(item.created_label.clone()),
+                                .child(if item.source.trim().is_empty() {
+                                    item.created_label.clone()
+                                } else {
+                                    format!("{} • {}", item.created_label, item.source)
+                                }),
                         ),
                 )
                 .into_any_element()
@@ -2953,6 +3029,7 @@ impl RootView {
         Some(
             div()
                 .id("snippet-panel")
+                .debug_selector(|| "snippet-panel".to_string())
                 .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| {
                     if this.template_editor.is_none() {
                         this.close_snippet_palette(window, cx);
@@ -3054,6 +3131,9 @@ impl RootView {
                             div()
                                 .w(px(sidebar_w))
                                 .min_w(px(sidebar_w))
+                                .debug_selector(|| "snippet-sidebar".to_string())
+                                .h_full()
+                                .min_h(px(0.0))
                                 .bg(rgb(PANEL_SIDEBAR_BG))
                                 .border_r_1()
                                 .border_color(rgba(0xffffff10))
@@ -3061,10 +3141,10 @@ impl RootView {
                                 .flex_col()
                                 .child(
                                     div()
-                                        .p(px(16.0))
+                                        .p(px(sidebar_section_padding))
                                         .flex()
                                         .flex_col()
-                                        .gap(px(12.0))
+                                        .gap(px(sidebar_section_gap))
                                         .child(
                                             div()
                                                 .font_family(UI_FONT)
@@ -3075,7 +3155,7 @@ impl RootView {
                                         )
                                         .child(
                                             div()
-                                                .h(px(34.0))
+                                                .h(px(search_box_height))
                                                 .rounded(px(10.0))
                                                 .bg(rgba(0xffffff0E))
                                                 .border_1()
@@ -3125,7 +3205,7 @@ impl RootView {
                                                                     )
                                                                     .into(),
                                                                 ))
-                                                                .rounded(px(11.0))
+                                                                .rounded(px(16.0))
                                                                 .border_1()
                                                                 .border_color(if active {
                                                                     rgba(0x0A84FF99)
@@ -3138,7 +3218,7 @@ impl RootView {
                                                                     rgba(0xffffff08)
                                                                 })
                                                                 .px(px(12.0))
-                                                                .py(px(8.0))
+                                                                .py(px(section_chip_y_padding))
                                                                 .cursor_pointer()
                                                                 .hover(|style| {
                                                                     style.bg(rgba(0xffffff14))
@@ -3193,6 +3273,7 @@ impl RootView {
                                 .child(
                                     div()
                                         .id("snippet-list-scroll")
+                                        .debug_selector(|| "snippet-list-scroll".to_string())
                                         .flex_1()
                                         .min_h(px(0.0))
                                         .overflow_scroll()
@@ -3209,7 +3290,7 @@ impl RootView {
                                 )
                                 .child(
                                     div()
-                                        .h(px(40.0))
+                                        .h(px(sidebar_footer_height))
                                         .px(px(16.0))
                                         .border_t_1()
                                         .border_color(rgba(0xffffff10))
@@ -5905,27 +5986,80 @@ fn color_dot(color: u32) -> Div {
 #[cfg(test)]
 mod tests {
     use super::{
-        AiSettingsImeTarget, AiSettingsTextField, GlobalShortcutAction, INPUT_METHOD_VK_PROCESSKEY,
-        RootImeTarget, ZoomAction, active_ai_settings_ime_target, active_root_ime_target,
-        adjust_font_size_value, byte_index_to_utf16_offset, byte_range_to_utf16_range,
-        collect_global_hotkeys, configured_global_shortcut_action,
-        consume_input_method_vk_processkey, current_text_for_ai_settings_ime_target,
-        cycle_string_option, direct_text_from_input_keystroke, hotkey_binding_string,
-        hotkey_matches, hotkey_string_for_keystroke, next_filtered_index,
-        process_completion_notice_detail, replace_text_in_ai_settings_ime_target,
-        should_defer_control_key_to_input_method, should_defer_keystroke_to_input_method,
-        should_route_keystroke_via_text_input, snippet_panel_frame,
-        snippet_primary_action_for_section, terminal_settings_from_config, titlebar_actions_width,
-        titlebar_side_cluster_width, traffic_lights_width, utf16_offset_to_byte_index,
-        utf16_range_to_byte_range, wrap_sidebar_preview, zoom_action_for_window,
+        AiSettingsImeTarget, AiSettingsTextField, AppState, GlobalShortcutAction, RootImeTarget,
+        RootView, SettingsCategory, ZoomAction, active_ai_settings_ime_target,
+        active_root_ime_target, adjust_font_size_value, byte_index_to_utf16_offset,
+        byte_range_to_utf16_range, collect_global_hotkeys, configured_global_shortcut_action,
+        current_text_for_ai_settings_ime_target, cycle_string_option,
+        direct_text_from_input_keystroke, hotkey_binding_string, hotkey_matches,
+        hotkey_string_for_keystroke, next_filtered_index, process_completion_notice_detail,
+        replace_text_in_ai_settings_ime_target, should_defer_control_key_to_input_method,
+        should_defer_keystroke_to_input_method_with_state, should_route_keystroke_via_text_input,
+        snippet_panel_frame, snippet_primary_action_for_section, terminal_settings_from_config,
+        titlebar_actions_width, titlebar_side_cluster_width, traffic_lights_width,
+        utf16_offset_to_byte_index, utf16_range_to_byte_range, wrap_sidebar_preview,
+        zoom_action_for_window,
     };
     use crate::config::AppConfig;
-    use crate::snippet_palette::SnippetSection;
-    use gpui::{KeyDownEvent, Keystroke, Modifiers};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    };
+    use crate::snippet_palette::{SnippetPaletteModel, SnippetSection};
+    use gpui::{AppContext, KeyDownEvent, Keystroke, Modifiers, TestAppContext, point, px, size};
+    use std::sync::{Arc, atomic::AtomicBool};
+    use std::time::Instant;
+
+    fn build_test_root_view(cx: &mut gpui::Context<RootView>) -> RootView {
+        let state = cx.new(|_| AppState {
+            tabs: Vec::new(),
+            active_tab: 0,
+            available_shells: Vec::new(),
+            config: AppConfig::default(),
+            terminal_input_suppressed: Arc::new(AtomicBool::new(false)),
+        });
+        let mut snippet_palette = SnippetPaletteModel::with_test_data();
+        assert!(snippet_palette.select_section(SnippetSection::Template));
+        for index in 0..3 {
+            assert!(
+                snippet_palette
+                    .create_template_item(
+                        format!("追加テスト {}", index + 1),
+                        format!("echo test-{}", index + 1),
+                        Some("クリック検証用".to_string()),
+                        vec!["test".to_string()],
+                        false,
+                    )
+                    .is_some()
+            );
+        }
+
+        RootView {
+            state,
+            focus_handle: cx.focus_handle(),
+            clipboard_listener: None,
+            last_clipboard_sequence: None,
+            show_shell_menu: false,
+            show_settings: false,
+            show_snippet_palette: true,
+            template_editor: None,
+            show_close_confirm: false,
+            snippet_palette,
+            keyboard_settings_active_text: None,
+            ai_settings_active_text: None,
+            app_notice: None,
+            root_ime_target: None,
+            root_ime_marked_range: None,
+            root_ime_selected_range: None,
+            settings_category: SettingsCategory::General,
+            last_bounds: None,
+            last_save_time: Instant::now(),
+            bounds_dirty: false,
+        }
+    }
+
+    fn bounds_center(bounds: gpui::Bounds<gpui::Pixels>) -> gpui::Point<gpui::Pixels> {
+        point(
+            bounds.origin.x + (bounds.size.width / 2.0),
+            bounds.origin.y + (bounds.size.height / 2.0),
+        )
+    }
 
     #[test]
     fn zoom_action_maximizes_when_windowed() {
@@ -5987,14 +6121,63 @@ mod tests {
     }
 
     #[test]
-    fn history_primary_action_pastes_and_template_copies() {
+    fn wrap_sidebar_preview_breaks_long_urls_into_two_lines() {
+        let wrapped = wrap_sidebar_preview(
+            "https://www.figma.com/make/hEbX0XvRtTkJy5s2CpfPf6/CopyQ%E9%A2%A8UI%E4%BD%9C%E6%88%90",
+            20.0,
+            2,
+        );
+
+        assert!(wrapped.contains('\n'));
+        assert!(wrapped.lines().count() <= 2);
+    }
+
+    #[gpui::test]
+    fn snippet_palette_sidebar_allows_selecting_items_below_third_row(cx: &mut TestAppContext) {
+        let (view, cx) = cx.add_window_view(|_, cx| build_test_root_view(cx));
+        cx.simulate_resize(size(px(1280.0), px(900.0)));
+        cx.run_until_parked();
+
+        let target_bounds = cx
+            .debug_bounds("snippet-item-template-weekly")
+            .expect("template-weekly should be rendered in the sidebar");
+        let list_bounds = cx
+            .debug_bounds("snippet-list-scroll")
+            .expect("snippet list scroll area should exist");
+        let target_center = bounds_center(target_bounds);
+
+        assert!(
+            target_bounds.origin.y >= list_bounds.origin.y,
+            "target item should start within the list viewport"
+        );
+        assert!(
+            target_bounds.origin.y + target_bounds.size.height
+                <= list_bounds.origin.y + list_bounds.size.height,
+            "fourth item should remain fully visible inside the list viewport"
+        );
+
+        cx.simulate_click(target_center, Modifiers::default());
+        cx.run_until_parked();
+
+        view.update(cx, |view, _| {
+            assert_eq!(
+                view.snippet_palette
+                    .selected_snippet()
+                    .map(|snippet| snippet.id.as_str()),
+                Some("template-weekly")
+            );
+        });
+    }
+
+    #[test]
+    fn history_and_template_primary_actions_paste_to_terminal() {
         assert_eq!(
             snippet_primary_action_for_section(SnippetSection::History),
             super::SnippetPrimaryAction::PasteToTerminal
         );
         assert_eq!(
             snippet_primary_action_for_section(SnippetSection::Template),
-            super::SnippetPrimaryAction::CopyToClipboard
+            super::SnippetPrimaryAction::PasteToTerminal
         );
     }
 
@@ -6105,8 +6288,9 @@ mod tests {
             key_char: None,
         };
 
-        INPUT_METHOD_VK_PROCESSKEY.store(true, Ordering::Release);
-        assert!(should_defer_keystroke_to_input_method(&keystroke));
+        assert!(should_defer_keystroke_to_input_method_with_state(
+            &keystroke, true, true
+        ));
     }
 
     #[test]
@@ -6117,8 +6301,9 @@ mod tests {
             key_char: None,
         };
 
-        INPUT_METHOD_VK_PROCESSKEY.store(true, Ordering::Release);
-        assert!(!should_defer_keystroke_to_input_method(&keystroke));
+        assert!(!should_defer_keystroke_to_input_method_with_state(
+            &keystroke, true, true
+        ));
     }
 
     #[test]
@@ -6129,8 +6314,22 @@ mod tests {
             key_char: Some("a".into()),
         };
 
-        INPUT_METHOD_VK_PROCESSKEY.store(true, Ordering::Release);
-        assert!(should_defer_keystroke_to_input_method(&keystroke));
+        assert!(should_defer_keystroke_to_input_method_with_state(
+            &keystroke, true, true
+        ));
+    }
+
+    #[test]
+    fn should_defer_keystroke_to_input_method_allows_ascii_after_ime_returns_to_alnum() {
+        let keystroke = Keystroke {
+            modifiers: Modifiers::default(),
+            key: "a".into(),
+            key_char: Some("a".into()),
+        };
+
+        assert!(!should_defer_keystroke_to_input_method_with_state(
+            &keystroke, true, false
+        ));
     }
 
     #[test]
@@ -6142,14 +6341,6 @@ mod tests {
         };
 
         assert!(should_route_keystroke_via_text_input(&keystroke));
-    }
-
-    #[test]
-    fn consume_input_method_vk_processkey_clears_pending_flag() {
-        INPUT_METHOD_VK_PROCESSKEY.store(true, Ordering::Release);
-
-        assert!(consume_input_method_vk_processkey());
-        assert!(!consume_input_method_vk_processkey());
     }
 
     #[test]

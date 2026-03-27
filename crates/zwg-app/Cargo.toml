@@ -39,6 +39,9 @@ ghostty-vt = { path = "../ghostty-vt", optional = true }
 cc = "1"
 winresource = "0.1"
 
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [features]
 default = ["ghostty_vt"]
 ghostty_vt = ["dep:ghostty-vt"]
