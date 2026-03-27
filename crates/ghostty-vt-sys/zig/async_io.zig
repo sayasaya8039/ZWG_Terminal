@@ -10,18 +10,32 @@
 
 const std = @import("std");
 
+/// Spin-wait for a precise sub-millisecond delay. On Windows, Thread.sleep
+/// has ~15ms minimum granularity, making it useless for delays under 1ms.
+/// This uses spin-loop hints to yield CPU cycles without oversleeping.
+fn spinWaitNs(target_ns: u64) void {
+    var timer = std.time.Timer.start() catch {
+        // Fallback to Thread.sleep if high-resolution timer unavailable
+        std.Thread.sleep(target_ns);
+        return;
+    };
+    while (timer.read() < target_ns) {
+        std.atomic.spinLoopHint();
+    }
+}
+
 /// 4MB ring buffer capacity (power of 2 for bitmask modulo)
 pub const RING_CAPACITY: usize = 4 * 1024 * 1024;
 const RING_MASK: usize = RING_CAPACITY - 1;
-/// Coalesce window: start conservatively at 2ms, but the parser loop
-/// adaptively shortens to 1ms when sustained output is detected (e.g.
-/// Claude Code /fast mode).  Reverts to 2ms after an idle period.
-const OUTPUT_COALESCE_NS_NORMAL: u64 = 2 * std.time.ns_per_ms;
-const OUTPUT_COALESCE_NS_FAST: u64 = 1 * std.time.ns_per_ms;
+/// Coalesce window: reduced from 2ms/1ms to 500us/250us to improve
+/// throughput beyond 120 FPS. On Windows, Thread.sleep has ~15ms granularity,
+/// so we use spin-wait for sub-millisecond delays to ensure accuracy.
+const OUTPUT_COALESCE_NS_NORMAL: u64 = 500 * std.time.ns_per_us;
+const OUTPUT_COALESCE_NS_FAST: u64 = 250 * std.time.ns_per_us;
 /// Consecutive busy cycles before switching to fast coalesce mode.
-const FAST_MODE_THRESHOLD: u32 = 8;
+const FAST_MODE_THRESHOLD: u32 = 4;
 /// Idle cycles before reverting to normal coalesce mode.
-const FAST_MODE_REVERT_IDLE: u32 = 200;
+const FAST_MODE_REVERT_IDLE: u32 = 100;
 const DRAIN_BUFFER_CAPACITY: usize = 512 * 1024;
 
 /// Single-Producer Single-Consumer lock-free ring buffer.
@@ -186,7 +200,9 @@ pub const AsyncFeeder = struct {
                     OUTPUT_COALESCE_NS_NORMAL;
 
                 var total = n;
-                std.Thread.sleep(coalesce_ns);
+                // Spin-wait for sub-millisecond accuracy on Windows where
+                // Thread.sleep has ~15ms minimum granularity.
+                spinWaitNs(coalesce_ns);
                 while (total < drain_buf.len) {
                     const drained = self.ring.pop(drain_buf[total..]);
                     if (drained == 0) break;

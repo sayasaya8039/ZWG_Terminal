@@ -82,12 +82,13 @@ impl TerminalSnapshot {
 pub(super) struct GridRendererConfig {
     pub cell_width: f32,
     pub cell_height: f32,
-    pub font_family: SharedString,
     pub font_size: f32,
     pub horizontal_text_padding: f32,
     pub term_cols: u16,
     pub fg_color: u32,
     pub bg_color: u32,
+    /// Pre-built Font descriptor — avoids rebuilding from font family string every frame.
+    pub cached_font: Font,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -631,21 +632,25 @@ fn borrow_active_glyph_plans(
     cache: &HashMap<GlyphKey, PreparedGlyphPlan>,
     active_keys: &HashSet<GlyphKey>,
 ) -> HashMap<GlyphKey, PreparedGlyphPlan> {
-    active_keys
-        .iter()
-        .filter_map(|key| cache.get(key).cloned().map(|plan| (key.clone(), plan)))
-        .collect()
+    let mut result = HashMap::with_capacity(active_keys.len());
+    for key in active_keys {
+        if let Some(plan) = cache.get(key) {
+            result.insert(key.clone(), plan.clone());
+        }
+    }
+    result
 }
 
 #[cfg(feature = "ghostty_vt")]
 fn persist_active_glyph_plans(
     cache: &mut HashMap<GlyphKey, PreparedGlyphPlan>,
-    local_plans: &HashMap<GlyphKey, PreparedGlyphPlan>,
+    local_plans: HashMap<GlyphKey, PreparedGlyphPlan>,
     active_keys: &HashSet<GlyphKey>,
 ) {
-    for key in active_keys {
-        if let Some(plan) = local_plans.get(key) {
-            cache.insert(key.clone(), plan.clone());
+    // Move plans from local into cache — avoids cloning keys and plans
+    for (key, plan) in local_plans {
+        if active_keys.contains(&key) {
+            cache.insert(key, plan);
         }
     }
 }
@@ -1169,7 +1174,7 @@ pub(crate) fn grid_cells_from_parts(
 }
 
 pub(super) fn terminal_canvas(
-    snapshot: TerminalSnapshot,
+    snapshot: Arc<TerminalSnapshot>,
     selection: Option<(SelectionPoint, SelectionPoint)>,
     config: GridRendererConfig,
     glyph_cache: GlyphCache,
@@ -1178,7 +1183,7 @@ pub(super) fn terminal_canvas(
         |_, _, _| (),
         move |bounds: Bounds<Pixels>, _, window: &mut Window, _cx: &mut App| {
             let text_system = window.text_system().clone();
-            let font_desc = font(config.font_family.clone());
+            let font_desc = config.cached_font.clone();
             let font_size = px(config.font_size);
             let line_height_px = px(config.cell_height);
             let num_rows = snapshot.rows.len();
@@ -1361,7 +1366,7 @@ pub(super) fn terminal_canvas(
             {
                 let mut cache = glyph_cache.lock();
                 prune_glyph_cache(&mut cache, &active_glyph_keys);
-                persist_active_glyph_plans(&mut cache, &glyph_layout_cache, &active_glyph_keys);
+                persist_active_glyph_plans(&mut cache, glyph_layout_cache, &active_glyph_keys);
             }
         },
     )
@@ -1980,7 +1985,7 @@ mod tests {
             PreparedGlyphPlan::default(),
         );
         prune_glyph_cache(&mut shared, &active_keys);
-        persist_active_glyph_plans(&mut shared, &local, &active_keys);
+        persist_active_glyph_plans(&mut shared, local, &active_keys);
 
         assert_eq!(shared.len(), 1);
         assert!(shared.contains_key(&active_key));

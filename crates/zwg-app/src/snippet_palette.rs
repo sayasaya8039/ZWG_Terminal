@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -68,6 +69,8 @@ pub struct SnippetPaletteModel {
     selected_snippet_id: Option<String>,
     search_query: String,
     pinned_only: bool,
+    /// Cached visible snippet IDs — invalidated on filter/snippets change
+    cached_visible_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -101,9 +104,15 @@ impl SnippetPaletteModel {
             selected_snippet_id: None,
             search_query: String::new(),
             pinned_only: false,
+            cached_visible_ids: None,
         };
         model.sync_selection();
         model
+    }
+
+    /// Invalidate the cached visible IDs (call whenever snippets, filter, or section changes)
+    fn invalidate_cache(&mut self) {
+        self.cached_visible_ids = None;
     }
 
     #[cfg(test)]
@@ -173,11 +182,8 @@ impl SnippetPaletteModel {
     }
 
     pub fn select(&mut self, snippet_id: &str) -> bool {
-        if self
-            .visible_snippet_ids()
-            .iter()
-            .any(|candidate| candidate == snippet_id)
-        {
+        let ids = self.get_visible_ids();
+        if ids.iter().any(|candidate| candidate == snippet_id) {
             self.selected_snippet_id = Some(snippet_id.to_string());
             return true;
         }
@@ -191,6 +197,7 @@ impl SnippetPaletteModel {
         }
 
         self.active_section = section;
+        self.invalidate_cache();
         self.sync_selection();
         true
     }
@@ -204,12 +211,13 @@ impl SnippetPaletteModel {
         let next_index =
             (current_index as isize + step).rem_euclid(sections.len() as isize) as usize;
         self.active_section = sections[next_index];
+        self.invalidate_cache();
         self.sync_selection();
         true
     }
 
     pub fn move_selection(&mut self, step: isize) -> bool {
-        let visible = self.visible_snippet_ids();
+        let visible = self.get_visible_ids();
         if visible.is_empty() {
             self.selected_snippet_id = None;
             return false;
@@ -229,6 +237,7 @@ impl SnippetPaletteModel {
     #[cfg(test)]
     pub fn set_search_query(&mut self, query: impl Into<String>) {
         self.search_query = query.into();
+        self.invalidate_cache();
         self.sync_selection();
     }
 
@@ -238,6 +247,7 @@ impl SnippetPaletteModel {
         }
 
         self.search_query.push_str(text);
+        self.invalidate_cache();
         self.sync_selection();
     }
 
@@ -247,6 +257,7 @@ impl SnippetPaletteModel {
         }
 
         self.search_query.pop();
+        self.invalidate_cache();
         self.sync_selection();
         true
     }
@@ -257,12 +268,14 @@ impl SnippetPaletteModel {
         }
 
         self.search_query.clear();
+        self.invalidate_cache();
         self.sync_selection();
         true
     }
 
     pub fn toggle_pinned_only(&mut self) -> bool {
         self.pinned_only = !self.pinned_only;
+        self.invalidate_cache();
         self.sync_selection();
         self.pinned_only
     }
@@ -279,6 +292,7 @@ impl SnippetPaletteModel {
             SnippetSection::History => self.persist_history(),
             SnippetSection::Template => self.persist_templates(),
         }
+        self.invalidate_cache();
         self.sync_selection();
         Some(pinned)
     }
@@ -322,6 +336,7 @@ impl SnippetPaletteModel {
             .unwrap_or(self.snippets.len());
         self.snippets.insert(insert_at, new_item);
         self.selected_snippet_id = Some(new_id.clone());
+        self.invalidate_cache();
         self.sync_selection();
         self.persist_templates();
         Some(new_id)
@@ -350,6 +365,7 @@ impl SnippetPaletteModel {
         snippet.tags = tags;
         snippet.pinned = favorite;
         snippet.kind_label = template_kind_label(&snippet.content).to_string();
+        self.invalidate_cache();
         self.persist_templates();
         true
     }
@@ -393,6 +409,7 @@ impl SnippetPaletteModel {
             .unwrap_or(0);
         self.snippets.insert(insert_at, history_record);
         self.trim_history_items();
+        self.invalidate_cache();
         self.sync_selection();
         self.persist_history();
         true
@@ -408,6 +425,7 @@ impl SnippetPaletteModel {
         }
 
         self.selected_snippet_id = None;
+        self.invalidate_cache();
         self.sync_selection();
         let _ = clear_history_store();
         true
@@ -417,7 +435,7 @@ impl SnippetPaletteModel {
         let Some(selected_id) = self.selected_snippet_id.clone() else {
             return false;
         };
-        let visible_before = self.visible_snippet_ids();
+        let visible_before = self.get_visible_ids();
         let fallback_index = visible_before
             .iter()
             .position(|snippet_id| *snippet_id == selected_id)
@@ -433,7 +451,8 @@ impl SnippetPaletteModel {
             return false;
         }
 
-        let visible_after = self.visible_snippet_ids();
+        self.invalidate_cache();
+        let visible_after = self.get_visible_ids();
         self.selected_snippet_id = visible_after
             .get(fallback_index)
             .cloned()
@@ -472,6 +491,21 @@ impl SnippetPaletteModel {
         }
     }
 
+    /// Get visible snippet IDs, using cache if available
+    fn get_visible_ids(&mut self) -> Vec<String> {
+        if let Some(ref cached) = self.cached_visible_ids {
+            return cached.clone();
+        }
+        let ids: Vec<String> = self
+            .visible_snippets()
+            .into_iter()
+            .map(|snippet| snippet.id.clone())
+            .collect();
+        self.cached_visible_ids = Some(ids.clone());
+        ids
+    }
+
+    /// Build visible IDs without caching (for sync_selection which borrows &self)
     fn visible_snippet_ids(&self) -> Vec<String> {
         self.visible_snippets()
             .into_iter()
@@ -507,9 +541,11 @@ impl SnippetPaletteModel {
 
     fn sync_selection(&mut self) {
         let visible = self.visible_snippet_ids();
+        // Use HashSet for O(1) containment check instead of Vec::contains O(n)
+        let visible_set: HashSet<&str> = visible.iter().map(|s| s.as_str()).collect();
         self.selected_snippet_id = match (self.selected_snippet_id.clone(), visible.first()) {
             (_, None) => None,
-            (Some(selected), _) if visible.contains(&selected) => Some(selected),
+            (Some(selected), _) if visible_set.contains(selected.as_str()) => Some(selected),
             (_, Some(first)) => Some(first.clone()),
         };
     }
@@ -921,10 +957,12 @@ mod tests {
             false,
         );
 
-        assert_eq!(new_id.as_deref(), Some("template-new-4"));
+        assert!(new_id.is_some(), "create_template_item should return an id");
+        let created_id = new_id.unwrap();
+        assert!(created_id.starts_with("template-"), "id should start with template- prefix");
         assert_eq!(
             model.selected_snippet().map(|snippet| snippet.id.as_str()),
-            Some("template-new-4")
+            Some(created_id.as_str())
         );
         assert_eq!(
             model

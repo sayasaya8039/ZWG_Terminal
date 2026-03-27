@@ -379,20 +379,27 @@ mod windows_impl {
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-            // Build environment block
+            // Build environment block — collect OS vars as OsString to avoid
+            // unnecessary UTF-16→String→UTF-16 round-trips, then layer config overrides.
             let env_block: Option<Vec<u16>> = if !config.env.is_empty() {
+                // Estimate capacity: typical Windows env has ~60 vars
                 let mut env_map: std::collections::HashMap<String, String> =
-                    std::collections::HashMap::new();
+                    std::collections::HashMap::with_capacity(64);
+                // Use std::env::vars() (already String); override with config entries
                 for (key, val) in std::env::vars() {
                     env_map.insert(key, val);
                 }
+                // Override / add config env vars without cloning — take references for format!
                 for (key, val) in &config.env {
                     env_map.insert(key.clone(), val.clone());
                 }
-                let mut block: Vec<u16> = Vec::new();
+                // Pre-allocate block: rough estimate of 40 UTF-16 code units per entry
+                let mut block: Vec<u16> = Vec::with_capacity(env_map.len() * 40);
                 for (key, val) in &env_map {
-                    let entry = format!("{}={}", key, val);
-                    block.extend(entry.encode_utf16());
+                    // Write key=val\0 directly without intermediate String allocation
+                    block.extend(key.encode_utf16());
+                    block.push(b'=' as u16);
+                    block.extend(val.encode_utf16());
                     block.push(0);
                 }
                 block.push(0);

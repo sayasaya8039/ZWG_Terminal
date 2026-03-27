@@ -360,6 +360,10 @@ impl TerminalSurface {
             .spawn(move || {
                 let mut buf = [0u8; 262_144]; // 256KB for high-throughput CLI output
                 let mut win32_input_tracker = Win32InputModeTracker::default();
+                // Batching buffer: accumulate multiple PTY reads before locking backend.
+                // Only used in sync (non-async) mode to reduce mutex contention.
+                let mut batch_buf: Vec<u8> = Vec::new();
+                const BATCH_MAX: usize = 512 * 1024; // 512KB batch ceiling
                 loop {
                     if stop_flag.load(Ordering::Relaxed) {
                         break;
@@ -373,28 +377,72 @@ impl TerminalSurface {
                         }
                     };
                     let win32_mode_active = win32_input_tracker.observe(&buf[..n]);
-                    win32_input_mode.store(win32_mode_active, Ordering::Release);
+                    // Relaxed is safe: win32 input mode is advisory, not a synchronization point
+                    win32_input_mode.store(win32_mode_active, Ordering::Relaxed);
                     if let Some(raw_ptr) = async_ptr {
+                        // Async path: lock-free ring buffer push, no mutex needed
                         #[cfg(feature = "ghostty_vt")]
                         unsafe {
                             feed_async_raw(raw_ptr, &buf[..n]);
                         }
                     } else {
-                        let mut b = backend.lock();
-                        b.feed(&buf[..n]);
+                        // Sync path: batch multiple reads to reduce backend lock acquisitions.
+                        // Accumulate data and only lock+feed when no more data is immediately
+                        // available or when the batch buffer is full.
+                        batch_buf.extend_from_slice(&buf[..n]);
+                        if batch_buf.len() < BATCH_MAX {
+                            // Try a non-blocking peek: attempt another read before locking
+                            let mut guard = reader.lock();
+                            match guard.read(&mut buf) {
+                                Ok(0) => {
+                                    // EOF — feed whatever we have, then break
+                                    drop(guard);
+                                    if !batch_buf.is_empty() {
+                                        let mut b = backend.lock();
+                                        b.feed(&batch_buf);
+                                        batch_buf.clear();
+                                    }
+                                    break;
+                                }
+                                Ok(extra_n) => {
+                                    drop(guard);
+                                    batch_buf.extend_from_slice(&buf[..extra_n]);
+                                    let extra_win32 = win32_input_tracker.observe(&buf[..extra_n]);
+                                    win32_input_mode.store(extra_win32, Ordering::Relaxed);
+                                }
+                                Err(_) => {
+                                    // Read error (likely pipe broken) — feed remaining then break
+                                    drop(guard);
+                                    if !batch_buf.is_empty() {
+                                        let mut b = backend.lock();
+                                        b.feed(&batch_buf);
+                                        batch_buf.clear();
+                                    }
+                                    break;
+                                }
+                            }
+                        }
+                        // Feed the accumulated batch to backend (single lock acquisition)
+                        if !batch_buf.is_empty() {
+                            let mut b = backend.lock();
+                            b.feed(&batch_buf);
+                            batch_buf.clear();
+                        }
                     }
+                    // Relaxed CAS is sufficient: OutputReceived is a hint, not ordering-critical.
+                    // The UI thread will see the flag on next poll regardless of memory ordering.
                     if output_event_pending
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                        .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
                         .is_ok()
                     {
                         if event_tx.try_send(TerminalEvent::OutputReceived).is_err() {
-                            output_event_pending.store(false, Ordering::Release);
+                            output_event_pending.store(false, Ordering::Relaxed);
                         }
                     }
                 }
                 log::debug!("PTY reader thread exiting");
-                output_event_pending.store(false, Ordering::Release);
-                win32_input_mode.store(false, Ordering::Release);
+                output_event_pending.store(false, Ordering::Relaxed);
+                win32_input_mode.store(false, Ordering::Relaxed);
                 let _ = event_tx.send(TerminalEvent::ProcessExited(0));
             })?;
 

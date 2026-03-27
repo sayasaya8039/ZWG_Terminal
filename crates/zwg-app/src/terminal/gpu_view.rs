@@ -99,9 +99,16 @@ impl GpuTerminalState {
         default_bg: u32,
     ) -> PackedRefresh {
         if self.last_packed_revision != snapshot.content_revision {
+            // If damaged_rows is empty but revision changed, no specific rows
+            // reported damage — skip the expensive full rebuild and just update
+            // the revision tracker.  Row-count changes and first-paint (u64::MAX)
+            // are still caught explicitly.
             let needs_full_rebuild = self.packed_rows.len() != snapshot.rows.len()
-                || self.last_packed_revision == u64::MAX
-                || snapshot.damaged_rows.is_empty();
+                || self.last_packed_revision == u64::MAX;
+            if !needs_full_rebuild && snapshot.damaged_rows.is_empty() {
+                self.last_packed_revision = snapshot.content_revision;
+                return PackedRefresh::Unchanged;
+            }
 
             if needs_full_rebuild {
                 self.packed_rows = snapshot
@@ -614,6 +621,10 @@ fn merge_damage_rects(
     rects.retain(|rect| {
         rect.col_count != 0 && rect.row_count != 0 && rect.start_col < term_cols as u32
     });
+    // Short-circuit: 0 or 1 rects cannot merge, skip sorting entirely
+    if rects.len() <= 1 {
+        return rects;
+    }
     rects.sort_unstable_by_key(|rect| {
         (
             rect.row_start,
@@ -753,7 +764,7 @@ fn overlay_damage_rects(
 ///
 /// This keeps GPUI alive for layout/input while the pixels are presented by a native DXGI swapchain.
 pub(super) fn gpu_terminal_canvas(
-    snapshot: TerminalSnapshot,
+    snapshot: Arc<TerminalSnapshot>,
     cursor: Option<CursorOverlay>,
     selection: Option<(SelectionPoint, SelectionPoint)>,
     config: GridRendererConfig,

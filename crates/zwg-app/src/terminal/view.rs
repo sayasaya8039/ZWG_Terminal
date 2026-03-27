@@ -793,6 +793,8 @@ pub struct TerminalPane {
     /// Keystrokes buffered while PTY is still connecting (Pending state)
     pending_input: Vec<u8>,
     pending_process_exit_status: Option<i32>,
+    /// Set by the blink timer to indicate only cursor visibility changed — no content refresh needed.
+    cursor_blink_pending: bool,
     /// Cross-frame glyph layout cache — avoids reshaping unchanged glyphs every paint
     glyph_cache: GlyphCache,
     /// DX12 GPU renderer state — bypasses GPUI text shaping when available
@@ -1100,6 +1102,7 @@ impl TerminalPane {
                             && pane.cursor_blink
                             && pane.snapshot.cursor_visible
                         {
+                            pane.cursor_blink_pending = true;
                             cx.notify();
                         }
                     })
@@ -1143,6 +1146,7 @@ impl TerminalPane {
             recent_user_inputs: VecDeque::new(),
             pending_input: Vec::new(),
             pending_process_exit_status: None,
+            cursor_blink_pending: false,
             glyph_cache: Default::default(),
             #[cfg(feature = "ghostty_vt")]
             gpu_state: None,
@@ -1305,6 +1309,8 @@ impl TerminalPane {
     }
 
     fn refresh_snapshot(&mut self, force_full: bool) -> bool {
+        // Content refresh invalidates cursor-blink-only state
+        self.cursor_blink_pending = false;
         self.snapshot.damaged_rows.clear();
         #[cfg(feature = "ghostty_vt")]
         let (rows, cursor_x, cursor_y, cursor_visible, row_updates, scrolled) = {
@@ -1572,22 +1578,33 @@ impl TerminalPane {
         let (layout_width, layout_height) =
             terminal_layout_size(window.viewport_size(), self.last_bounds);
         if self.handle_resize(layout_width, layout_height) {
+            self.cursor_blink_pending = false;
             self.refresh_snapshot(true);
         }
 
+        // When the render was triggered only by cursor blink, skip the full
+        // snapshot refresh — the content hasn't changed, only cursor visibility.
+        if self.cursor_blink_pending {
+            self.cursor_blink_pending = false;
+            // No refresh_snapshot needed — cursor_blink_visible() handles it below
+        }
+
         let selection = self.selection_range();
-        let mut render_snapshot = self.snapshot.clone();
-        render_snapshot.cursor_visible &= self.cursor_blink_visible();
+        let render_snapshot = {
+            let mut snap = self.snapshot.clone();
+            snap.cursor_visible &= self.cursor_blink_visible();
+            Arc::new(snap)
+        };
 
         let config = GridRendererConfig {
             cell_width: self.cell_width,
             cell_height: self.cell_height,
-            font_family: self.font_family.clone(),
             font_size: self.font_size,
             horizontal_text_padding: HORIZONTAL_TEXT_PADDING,
             term_cols: self.term_cols,
             fg_color: self.fg_color,
             bg_color: self.bg_color,
+            cached_font: font(self.font_family.clone()),
         };
 
         // Choose rendering path: DX12 native swapchain when possible, otherwise GPUI text shaping.
@@ -1619,7 +1636,7 @@ impl TerminalPane {
                 let _ = gpu_terminal_canvas;
                 gpu.lock().hide_native_presenter();
                 terminal_canvas(
-                    render_snapshot.clone(),
+                    Arc::clone(&render_snapshot),
                     selection,
                     config,
                     self.glyph_cache.clone(),
@@ -1629,7 +1646,7 @@ impl TerminalPane {
             #[cfg(not(target_os = "windows"))]
             {
                 terminal_canvas(
-                    render_snapshot.clone(),
+                    Arc::clone(&render_snapshot),
                     selection,
                     config,
                     self.glyph_cache.clone(),
@@ -1638,7 +1655,7 @@ impl TerminalPane {
             }
         } else {
             terminal_canvas(
-                render_snapshot.clone(),
+                Arc::clone(&render_snapshot),
                 selection,
                 config,
                 self.glyph_cache.clone(),
@@ -1647,7 +1664,7 @@ impl TerminalPane {
         };
         #[cfg(not(feature = "ghostty_vt"))]
         let terminal_element: AnyElement = terminal_canvas(
-            render_snapshot.clone(),
+            Arc::clone(&render_snapshot),
             selection,
             config,
             self.glyph_cache.clone(),

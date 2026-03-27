@@ -1,6 +1,7 @@
 //! Split pane tree — manages horizontal/vertical terminal splits
 
 use gpui::*;
+use smallvec::SmallVec;
 use uuid::Uuid;
 
 use crate::terminal::{TerminalPane, TerminalSettings};
@@ -37,8 +38,11 @@ pub struct SplitContainer {
     resize_drag: Option<ResizeDragState>,
 }
 
+/// SmallVec with inline capacity 8 — typical split depth rarely exceeds 8
+type BranchPath = SmallVec<[bool; 8]>;
+
 struct ResizeDragState {
-    branch_path: Vec<bool>,
+    branch_path: BranchPath,
     direction: SplitDirection,
     last_position: Point<Pixels>,
 }
@@ -266,12 +270,23 @@ impl SplitContainer {
         }
     }
 
+    /// Count total terminal leaves without allocating a Vec
+    fn terminal_count(node: &SplitNode) -> usize {
+        match node {
+            SplitNode::Leaf { .. } => 1,
+            SplitNode::Branch { first, second, .. } => {
+                Self::terminal_count(first) + Self::terminal_count(second)
+            }
+        }
+    }
+
     /// Focus the next pane in the given direction
     pub fn focus_direction(&mut self, dir: FocusDir, cx: &mut Context<Self>) {
-        let terminals = self.all_terminals();
-        if terminals.len() <= 1 {
+        // Quick check without allocating
+        if Self::terminal_count(&self.root) <= 1 {
             return;
         }
+        let terminals = self.all_terminals();
         let current_idx = terminals
             .iter()
             .position(|(id, _)| *id == self.focused_id)
@@ -308,7 +323,7 @@ impl SplitContainer {
 
     fn begin_resize_drag(
         &mut self,
-        branch_path: Vec<bool>,
+        branch_path: BranchPath,
         direction: SplitDirection,
         start: Point<Pixels>,
     ) {
@@ -420,7 +435,8 @@ fn leaf_border_style(is_focused: bool) -> (u8, u32) {
 impl Render for SplitContainer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused_id = self.focused_id;
-        Self::render_node(&self.root, focused_id, cx.entity().clone(), &[])
+        let empty_path: BranchPath = SmallVec::new();
+        Self::render_node(&self.root, focused_id, cx.entity().clone(), &empty_path)
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {
                 if ev.dragging() {
                     this.update_resize_drag(ev.position, window.viewport_size(), cx);
@@ -446,7 +462,7 @@ impl SplitContainer {
         node: &SplitNode,
         focused_id: Uuid,
         pane_entity: Entity<SplitContainer>,
-        branch_path: &[bool],
+        branch_path: &BranchPath,
     ) -> Div {
         match node {
             SplitNode::Leaf { id, terminal } => {
@@ -468,11 +484,11 @@ impl SplitContainer {
                 first,
                 second,
             } => {
-                let mut first_path = branch_path.to_vec();
+                let mut first_path: BranchPath = branch_path.clone();
                 first_path.push(false);
                 let first_el =
                     Self::render_node(first, focused_id, pane_entity.clone(), &first_path);
-                let mut second_path = branch_path.to_vec();
+                let mut second_path: BranchPath = branch_path.clone();
                 second_path.push(true);
                 let second_el =
                     Self::render_node(second, focused_id, pane_entity.clone(), &second_path);
@@ -491,7 +507,7 @@ impl SplitContainer {
                         )
                         .child({
                             let pane_resize = pane_entity.clone();
-                            let path_for_start = branch_path.to_vec();
+                            let path_for_start: BranchPath = branch_path.clone();
                             div()
                                 .w(px(4.0))
                                 .h_full()
@@ -520,7 +536,7 @@ impl SplitContainer {
                         .child(first_el.flex_grow().flex_basis(relative(r)).min_h(px(96.0)))
                         .child({
                             let pane_resize = pane_entity.clone();
-                            let path_for_start = branch_path.to_vec();
+                            let path_for_start: BranchPath = branch_path.clone();
                             div()
                                 .h(px(4.0))
                                 .w_full()

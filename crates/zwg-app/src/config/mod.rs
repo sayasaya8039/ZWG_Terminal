@@ -164,16 +164,25 @@ impl Default for KeyboardConfig {
     }
 }
 
+/// Trim a string in place only if it has leading/trailing whitespace,
+/// avoiding a clone+allocation when the string is already clean.
+fn trim_in_place(s: &mut String) {
+    let trimmed = s.trim();
+    if trimmed.len() != s.len() {
+        *s = trimmed.to_string();
+    }
+}
+
 impl KeyboardConfig {
     fn sanitized(mut self) -> Self {
-        self.new_tab = self.new_tab.trim().to_string();
-        self.close_tab = self.close_tab.trim().to_string();
-        self.split_right = self.split_right.trim().to_string();
-        self.split_down = self.split_down.trim().to_string();
-        self.close_pane = self.close_pane.trim().to_string();
-        self.focus_next_pane = self.focus_next_pane.trim().to_string();
-        self.focus_prev_pane = self.focus_prev_pane.trim().to_string();
-        self.open_settings = self.open_settings.trim().to_string();
+        trim_in_place(&mut self.new_tab);
+        trim_in_place(&mut self.close_tab);
+        trim_in_place(&mut self.split_right);
+        trim_in_place(&mut self.split_down);
+        trim_in_place(&mut self.close_pane);
+        trim_in_place(&mut self.focus_next_pane);
+        trim_in_place(&mut self.focus_prev_pane);
+        trim_in_place(&mut self.open_settings);
         self
     }
 }
@@ -303,8 +312,8 @@ impl AppConfig {
             self.keyboard.split_down = DEFAULT_SPLIT_DOWN_SHORTCUT.into();
         }
         self.ai_provider = crate::ai::sanitize_ai_provider_config_value(&self.ai_provider);
-        self.ai_api_key = self.ai_api_key.trim().to_string();
-        self.ai_model = self.ai_model.trim().to_string();
+        trim_in_place(&mut self.ai_api_key);
+        trim_in_place(&mut self.ai_model);
         self
     }
 
@@ -562,6 +571,7 @@ mod tests {
             ai_api_key: "test-key".into(),
             ai_model: "gpt-4.1-mini".into(),
             gpu_acceleration: true,
+            renderer_fps: default_renderer_fps(),
             default_window_cols: 132,
             default_window_rows: 40,
         };

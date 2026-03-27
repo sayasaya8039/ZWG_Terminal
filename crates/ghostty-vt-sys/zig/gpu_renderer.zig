@@ -132,10 +132,11 @@ pub const GpuRenderer = struct {
 
     // Render target (offscreen RGBA8)
     rt_texture: *dx.ID3D12Resource,
-    readback_buf: *dx.ID3D12Resource,
+    readback_bufs: [COMMAND_FRAME_COUNT]*dx.ID3D12Resource,
     width: u32,
     height: u32,
-    readback_ptr: ?[*]u8, // mapped pointer (persistent)
+    readback_ptrs: [COMMAND_FRAME_COUNT]?[*]u8, // mapped pointers (persistent, double-buffered)
+    readback_active: u32, // index of the readback buffer last written to
 
     // Cell upload buffer (structured buffer for instanced draw)
     cell_buf_upload: *dx.ID3D12Resource,
@@ -195,7 +196,8 @@ pub const GpuRenderer = struct {
         self.atlas_cols = 0;
         self.atlas_rows = 0;
         self.atlas_slot_count = 0;
-        self.readback_ptr = null;
+        self.readback_ptrs = .{ null, null };
+        self.readback_active = 0;
         self.cell_mapped = null;
         self.cell_buf_gpu_state = .COMMON;
         self.dirty_value_mapped = null;
@@ -1060,7 +1062,8 @@ pub const GpuRenderer = struct {
         const rtv_handle = self.rtv_heap.GetCPUDescriptorHandleForHeapStart();
         self.device.CreateRenderTargetView(@ptrCast(self.rt_texture), null, rtv_handle);
 
-        // Readback buffer
+        // Double-buffered readback buffers — CPU reads from previous frame
+        // while GPU writes to the current one, eliminating synchronous fence stalls.
         const row_pitch = self.pixelStride();
         const rb_size = @as(u64, row_pitch) * @as(u64, self.height);
         const rb_desc = dx.D3D12_RESOURCE_DESC{
@@ -1070,31 +1073,35 @@ pub const GpuRenderer = struct {
         };
         const heap_readback = dx.D3D12_HEAP_PROPERTIES{ .Type = .READBACK };
 
-        var rb_raw: ?*anyopaque = null;
-        const rb_hr = self.device.CreateCommittedResource(
-            &heap_readback,
-            .NONE,
-            &rb_desc,
-            .COPY_DEST,
-            null,
-            &dx.IID_ID3D12Resource,
-            &rb_raw,
-        );
-        if (!dx.SUCCEEDED(rb_hr)) {
-            log.err("createRenderTarget: readback buffer allocation failed hr=0x{x}", .{hr_hex(rb_hr)});
-            return false;
-        }
-        self.readback_buf = @ptrCast(@alignCast(rb_raw.?));
+        var rb_idx: usize = 0;
+        while (rb_idx < COMMAND_FRAME_COUNT) : (rb_idx += 1) {
+            var rb_raw: ?*anyopaque = null;
+            const rb_hr = self.device.CreateCommittedResource(
+                &heap_readback,
+                .NONE,
+                &rb_desc,
+                .COPY_DEST,
+                null,
+                &dx.IID_ID3D12Resource,
+                &rb_raw,
+            );
+            if (!dx.SUCCEEDED(rb_hr)) {
+                log.err("createRenderTarget: readback buffer[{}] allocation failed hr=0x{x}", .{ rb_idx, hr_hex(rb_hr) });
+                return false;
+            }
+            self.readback_bufs[rb_idx] = @ptrCast(@alignCast(rb_raw.?));
 
-        // Map readback buffer persistently
-        var mapped: ?*anyopaque = null;
-        const map_hr = self.readback_buf.Map(0, null, &mapped);
-        if (dx.SUCCEEDED(map_hr)) {
-            self.readback_ptr = @ptrCast(mapped);
-        } else {
-            log.err("createRenderTarget: readback buffer map failed hr=0x{x}", .{hr_hex(map_hr)});
-            return false;
+            // Map readback buffer persistently
+            var mapped: ?*anyopaque = null;
+            const map_hr = self.readback_bufs[rb_idx].Map(0, null, &mapped);
+            if (dx.SUCCEEDED(map_hr)) {
+                self.readback_ptrs[rb_idx] = @ptrCast(mapped);
+            } else {
+                log.err("createRenderTarget: readback buffer[{}] map failed hr=0x{x}", .{ rb_idx, hr_hex(map_hr) });
+                return false;
+            }
         }
+        self.readback_active = 0;
 
         return true;
     }
@@ -1999,6 +2006,10 @@ pub const GpuRenderer = struct {
     }
 
     /// Render terminal cells to offscreen buffer. Returns RGBA pixel pointer.
+    /// Uses double-buffered readback: GPU copies to readback_bufs[active], then
+    /// we wait only for that specific frame's fence before returning the pointer.
+    /// The previous frame's readback buffer remains available for CPU access
+    /// without any GPU stall.
     pub fn renderFrame(
         self: *GpuRenderer,
         cells: [*]const GpuCellData,
@@ -2008,10 +2019,13 @@ pub const GpuRenderer = struct {
         cell_height: f32,
     ) ?[*]const u8 {
         const count = @min(cell_count, MAX_CELLS);
-        if (count == 0) return self.readback_ptr;
+        if (count == 0) return self.readback_ptrs[self.readback_active];
         if (!self.renderToTexture(cells, cell_count, term_cols, cell_width, cell_height)) {
             return null;
         }
+
+        // Cycle readback buffer index for double-buffering
+        const rb_idx = (self.readback_active +% 1) % COMMAND_FRAME_COUNT;
 
         // Copy RT → readback using a placed-footprint copy; texture->buffer CopyResource is invalid.
         const src_loc = dx.D3D12_TEXTURE_COPY_LOCATION{
@@ -2020,7 +2034,7 @@ pub const GpuRenderer = struct {
             .u = .{ .SubresourceIndex = 0 },
         };
         const dst_loc = dx.D3D12_TEXTURE_COPY_LOCATION{
-            .pResource = @ptrCast(self.readback_buf),
+            .pResource = @ptrCast(self.readback_bufs[rb_idx]),
             .Type = 1,
             .u = .{
                 .PlacedFootprint = .{
@@ -2035,8 +2049,9 @@ pub const GpuRenderer = struct {
         const frame = self.acquireFrame();
         frame.cmd_list.CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, null);
         self.submitFrame(frame, true);
+        self.readback_active = @intCast(rb_idx);
 
-        return self.readback_ptr;
+        return self.readback_ptrs[rb_idx];
     }
 
     pub fn renderToTexture(
@@ -2459,8 +2474,11 @@ pub const GpuRenderer = struct {
         cell_height: f32,
     ) ?[*]const u8 {
         const count = @min(cell_count, MAX_CELLS);
-        if (count == 0) return self.readback_ptr;
+        if (count == 0) return self.readback_ptrs[self.readback_active];
         if (dirty_range_count == 0) return self.renderFrame(cells, cell_count, term_cols, cell_width, cell_height);
+
+        // Cycle readback buffer for double-buffering
+        const rb_idx = (self.readback_active +% 1) % COMMAND_FRAME_COUNT;
 
         var damage_rects = self.damageRectsFromDirtyRanges(
             dirty_ranges,
@@ -2469,7 +2487,7 @@ pub const GpuRenderer = struct {
             term_cols,
         ) catch return null;
         defer damage_rects.deinit(self.alloc);
-        if (damage_rects.items.len == 0) return self.readback_ptr;
+        if (damage_rects.items.len == 0) return self.readback_ptrs[self.readback_active];
 
         self.pending_glyphs.clearRetainingCapacity();
         self.collectMissingGlyphsInDamageRects(cells, count, damage_rects.items.ptr, @intCast(damage_rects.items.len), term_cols);
@@ -2506,7 +2524,7 @@ pub const GpuRenderer = struct {
                 .bottom = bottom,
             }) catch return null;
         }
-        if (dirty_rects.items.len == 0) return self.readback_ptr;
+        if (dirty_rects.items.len == 0) return self.readback_ptrs[self.readback_active];
         frame.cmd_list.ClearRenderTargetView(
             rtv,
             &clear_color,
@@ -2585,7 +2603,7 @@ pub const GpuRenderer = struct {
             .u = .{ .SubresourceIndex = 0 },
         };
         const dst_loc = dx.D3D12_TEXTURE_COPY_LOCATION{
-            .pResource = @ptrCast(self.readback_buf),
+            .pResource = @ptrCast(self.readback_bufs[rb_idx]),
             .Type = 1,
             .u = .{
                 .PlacedFootprint = .{
@@ -2626,8 +2644,9 @@ pub const GpuRenderer = struct {
         }
 
         self.submitFrame(frame, true);
+        self.readback_active = @intCast(rb_idx);
 
-        return self.readback_ptr;
+        return self.readback_ptrs[rb_idx];
     }
 
     // ---- Helpers ----
@@ -2656,7 +2675,22 @@ pub const GpuRenderer = struct {
         if (frame.fence_value == 0) return;
         if (self.fence.GetCompletedValue() < frame.fence_value) {
             _ = self.fence.SetEventOnCompletion(frame.fence_value, self.fence_event);
-            _ = dx.WaitForSingleObject(self.fence_event, dx.INFINITE);
+            // Use 100ms timeout instead of INFINITE to detect GPU hangs early
+            // and avoid blocking the render thread indefinitely. Normal frames
+            // complete in <2ms; 100ms gives ample headroom.
+            const result = dx.WaitForSingleObject(self.fence_event, 100);
+            if (result != 0) { // WAIT_OBJECT_0 == 0
+                log.warn("waitForFrame: fence wait timed out or failed (result=0x{x}, fence_value={})", .{
+                    @as(u32, @bitCast(result)),
+                    frame.fence_value,
+                });
+                // Spin-poll for up to 500ms more before giving up
+                var spin: u32 = 0;
+                while (spin < 50) : (spin += 1) {
+                    if (self.fence.GetCompletedValue() >= frame.fence_value) break;
+                    std.Thread.sleep(10 * std.time.ns_per_ms);
+                }
+            }
         }
     }
 
@@ -2678,8 +2712,10 @@ pub const GpuRenderer = struct {
         if (self.cell_mapped != null) self.cell_buf_upload.Unmap(0, null);
         _ = self.cell_buf_upload.Release();
         _ = self.cell_buf_gpu.Release();
-        if (self.readback_ptr != null) self.readback_buf.Unmap(0, null);
-        _ = self.readback_buf.Release();
+        for (self.readback_ptrs, 0..) |ptr, i| {
+            if (ptr != null) self.readback_bufs[i].Unmap(0, null);
+            _ = self.readback_bufs[i].Release();
+        }
         _ = self.rt_texture.Release();
         const compute_pso: *dx.IUnknown = @ptrCast(@alignCast(self.compute_pso));
         _ = compute_pso.Release();
@@ -2705,12 +2741,14 @@ pub const GpuRenderer = struct {
         if (new_width == self.width and new_height == self.height) return true;
         self.waitForGpu();
 
-        // Release old render target & readback
-        if (self.readback_ptr != null) {
-            self.readback_buf.Unmap(0, null);
-            self.readback_ptr = null;
+        // Release old render target & readback (double-buffered)
+        for (self.readback_ptrs, 0..) |ptr, i| {
+            if (ptr != null) {
+                self.readback_bufs[i].Unmap(0, null);
+                self.readback_ptrs[i] = null;
+            }
+            _ = self.readback_bufs[i].Release();
         }
-        _ = self.readback_buf.Release();
         _ = self.rt_texture.Release();
 
         self.width = new_width;
