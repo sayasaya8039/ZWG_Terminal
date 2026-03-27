@@ -579,6 +579,8 @@ pub struct AppState {
     pub available_shells: Vec<ShellEntry>,
     pub config: AppConfig,
     terminal_input_suppressed: Arc<AtomicBool>,
+    /// Session name for psmux compatibility (default: "work")
+    pub session_name: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -848,6 +850,7 @@ impl AppState {
             available_shells,
             config,
             terminal_input_suppressed,
+            session_name: "work".to_string(),
         }
     }
 
@@ -6202,6 +6205,7 @@ mod tests {
             available_shells: Vec::new(),
             config: AppConfig::default(),
             terminal_input_suppressed: Arc::new(AtomicBool::new(false)),
+            session_name: "work".to_string(),
         });
         let mut snippet_palette = SnippetPaletteModel::with_test_data();
         assert!(snippet_palette.select_section(SnippetSection::Template));

@@ -33,10 +33,13 @@ pub enum CliCommand {
     KillPane { target: String },
     CapturePane { target: Option<String>, print_stdout: bool },
     HasSession,
-    NewSession { print_info: bool, format: Option<String> },
+    NewSession { print_info: bool, format: Option<String>, session_name: Option<String> },
     NewWindow { print_info: bool, format: Option<String> },
     ListWindows { format: Option<String> },
     ShowOptions { option_name: Option<String> },
+    ListSessions,
+    AttachSession { target: Option<String> },
+    KillSession { target: Option<String> },
     SilentSuccess,
     Unknown(String),
     Version,
@@ -67,8 +70,11 @@ pub fn parse_args() -> CliCommand {
         "new-window" => parse_new_window(rest),
         "list-windows" => parse_list_windows(rest),
         "show-options" | "show-option" => parse_show_options(rest),
+        "list-sessions" | "ls" => CliCommand::ListSessions,
+        "attach-session" | "attach" | "a" => parse_attach_session(rest),
+        "kill-session" => parse_kill_session(rest),
         "set-option" | "set" | "select-layout" | "resize-pane" | "break-pane" | "join-pane"
-        | "kill-session" | "kill-window" | "move-pane" | "swap-pane" | "move-window"
+        | "kill-window" | "move-pane" | "swap-pane" | "move-window"
         | "swap-window" | "rename-session" | "rename-window" | "respawn-pane"
         | "set-environment" | "set-window-option" | "setw" => CliCommand::SilentSuccess,
         _ if subcmd.starts_with('-') => CliCommand::Gui,
@@ -199,6 +205,7 @@ fn parse_display_message(args: &[String]) -> CliCommand {
 fn parse_new_session(args: &[String]) -> CliCommand {
     let mut print_info = false;
     let mut format = None;
+    let mut session_name = None;
     let mut skip = false;
     for (i, a) in args.iter().enumerate() {
         if skip { skip = false; continue; }
@@ -206,12 +213,42 @@ fn parse_new_session(args: &[String]) -> CliCommand {
             "-P" => print_info = true,
             "-F" => { format = args.get(i+1).cloned(); skip = true; }
             "-d" | "-x" | "-y" | "-E" => {}
-            "-s" | "-n" | "-t" => { skip = true; }
+            "-s" => { session_name = args.get(i+1).cloned(); skip = true; }
+            "-n" | "-t" => { skip = true; }
+            s if s.starts_with("-s") && s.len() > 2 => { session_name = Some(s[2..].into()); }
             s if s.starts_with("-F") => { format = Some(s[2..].into()); }
             _ => {}
         }
     }
-    CliCommand::NewSession { print_info, format }
+    CliCommand::NewSession { print_info, format, session_name }
+}
+
+fn parse_attach_session(args: &[String]) -> CliCommand {
+    let mut target = None;
+    let mut skip = false;
+    for (i, a) in args.iter().enumerate() {
+        if skip { skip = false; continue; }
+        match a.as_str() {
+            "-t" => { target = args.get(i+1).cloned(); skip = true; }
+            s if s.starts_with("-t") && s.len() > 2 => { target = Some(s[2..].into()); }
+            _ => {}
+        }
+    }
+    CliCommand::AttachSession { target }
+}
+
+fn parse_kill_session(args: &[String]) -> CliCommand {
+    let mut target = None;
+    let mut skip = false;
+    for (i, a) in args.iter().enumerate() {
+        if skip { skip = false; continue; }
+        match a.as_str() {
+            "-t" => { target = args.get(i+1).cloned(); skip = true; }
+            s if s.starts_with("-t") && s.len() > 2 => { target = Some(s[2..].into()); }
+            _ => {}
+        }
+    }
+    CliCommand::KillSession { target }
 }
 
 fn parse_new_window(args: &[String]) -> CliCommand {
@@ -291,7 +328,19 @@ pub fn run_client(command: CliCommand) -> ! {
         CliCommand::CapturePane { target, print_stdout } => {
             run_capture_pane(target, print_stdout);
         }
-        CliCommand::NewSession { print_info, format }
+        CliCommand::ListSessions => {
+            println!("work: 1 windows (created {}) (attached)", chrono_or_now());
+            std::process::exit(0);
+        }
+        CliCommand::AttachSession { .. } => {
+            // ZWG is already the GUI — attach is a no-op
+            std::process::exit(0);
+        }
+        CliCommand::KillSession { .. } => {
+            // Send IPC kill-session or just exit 0
+            std::process::exit(0);
+        }
+        CliCommand::NewSession { print_info, format, .. }
         | CliCommand::NewWindow { print_info, format } => {
             run_new_session_or_window(print_info, format);
         }
@@ -346,7 +395,7 @@ pub fn expand_tmux_format(
     r = r.replace("#{window_height}", &hs);
     r = r.replace("#{window_panes}", "1");
     // Session
-    r = r.replace("#{session_name}", "zwg");
+    r = r.replace("#{session_name}", "work");
     r = r.replace("#{session_id}", "$0");
     r = r.replace("#{session_windows}", "1");
     r = r.replace("#{session_attached}", "1");
@@ -388,18 +437,25 @@ fn run_display_message(print_stdout: bool, format: Option<String>) -> ! {
 }
 
 fn run_show_options(option_name: Option<String>) -> ! {
+    let default_shell = if cfg!(windows) {
+        std::env::var("COMSPEC").unwrap_or_else(|_| "powershell.exe".into())
+    } else {
+        std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into())
+    };
     match option_name.as_deref() {
         Some("prefix") => println!("prefix C-b"),
         Some("prefix2") => println!("prefix2 none"),
         Some("base-index") => println!("base-index 0"),
         Some("pane-base-index") => println!("pane-base-index 0"),
-        Some("default-terminal") => println!("default-terminal \"screen-256color\""),
+        Some("default-terminal") => println!("default-terminal \"xterm-256color\""),
+        Some("default-shell") => println!("default-shell \"{}\"", default_shell),
         Some(name) => println!("{} \"\"", name),
         None => {
             println!("prefix C-b");
             println!("base-index 0");
             println!("pane-base-index 0");
-            println!("default-terminal \"screen-256color\"");
+            println!("default-terminal \"xterm-256color\"");
+            println!("default-shell \"{}\"", default_shell);
         }
     }
     std::process::exit(0);
@@ -505,6 +561,17 @@ fn run_ipc_command_list_panes(args: Vec<String>) -> ! {
         Ok(resp) => { eprint_and_exit(resp.error); }
         Err(e) => { eprintln!("zwg: failed to connect to server: {}", e); std::process::exit(1); }
     }
+}
+
+fn chrono_or_now() -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = now.as_secs();
+    // Simple date formatting without chrono dependency
+    let hours = (secs % 86400) / 3600;
+    let mins = (secs % 3600) / 60;
+    format!("{}:{:02}", hours, mins)
 }
 
 fn eprint_and_exit(error: Option<String>) -> ! {

@@ -394,7 +394,7 @@ mod windows_impl {
                     env_map.insert(key.clone(), val.clone());
                 }
                 // Add ZWG teammate-mode environment variables
-                for (key, val) in super::zwg_env_vars() {
+                for (key, val) in super::zwg_env_vars(0) {
                     env_map.insert(key, val);
                 }
                 // Pre-allocate block: rough estimate of 40 UTF-16 code units per entry
@@ -564,6 +564,7 @@ pub fn create_tmux_shims() -> anyhow::Result<std::path::PathBuf> {
             let wrapper_content = r#"@echo off
 setlocal
 if defined ZWG_TMUX_VALUE set "TMUX=%ZWG_TMUX_VALUE%"
+set "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1"
 set "_SELF=%~f0"
 set "_TARGET="
 for /f "delims=" %%I in ('where %~n0 2^>nul') do (
@@ -573,7 +574,7 @@ if not defined _TARGET (
   echo zwg: failed to find real %~n0 executable in PATH. 1>&2
   exit /b 1
 )
-"%_TARGET%" %*
+"%_TARGET%" --teammate-mode tmux %*
 exit /b %ERRORLEVEL%
 "#;
             std::fs::write(&wrapper, wrapper_content)?;
@@ -609,6 +610,7 @@ exit /b %ERRORLEVEL%
 if [ -n "$ZWG_TMUX_VALUE" ]; then
   export TMUX="$ZWG_TMUX_VALUE"
 fi
+export CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1
 target="$(command -v "$0" 2>/dev/null || true)"
 found=""
 for p in $(which -a "$(basename "$0")" 2>/dev/null); do
@@ -621,7 +623,7 @@ if [ -z "$found" ]; then
   echo "zwg: failed to find real $(basename "$0") executable in PATH." >&2
   exit 1
 fi
-exec "$found" "$@"
+exec "$found" --teammate-mode tmux "$@"
 "#;
             std::fs::write(&wrapper, &wrapper_content)?;
             std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
@@ -634,7 +636,7 @@ exec "$found" "$@"
 
 /// Generate the environment variables that should be set in every PTY spawned by ZWG.
 /// This enables Claude Code to detect ZWG as a tmux-compatible multiplexer.
-pub fn zwg_env_vars() -> Vec<(String, String)> {
+pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
     let conn = crate::ipc::IpcServer::connection_string();
     let pid = std::process::id();
     let tmux_value = format!("{},{},0", conn, pid);
@@ -657,6 +659,13 @@ pub fn zwg_env_vars() -> Vec<(String, String)> {
         ("PATH".to_string(), new_path),
         ("ZWG_AGENT_HOOK".to_string(), hook_cmd.clone()),
         ("CLAUDE_CODE_HOOK_CMD".to_string(), hook_cmd),
+        // Pane identification (psmux-compatible)
+        ("TMUX_PANE".to_string(), format!("%{}", pane_id)),
+        ("TERM".to_string(), "xterm-256color".to_string()),
+        ("COLORTERM".to_string(), "truecolor".to_string()),
+        // Claude Code agent teams support
+        ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS".to_string(), "1".to_string()),
+        ("CLAUDE_CODE_FORCE_INTERACTIVE".to_string(), "1".to_string()),
     ]
 }
 
