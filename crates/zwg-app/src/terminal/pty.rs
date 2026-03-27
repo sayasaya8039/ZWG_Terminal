@@ -379,9 +379,9 @@ mod windows_impl {
             )
             .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
 
-            // Build environment block — collect OS vars as OsString to avoid
-            // unnecessary UTF-16→String→UTF-16 round-trips, then layer config overrides.
-            let env_block: Option<Vec<u16>> = if !config.env.is_empty() {
+            // Build environment block — collect OS vars, layer config overrides,
+            // and inject ZWG teammate-mode environment variables.
+            let env_block: Option<Vec<u16>> = {
                 // Estimate capacity: typical Windows env has ~60 vars
                 let mut env_map: std::collections::HashMap<String, String> =
                     std::collections::HashMap::with_capacity(64);
@@ -389,9 +389,13 @@ mod windows_impl {
                 for (key, val) in std::env::vars() {
                     env_map.insert(key, val);
                 }
-                // Override / add config env vars without cloning — take references for format!
+                // Override / add config env vars
                 for (key, val) in &config.env {
                     env_map.insert(key.clone(), val.clone());
+                }
+                // Add ZWG teammate-mode environment variables
+                for (key, val) in super::zwg_env_vars() {
+                    env_map.insert(key, val);
                 }
                 // Pre-allocate block: rough estimate of 40 UTF-16 code units per entry
                 let mut block: Vec<u16> = Vec::with_capacity(env_map.len() * 40);
@@ -404,8 +408,6 @@ mod windows_impl {
                 }
                 block.push(0);
                 Some(block)
-            } else {
-                None
             };
 
             let mut si = STARTUPINFOEXW::default();
@@ -504,6 +506,158 @@ pub fn spawn_pty(config: ConPtyConfig) -> io::Result<PtyPair> {
             "Non-Windows PTY not yet implemented",
         ))
     }
+}
+
+// ============================================================
+// ZWG teammate-mode: env vars & PATH shim
+// ============================================================
+
+/// Return the directory where the tmux shim scripts live.
+/// On Windows: `{data_local_dir}/zwg/bin/`
+fn shim_dir() -> std::path::PathBuf {
+    dirs::data_local_dir()
+        .unwrap_or_else(|| std::path::PathBuf::from("."))
+        .join("zwg")
+        .join("bin")
+}
+
+/// Create tmux/claude shim scripts in the ZWG bin directory.
+/// Returns the shim directory path on success.
+pub fn create_tmux_shims() -> anyhow::Result<std::path::PathBuf> {
+    let dir = shim_dir();
+    std::fs::create_dir_all(&dir)?;
+
+    let zwg_exe = std::env::current_exe()?;
+
+    #[cfg(windows)]
+    {
+        // --- tmux.cmd ---
+        let shim_cmd = dir.join("tmux.cmd");
+        let content = format!("@\"{}\" %*\r\n", zwg_exe.display());
+        std::fs::write(&shim_cmd, content)?;
+        log::info!("tmux.cmd shim written to {:?}", shim_cmd);
+
+        // --- tmux.exe (hardlink or copy) ---
+        let shim_exe = dir.join("tmux.exe");
+        if !shim_exe.exists()
+            || shim_exe.metadata().map(|m| m.len()).unwrap_or(0)
+                != zwg_exe.metadata().map(|m| m.len()).unwrap_or(1)
+        {
+            let _ = std::fs::remove_file(&shim_exe);
+            if std::fs::hard_link(&zwg_exe, &shim_exe).is_err() {
+                std::fs::copy(&zwg_exe, &shim_exe)?;
+                log::info!("tmux.exe shim copied to {:?}", shim_exe);
+            } else {
+                log::info!("tmux.exe shim hardlinked to {:?}", shim_exe);
+            }
+        }
+
+        // --- zwg-agent-hook.cmd ---
+        let hook_cmd = dir.join("zwg-agent-hook.cmd");
+        let hook_content = format!("@\"{}\" agent-hook %*\r\n", zwg_exe.display());
+        std::fs::write(&hook_cmd, hook_content)?;
+        log::info!("zwg-agent-hook.cmd shim written to {:?}", hook_cmd);
+
+        // --- claude.cmd / claude-code.cmd ---
+        for name in ["claude.cmd", "claude-code.cmd"] {
+            let wrapper = dir.join(name);
+            let wrapper_content = r#"@echo off
+setlocal
+if defined ZWG_TMUX_VALUE set "TMUX=%ZWG_TMUX_VALUE%"
+set "_SELF=%~f0"
+set "_TARGET="
+for /f "delims=" %%I in ('where %~n0 2^>nul') do (
+  if /I not "%%~fI"=="%_SELF%" if not defined _TARGET set "_TARGET=%%~fI"
+)
+if not defined _TARGET (
+  echo zwg: failed to find real %~n0 executable in PATH. 1>&2
+  exit /b 1
+)
+"%_TARGET%" %*
+exit /b %ERRORLEVEL%
+"#;
+            std::fs::write(&wrapper, wrapper_content)?;
+            log::info!("{} shim written to {:?}", name, wrapper);
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // --- tmux ---
+        let shim_path = dir.join("tmux");
+        let content = format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", zwg_exe.display());
+        std::fs::write(&shim_path, &content)?;
+        std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755))?;
+        log::info!("tmux shim written to {:?}", shim_path);
+
+        // --- zwg-agent-hook ---
+        let hook_path = dir.join("zwg-agent-hook");
+        let hook_content = format!(
+            "#!/bin/sh\nexec \"{}\" agent-hook \"$@\"\n",
+            zwg_exe.display()
+        );
+        std::fs::write(&hook_path, &hook_content)?;
+        std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755))?;
+        log::info!("zwg-agent-hook shim written to {:?}", hook_path);
+
+        // --- claude / claude-code ---
+        for name in ["claude", "claude-code"] {
+            let wrapper = dir.join(name);
+            let wrapper_content = r#"#!/bin/sh
+if [ -n "$ZWG_TMUX_VALUE" ]; then
+  export TMUX="$ZWG_TMUX_VALUE"
+fi
+target="$(command -v "$0" 2>/dev/null || true)"
+found=""
+for p in $(which -a "$(basename "$0")" 2>/dev/null); do
+  if [ "$p" != "$target" ]; then
+    found="$p"
+    break
+  fi
+done
+if [ -z "$found" ]; then
+  echo "zwg: failed to find real $(basename "$0") executable in PATH." >&2
+  exit 1
+fi
+exec "$found" "$@"
+"#;
+            std::fs::write(&wrapper, &wrapper_content)?;
+            std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755))?;
+            log::info!("{} shim written to {:?}", name, wrapper);
+        }
+    }
+
+    Ok(dir)
+}
+
+/// Generate the environment variables that should be set in every PTY spawned by ZWG.
+/// This enables Claude Code to detect ZWG as a tmux-compatible multiplexer.
+pub fn zwg_env_vars() -> Vec<(String, String)> {
+    let conn = crate::ipc::IpcServer::connection_string();
+    let pid = std::process::id();
+    let tmux_value = format!("{},{},0", conn, pid);
+
+    let shim = shim_dir();
+    let current_path = std::env::var("PATH").unwrap_or_default();
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    let new_path = format!("{}{}{}", shim.display(), separator, current_path);
+
+    #[cfg(windows)]
+    let hook_cmd_path = shim.join("zwg-agent-hook.cmd");
+    #[cfg(not(windows))]
+    let hook_cmd_path = shim.join("zwg-agent-hook");
+    let hook_cmd = hook_cmd_path.to_string_lossy().to_string();
+
+    vec![
+        ("ZWG".to_string(), "1".to_string()),
+        ("ZWG_TMUX_VALUE".to_string(), tmux_value.clone()),
+        ("TMUX".to_string(), tmux_value),
+        ("PATH".to_string(), new_path),
+        ("ZWG_AGENT_HOOK".to_string(), hook_cmd.clone()),
+        ("CLAUDE_CODE_HOOK_CMD".to_string(), hook_cmd),
+    ]
 }
 
 #[cfg(test)]

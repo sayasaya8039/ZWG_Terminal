@@ -1210,6 +1210,33 @@ impl TerminalPane {
         self.pending_process_exit_status = None;
     }
 
+    // ── IPC helpers ────────────────────────────────────────────────
+
+    /// Write raw bytes to the PTY (used by send-keys IPC command)
+    pub fn write_to_pty(&self, data: &[u8]) -> anyhow::Result<()> {
+        self.surface
+            .write_input(data)
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("PTY write failed: {}", e))
+    }
+
+    /// Capture the current visible screen content as a string
+    pub fn capture_screen(&self) -> String {
+        let backend = self.surface.backend.lock();
+        let rows = backend.rows;
+        let mut content = String::new();
+        for row in 0..rows {
+            content.push_str(&backend.row_text(row));
+            content.push('\n');
+        }
+        content
+    }
+
+    /// Get current terminal dimensions (cols, rows)
+    pub fn terminal_size(&self) -> (u16, u16) {
+        (self.term_cols, self.term_rows)
+    }
+
     pub fn update_settings(&mut self, settings: &TerminalSettings, cx: &mut Context<Self>) {
         let next_font_family = SharedString::from(settings.font_family.clone());
         let font_changed = self.font_family != next_font_family

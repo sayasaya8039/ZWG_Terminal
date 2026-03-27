@@ -16,8 +16,10 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 mod ai;
 mod app;
+pub mod cli;
 mod clipboard_monitor;
 mod config;
+pub mod ipc;
 mod shell;
 mod snippet_palette;
 mod split;
@@ -326,6 +328,13 @@ fn main() {
         log::info!("ZWG_IME_TRACE=1 enabled");
     }
 
+    // CLI dispatch: if invoked with tmux subcommands, run as IPC client and exit
+    let cli_command = cli::parse_args();
+    if !matches!(cli_command, cli::CliCommand::Gui) {
+        cli::run_client(cli_command);
+        // run_client calls process::exit() — unreachable
+    }
+
     log::info!("ZWG Terminal v{} starting", env!("CARGO_PKG_VERSION"));
     let wasm_runtime = wasm_runtime::initialize().expect("embedded WASM runtime init failed");
     log::info!(
@@ -379,6 +388,8 @@ fn main() {
             root.update(cx, |view, cx| {
                 view.attach_clipboard_monitor(window, cx);
                 view.focus_active_terminal(window, cx);
+                // Start IPC server for tmux compatibility layer
+                view.start_ipc_server(cx);
             });
             root
         })

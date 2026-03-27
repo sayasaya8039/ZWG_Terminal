@@ -1,10 +1,20 @@
 //! Split pane tree — manages horizontal/vertical terminal splits
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use gpui::*;
 use smallvec::SmallVec;
 use uuid::Uuid;
 
 use crate::terminal::{TerminalPane, TerminalSettings};
+
+/// Monotonic pane ID counter for tmux-compatible pane addressing
+static NEXT_PANE_ID: AtomicU32 = AtomicU32::new(0);
+
+/// Allocate the next unique pane ID
+pub fn next_pane_id() -> u32 {
+    NEXT_PANE_ID.fetch_add(1, Ordering::Relaxed)
+}
 
 const PANE_BORDER_NEUTRAL: u32 = 0x3C3C3E;
 
@@ -19,6 +29,7 @@ pub enum SplitDirection {
 enum SplitNode {
     Leaf {
         id: Uuid,
+        pane_id: u32,
         terminal: Entity<TerminalPane>,
     },
     Branch {
@@ -50,9 +61,10 @@ struct ResizeDragState {
 impl SplitContainer {
     pub fn new(shell: &str, terminal_settings: TerminalSettings, cx: &mut Context<Self>) -> Self {
         let id = Uuid::new_v4();
+        let pane_id = next_pane_id();
         let terminal = cx.new(|cx| TerminalPane::new(shell, terminal_settings.clone(), cx));
         Self {
-            root: SplitNode::Leaf { id, terminal },
+            root: SplitNode::Leaf { id, pane_id, terminal },
             focused_id: id,
             shell: shell.to_string(),
             terminal_settings,
@@ -65,6 +77,7 @@ impl SplitContainer {
         let target_id = self.focused_id;
         let shell = self.shell.clone();
         let new_id = Uuid::new_v4();
+        let new_pane_id = next_pane_id();
         let terminal_settings = self.terminal_settings.clone();
         let new_terminal = cx.new(|cx| TerminalPane::new(&shell, terminal_settings, cx));
 
@@ -73,12 +86,14 @@ impl SplitContainer {
                 &mut self.root,
                 SplitNode::Leaf {
                     id: Uuid::nil(),
+                    pane_id: u32::MAX,
                     terminal: new_terminal.clone(),
                 },
             ),
             target_id,
             direction,
             new_id,
+            new_pane_id,
             new_terminal,
         );
 
@@ -86,20 +101,38 @@ impl SplitContainer {
         cx.notify();
     }
 
+    /// Get the pane_id of the most recently focused pane
+    pub fn focused_pane_id(&self) -> Option<u32> {
+        Self::find_pane_id_by_uuid(&self.root, self.focused_id)
+    }
+
+    fn find_pane_id_by_uuid(node: &SplitNode, target_uuid: Uuid) -> Option<u32> {
+        match node {
+            SplitNode::Leaf { id, pane_id, .. } if *id == target_uuid => Some(*pane_id),
+            SplitNode::Leaf { .. } => None,
+            SplitNode::Branch { first, second, .. } => {
+                Self::find_pane_id_by_uuid(first, target_uuid)
+                    .or_else(|| Self::find_pane_id_by_uuid(second, target_uuid))
+            }
+        }
+    }
+
     fn split_node(
         node: SplitNode,
         target_id: Uuid,
         direction: SplitDirection,
         new_id: Uuid,
+        new_pane_id: u32,
         new_terminal: Entity<TerminalPane>,
     ) -> SplitNode {
         match node {
-            SplitNode::Leaf { id, terminal } if id == target_id => SplitNode::Branch {
+            SplitNode::Leaf { id, pane_id, terminal } if id == target_id => SplitNode::Branch {
                 direction,
                 ratio: 0.5,
-                first: Box::new(SplitNode::Leaf { id, terminal }),
+                first: Box::new(SplitNode::Leaf { id, pane_id, terminal }),
                 second: Box::new(SplitNode::Leaf {
                     id: new_id,
+                    pane_id: new_pane_id,
                     terminal: new_terminal,
                 }),
             },
@@ -116,6 +149,7 @@ impl SplitContainer {
                     target_id,
                     direction,
                     new_id,
+                    new_pane_id,
                     new_terminal.clone(),
                 )),
                 second: Box::new(Self::split_node(
@@ -123,6 +157,7 @@ impl SplitContainer {
                     target_id,
                     direction,
                     new_id,
+                    new_pane_id,
                     new_terminal,
                 )),
             },
@@ -159,6 +194,7 @@ impl SplitContainer {
                 &mut self.root,
                 SplitNode::Leaf {
                     id: Uuid::nil(),
+                    pane_id: u32::MAX,
                     terminal: dummy_terminal,
                 },
             ),
@@ -240,7 +276,7 @@ impl SplitContainer {
         }
     }
 
-    /// Get all terminal entities in order
+    /// Get all terminal entities in order (uuid, terminal)
     pub fn all_terminals(&self) -> Vec<(Uuid, Entity<TerminalPane>)> {
         let mut result = Vec::new();
         Self::collect_terminals(&self.root, &mut result);
@@ -253,7 +289,7 @@ impl SplitContainer {
 
     fn collect_terminals(node: &SplitNode, out: &mut Vec<(Uuid, Entity<TerminalPane>)>) {
         match node {
-            SplitNode::Leaf { id, terminal } => out.push((*id, terminal.clone())),
+            SplitNode::Leaf { id, terminal, .. } => out.push((*id, terminal.clone())),
             SplitNode::Branch { first, second, .. } => {
                 Self::collect_terminals(first, out);
                 Self::collect_terminals(second, out);
@@ -263,10 +299,110 @@ impl SplitContainer {
 
     fn find_terminal(node: &SplitNode, target_id: Uuid) -> Option<Entity<TerminalPane>> {
         match node {
-            SplitNode::Leaf { id, terminal } if *id == target_id => Some(terminal.clone()),
+            SplitNode::Leaf { id, terminal, .. } if *id == target_id => Some(terminal.clone()),
             SplitNode::Leaf { .. } => None,
             SplitNode::Branch { first, second, .. } => Self::find_terminal(first, target_id)
                 .or_else(|| Self::find_terminal(second, target_id)),
+        }
+    }
+
+    // ── IPC pane operations ─────────────────────────────────────────
+
+    /// List all panes with (pane_id, uuid, terminal_entity)
+    pub fn list_panes(&self) -> Vec<(u32, Uuid, Entity<TerminalPane>)> {
+        let mut result = Vec::new();
+        Self::collect_panes(&self.root, &mut result);
+        result
+    }
+
+    fn collect_panes(node: &SplitNode, out: &mut Vec<(u32, Uuid, Entity<TerminalPane>)>) {
+        match node {
+            SplitNode::Leaf { id, pane_id, terminal } => {
+                out.push((*pane_id, *id, terminal.clone()));
+            }
+            SplitNode::Branch { first, second, .. } => {
+                Self::collect_panes(first, out);
+                Self::collect_panes(second, out);
+            }
+        }
+    }
+
+    /// Find a terminal by its numeric pane ID
+    pub fn find_pane_by_id(&self, target_pane_id: u32) -> Option<Entity<TerminalPane>> {
+        Self::find_pane_by_numeric_id(&self.root, target_pane_id)
+    }
+
+    fn find_pane_by_numeric_id(node: &SplitNode, target: u32) -> Option<Entity<TerminalPane>> {
+        match node {
+            SplitNode::Leaf { pane_id, terminal, .. } if *pane_id == target => {
+                Some(terminal.clone())
+            }
+            SplitNode::Leaf { .. } => None,
+            SplitNode::Branch { first, second, .. } => {
+                Self::find_pane_by_numeric_id(first, target)
+                    .or_else(|| Self::find_pane_by_numeric_id(second, target))
+            }
+        }
+    }
+
+    /// Focus a pane by its numeric pane ID. Returns true if found.
+    pub fn focus_pane_by_id(&mut self, target_pane_id: u32, cx: &mut Context<Self>) -> bool {
+        if let Some(uuid) = Self::find_uuid_by_pane_id(&self.root, target_pane_id) {
+            self.focused_id = uuid;
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn find_uuid_by_pane_id(node: &SplitNode, target: u32) -> Option<Uuid> {
+        match node {
+            SplitNode::Leaf { id, pane_id, .. } if *pane_id == target => Some(*id),
+            SplitNode::Leaf { .. } => None,
+            SplitNode::Branch { first, second, .. } => {
+                Self::find_uuid_by_pane_id(first, target)
+                    .or_else(|| Self::find_uuid_by_pane_id(second, target))
+            }
+        }
+    }
+
+    /// Kill (remove) a pane by its numeric ID. Returns true if removed.
+    pub fn kill_pane_by_id(&mut self, target_pane_id: u32, cx: &mut Context<Self>) -> bool {
+        // Find the UUID for this pane_id
+        let Some(target_uuid) = Self::find_uuid_by_pane_id(&self.root, target_pane_id) else {
+            return false;
+        };
+
+        // Cannot kill the last pane
+        if let SplitNode::Leaf { id, .. } = &self.root {
+            if *id == target_uuid {
+                return false;
+            }
+        }
+
+        let dummy_terminal = self.first_terminal();
+        let (new_root, sibling_id) = Self::remove_node(
+            std::mem::replace(
+                &mut self.root,
+                SplitNode::Leaf {
+                    id: Uuid::nil(),
+                    pane_id: u32::MAX,
+                    terminal: dummy_terminal,
+                },
+            ),
+            target_uuid,
+        );
+
+        if let Some(root) = new_root {
+            self.root = root;
+            if let Some(sid) = sibling_id {
+                self.focused_id = sid;
+            }
+            cx.notify();
+            true
+        } else {
+            false
         }
     }
 
@@ -465,7 +601,7 @@ impl SplitContainer {
         branch_path: &BranchPath,
     ) -> Div {
         match node {
-            SplitNode::Leaf { id, terminal } => {
+            SplitNode::Leaf { id, terminal, .. } => {
                 let is_focused = *id == focused_id;
                 let (border_width, border_rgb) = leaf_border_style(is_focused);
                 let mut el = div().size_full().child(terminal.clone());

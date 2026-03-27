@@ -37,6 +37,8 @@ use crate::config::{
 };
 use crate::shell::{self, ShellType};
 use crate::snippet_palette::{SnippetPaletteModel, SnippetSection};
+use crate::ipc;
+use crate::ipc::bridge::{GpuiCommand, GpuiResponse, PaneInfo};
 use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::template_editor::{TemplateEditorModal, TemplateEditorOutcome};
 use crate::terminal::TerminalSettings;
@@ -962,6 +964,193 @@ impl RootView {
             }
         })
         .detach();
+    }
+
+    /// Start the IPC server and begin polling for GPUI commands
+    pub fn start_ipc_server(&self, cx: &mut Context<Self>) {
+        let ipc_server = ipc::IpcServer::new();
+        ipc::register_default_handlers(&ipc_server);
+        let (cmd_tx, cmd_rx) = ipc::bridge::create_channel();
+        ipc::bridge::register_handlers(&ipc_server, cmd_tx);
+        if let Err(e) = ipc_server.start() {
+            log::error!("Failed to start IPC server: {}", e);
+            return;
+        }
+        // Create tmux shims for Claude Code teammate-mode
+        if let Err(e) = crate::terminal::pty::create_tmux_shims() {
+            log::warn!("Failed to create tmux shims: {}", e);
+        }
+        log::info!("IPC server started for tmux compatibility");
+
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_, cx: &mut AsyncApp| {
+            while let Ok(cmd) = cmd_rx.recv_async().await {
+                let _ = this.update(cx, |root_view: &mut RootView, cx| {
+                    root_view.handle_gpui_command(cmd, cx);
+                });
+            }
+        })
+        .detach();
+    }
+
+    /// Dispatch a GPUI command from the IPC bridge
+    fn handle_gpui_command(&mut self, cmd: GpuiCommand, cx: &mut Context<Self>) {
+        match cmd {
+            GpuiCommand::SplitWindow {
+                horizontal,
+                resp_tx,
+                ..
+            } => {
+                let direction = if horizontal {
+                    SplitDirection::Horizontal
+                } else {
+                    SplitDirection::Vertical
+                };
+                let split = {
+                    let state = self.state.read(cx);
+                    let Some(s) = state.active_split().cloned() else {
+                        let _ = resp_tx.send(GpuiResponse::Error("no active tab".into()));
+                        return;
+                    };
+                    s
+                };
+                split.update(cx, |sc, cx| {
+                    sc.split(direction, cx);
+                    let pane_id = sc.focused_pane_id().unwrap_or(0);
+                    let _ = resp_tx.send(GpuiResponse::SplitOk { pane_id });
+                });
+            }
+
+            GpuiCommand::SendKeys {
+                pane_id,
+                data,
+                resp_tx,
+            } => {
+                let terminal = self.find_pane_terminal(pane_id, cx);
+                match terminal {
+                    Some(term) => {
+                        let result = term.read(cx).write_to_pty(&data);
+                        match result {
+                            Ok(()) => {
+                                let _ = resp_tx.send(GpuiResponse::SendKeysOk);
+                            }
+                            Err(e) => {
+                                let _ = resp_tx.send(GpuiResponse::Error(e.to_string()));
+                            }
+                        }
+                    }
+                    None => {
+                        let _ = resp_tx.send(GpuiResponse::Error(
+                            format!("pane %{} not found", pane_id),
+                        ));
+                    }
+                }
+            }
+
+            GpuiCommand::ListPanes { resp_tx } => {
+                let split = {
+                    let state = self.state.read(cx);
+                    let Some(s) = state.active_split().cloned() else {
+                        let _ = resp_tx.send(GpuiResponse::PaneList(Vec::new()));
+                        return;
+                    };
+                    s
+                };
+                let focused_pane_id = split.read(cx).focused_pane_id();
+                let panes = split.read(cx).list_panes();
+
+                let pane_infos: Vec<PaneInfo> = panes
+                    .iter()
+                    .map(|(pid, _uuid, term)| {
+                        let (cols, rows) = term.read(cx).terminal_size();
+                        PaneInfo {
+                            pane_id: *pid,
+                            width: cols,
+                            height: rows,
+                            active: Some(*pid) == focused_pane_id,
+                        }
+                    })
+                    .collect();
+                let _ = resp_tx.send(GpuiResponse::PaneList(pane_infos));
+            }
+
+            GpuiCommand::SelectPane { pane_id, resp_tx } => {
+                let split = {
+                    let state = self.state.read(cx);
+                    let Some(s) = state.active_split().cloned() else {
+                        let _ = resp_tx.send(GpuiResponse::Error("no active tab".into()));
+                        return;
+                    };
+                    s
+                };
+                split.update(cx, |sc, cx| {
+                    if sc.focus_pane_by_id(pane_id, cx) {
+                        let _ = resp_tx.send(GpuiResponse::SelectPaneOk);
+                    } else {
+                        let _ = resp_tx.send(GpuiResponse::Error(
+                            format!("pane %{} not found", pane_id),
+                        ));
+                    }
+                });
+            }
+
+            GpuiCommand::KillPane { pane_id, resp_tx } => {
+                let split = {
+                    let state = self.state.read(cx);
+                    let Some(s) = state.active_split().cloned() else {
+                        let _ = resp_tx.send(GpuiResponse::Error("no active tab".into()));
+                        return;
+                    };
+                    s
+                };
+                split.update(cx, |sc, cx| {
+                    if sc.kill_pane_by_id(pane_id, cx) {
+                        let _ = resp_tx.send(GpuiResponse::KillPaneOk);
+                    } else {
+                        let _ = resp_tx.send(GpuiResponse::Error(
+                            format!("pane %{} not found or last pane", pane_id),
+                        ));
+                    }
+                });
+            }
+
+            GpuiCommand::CapturePane { pane_id, resp_tx } => {
+                let terminal = self.find_pane_terminal(pane_id, cx);
+                match terminal {
+                    Some(term) => {
+                        let content = term.read(cx).capture_screen();
+                        let _ = resp_tx.send(GpuiResponse::PaneContent(content));
+                    }
+                    None => {
+                        let _ = resp_tx.send(GpuiResponse::Error(
+                            format!("pane %{} not found", pane_id),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Find a terminal entity by pane_id across all tabs
+    fn find_pane_terminal(
+        &self,
+        pane_id: u32,
+        cx: &Context<Self>,
+    ) -> Option<gpui::Entity<crate::terminal::view::TerminalPane>> {
+        let state = self.state.read(cx);
+        // Search active tab first
+        if let Some(split) = state.active_split() {
+            if let Some(term) = split.read(cx).find_pane_by_id(pane_id) {
+                return Some(term);
+            }
+        }
+        // Search all tabs
+        for tab in &state.tabs {
+            if let Some(term) = tab.split.read(cx).find_pane_by_id(pane_id) {
+                return Some(term);
+            }
+        }
+        None
     }
 
     fn compute_root_ime_target(&self) -> Option<RootImeTarget> {
