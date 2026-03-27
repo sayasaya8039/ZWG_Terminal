@@ -332,6 +332,7 @@ impl AppConfig {
         }
     }
 
+    #[cfg(test)]
     /// Available theme names
     pub fn available_themes() -> Vec<&'static str> {
         vec!["Catppuccin Mocha", "Catppuccin Latte", "Tokyo Night"]

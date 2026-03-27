@@ -30,6 +30,7 @@ pub struct WasmRuntimeStatus {
 }
 
 impl WasmRuntimeStatus {
+    #[cfg(test)]
     pub fn has_capability(&self, capability: i32) -> bool {
         self.capabilities & capability == capability
     }

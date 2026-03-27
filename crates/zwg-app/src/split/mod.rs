@@ -292,10 +292,6 @@ impl SplitContainer {
         cx.notify();
     }
 
-    pub fn focused_id(&self) -> Uuid {
-        self.focused_id
-    }
-
     pub fn update_terminal_settings(
         &mut self,
         terminal_settings: TerminalSettings,
