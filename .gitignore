@@ -26,3 +26,4 @@ crates/ghostty-vt/examples/
 tmp_*.png
 
 # vendor/ghostty is a git submodule, do not ignore
+pix-captures/
