@@ -1461,12 +1461,34 @@ pub const GpuRenderer = struct {
         var upload_offset: u64 = 0;
         var row_index: u32 = 0;
         while (row_index < self.atlas_rows) : (row_index += 1) {
+            // Fast dirty-span scan using @ctz on atlas_dirty_words.
+            // Skips entire 64-slot words that are clean, then extracts
+            // contiguous dirty runs within each word.
+            const row_base = row_index * self.atlas_cols;
             var slot_index: u32 = 0;
             while (slot_index < self.atlas_cols) {
-                while (slot_index < self.atlas_cols and !self.hasAtlasDirtySlot(row_index * self.atlas_cols + slot_index)) : (slot_index += 1) {}
+                const global_slot = row_base + slot_index;
+                const word_idx = global_slot >> 6;
+                const bit_idx: u6 = @intCast(global_slot & 63);
+                if (word_idx >= self.atlas_dirty_words.len) break;
+                // Mask off already-scanned bits in this word
+                const word = self.atlas_dirty_words[word_idx] >> bit_idx;
+                if (word == 0) {
+                    // Skip remaining bits in this word
+                    slot_index += 64 - @as(u32, bit_idx);
+                    continue;
+                }
+                // Find first dirty bit
+                const first_dirty: u32 = @intCast(@ctz(word));
+                slot_index += first_dirty;
                 if (slot_index >= self.atlas_cols) break;
                 const span_start = slot_index;
-                while (slot_index < self.atlas_cols and self.hasAtlasDirtySlot(row_index * self.atlas_cols + slot_index)) : (slot_index += 1) {}
+                // Find first clean bit after the dirty run
+                const shift_amt: u6 = @intCast(@min(first_dirty, 63));
+                const inverted = ~(word >> shift_amt);
+                const run_len: u32 = if (inverted == 0) 64 - first_dirty - @as(u32, bit_idx) else @intCast(@ctz(inverted));
+                slot_index += run_len;
+                if (slot_index > self.atlas_cols) slot_index = self.atlas_cols;
                 const span_end = slot_index;
                 const region_x = span_start * slot_pitch_w;
                 const region_y = row_index * slot_pitch_h;
@@ -1640,18 +1662,49 @@ pub const GpuRenderer = struct {
             var last_glyph_idx: u32 = 0;
             var last_valid = false;
 
-            var i: u32 = 0;
-            while (i < instance_count) : (i += 1) {
-                const cell_index = start_instance + i;
-                const c = cells[cell_index];
+            // Process cells in batches of 4 with prefetch for better cache usage.
+            // The glyph lookup itself is hash-map based and cannot be vectorized,
+            // but prefetching the next batch of cells while processing the current
+            // one hides memory latency (cell data + GPU mapped memory are on
+            // separate cache lines).
+            const end = start_instance + instance_count;
+            var i: u32 = start_instance;
+            const batch_end = if (instance_count >= 4) end - 3 else start_instance;
+            while (i < batch_end) : (i += 4) {
+                // Prefetch the next batch of source cells
+                if (i + 8 < end) {
+                    @prefetch(cells + (i + 4), .{ .rw = .read, .locality = 1 });
+                    @prefetch(cells + (i + 6), .{ .rw = .read, .locality = 1 });
+                }
+
+                inline for (0..4) |offset| {
+                    const ci = i + offset;
+                    const c = cells[ci];
+                    const glyph_idx = self.resolveGlyphIndexCached(
+                        c.codepoint,
+                        &last_codepoint,
+                        &last_glyph_idx,
+                        &last_valid,
+                    );
+                    gpu_cells[ci] = .{
+                        .glyph_idx = glyph_idx,
+                        .codepoint = c.codepoint,
+                        .fg_rgba = c.fg_rgba,
+                        .bg_rgba = c.bg_rgba,
+                        .attrs = c.flags,
+                    };
+                }
+            }
+            // Remainder
+            while (i < end) : (i += 1) {
+                const c = cells[i];
                 const glyph_idx = self.resolveGlyphIndexCached(
                     c.codepoint,
                     &last_codepoint,
                     &last_glyph_idx,
                     &last_valid,
                 );
-
-                gpu_cells[cell_index] = .{
+                gpu_cells[i] = .{
                     .glyph_idx = glyph_idx,
                     .codepoint = c.codepoint,
                     .fg_rgba = c.fg_rgba,

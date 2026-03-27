@@ -13,8 +13,16 @@ const std = @import("std");
 /// 4MB ring buffer capacity (power of 2 for bitmask modulo)
 pub const RING_CAPACITY: usize = 4 * 1024 * 1024;
 const RING_MASK: usize = RING_CAPACITY - 1;
-const OUTPUT_COALESCE_NS: u64 = 2 * std.time.ns_per_ms;
-const DRAIN_BUFFER_CAPACITY: usize = 256 * 1024;
+/// Coalesce window: start conservatively at 2ms, but the parser loop
+/// adaptively shortens to 1ms when sustained output is detected (e.g.
+/// Claude Code /fast mode).  Reverts to 2ms after an idle period.
+const OUTPUT_COALESCE_NS_NORMAL: u64 = 2 * std.time.ns_per_ms;
+const OUTPUT_COALESCE_NS_FAST: u64 = 1 * std.time.ns_per_ms;
+/// Consecutive busy cycles before switching to fast coalesce mode.
+const FAST_MODE_THRESHOLD: u32 = 8;
+/// Idle cycles before reverting to normal coalesce mode.
+const FAST_MODE_REVERT_IDLE: u32 = 200;
+const DRAIN_BUFFER_CAPACITY: usize = 512 * 1024;
 
 /// Single-Producer Single-Consumer lock-free ring buffer.
 ///
@@ -160,16 +168,25 @@ pub const AsyncFeeder = struct {
     }
 
     fn parserLoop(self: *AsyncFeeder) void {
-        // 256KB drain buffer to coalesce short PTY bursts into a single feed.
+        // 512KB drain buffer to coalesce PTY bursts into a single feed.
         var drain_buf: [DRAIN_BUFFER_CAPACITY]u8 = undefined;
         var idle_count: u32 = 0;
+        var busy_count: u32 = 0;
 
         while (!@atomicLoad(bool, &self.stop_flag, .acquire)) {
             const n = self.ring.pop(&drain_buf);
             if (n > 0) {
                 idle_count = 0;
+                busy_count +|= 1;
+
+                // Adaptive coalesce: shorten window under sustained output
+                const coalesce_ns = if (busy_count >= FAST_MODE_THRESHOLD)
+                    OUTPUT_COALESCE_NS_FAST
+                else
+                    OUTPUT_COALESCE_NS_NORMAL;
+
                 var total = n;
-                std.Thread.sleep(OUTPUT_COALESCE_NS);
+                std.Thread.sleep(coalesce_ns);
                 while (total < drain_buf.len) {
                     const drained = self.ring.pop(drain_buf[total..]);
                     if (drained == 0) break;
@@ -182,6 +199,9 @@ pub const AsyncFeeder = struct {
             } else {
                 // Adaptive sleep — minimize latency for bursts, save CPU when idle
                 idle_count +|= 1;
+                if (idle_count >= FAST_MODE_REVERT_IDLE) {
+                    busy_count = 0;
+                }
                 if (idle_count < 100) {
                     std.atomic.spinLoopHint();
                 } else if (idle_count < 1000) {

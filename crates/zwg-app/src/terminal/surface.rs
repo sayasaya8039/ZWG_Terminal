@@ -358,7 +358,7 @@ impl TerminalSurface {
         let handle = std::thread::Builder::new()
             .name("zwg-pty-reader".into())
             .spawn(move || {
-                let mut buf = [0u8; 131_072];
+                let mut buf = [0u8; 262_144]; // 256KB for high-throughput CLI output
                 let mut win32_input_tracker = Win32InputModeTracker::default();
                 loop {
                     if stop_flag.load(Ordering::Relaxed) {

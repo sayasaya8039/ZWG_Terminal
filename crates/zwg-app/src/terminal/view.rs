@@ -31,14 +31,22 @@ use super::win32_input::encode_win32_input_text;
 use parking_lot::Mutex;
 
 const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
-const MAX_FRAME_COALESCE_MICROS: u64 = 1_667;
-const ASYNC_PARSE_SETTLE_MILLIS: u64 = 2;
-const ASYNC_PARSE_RETRY_LIMIT: usize = 4;
-/// After detecting a change, sweep up to this many additional times while the
-/// async parser still reports pending data.  PSReadLine typically emits 3-5
-/// chunks per keystroke (echo + highlight + prediction + cursor restore), so
-/// 6 extra sweeps with a 2 ms gap covers the full burst within ~12 ms.
-const ASYNC_PARSE_POST_CHANGE_SWEEPS: usize = 6;
+// --- Adaptive frame pacing ---------------------------------------------------
+// Two modes: NORMAL (interactive / PSReadLine) and FAST (sustained output like
+// Claude Code /fast).  The event loop switches automatically based on how many
+// consecutive frames contained changes.
+const FRAME_COALESCE_NORMAL_MICROS: u64 = 1_667; // ~600 Hz
+const FRAME_COALESCE_FAST_MICROS: u64 = 5_000; // ~200 Hz (batches more per frame)
+const SETTLE_NORMAL_MILLIS: u64 = 2;
+const SETTLE_FAST_MILLIS: u64 = 1;
+const RETRY_LIMIT_NORMAL: usize = 4;
+const RETRY_LIMIT_FAST: usize = 2;
+const SWEEPS_NORMAL: usize = 6;
+const SWEEPS_FAST: usize = 10;
+/// Consecutive changed-frames before entering fast pacing mode.
+const FAST_PACING_ENTER: u32 = 4;
+/// Consecutive idle frames before reverting to normal pacing mode.
+const FAST_PACING_EXIT: u32 = 8;
 const CROSS_ROUTE_DUPLICATE_WINDOW_MS: u64 = 250;
 const SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS: u64 = 30;
 /// Fallback values — replaced at runtime by measured font metrics
@@ -862,8 +870,10 @@ impl TerminalPane {
         // while still allowing high refresh-rate panels to update promptly.
         cx.spawn(
             async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
-                let frame_budget = std::time::Duration::from_micros(MAX_FRAME_COALESCE_MICROS);
                 let mut last_presented: Option<std::time::Instant> = None;
+                // Adaptive pacing state
+                let mut consecutive_busy: u32 = 0;
+                let mut consecutive_idle: u32 = 0;
 
                 loop {
                     let Ok(event) = event_rx.recv_async().await else {
@@ -879,6 +889,29 @@ impl TerminalPane {
                             process_exit_status = Some(code);
                         }
                     }
+
+                    // --- Select pacing parameters based on current mode ------
+                    let fast_mode = consecutive_busy >= FAST_PACING_ENTER;
+                    let frame_budget = Duration::from_micros(if fast_mode {
+                        FRAME_COALESCE_FAST_MICROS
+                    } else {
+                        FRAME_COALESCE_NORMAL_MICROS
+                    });
+                    let settle_ms = if fast_mode {
+                        SETTLE_FAST_MILLIS
+                    } else {
+                        SETTLE_NORMAL_MILLIS
+                    };
+                    let retry_limit = if fast_mode {
+                        RETRY_LIMIT_FAST
+                    } else {
+                        RETRY_LIMIT_NORMAL
+                    };
+                    let sweep_limit = if fast_mode {
+                        SWEEPS_FAST
+                    } else {
+                        SWEEPS_NORMAL
+                    };
 
                     if let Some(last_presented_at) = last_presented {
                         let elapsed = last_presented_at.elapsed();
@@ -901,10 +934,8 @@ impl TerminalPane {
                     let mut settled = false;
 
                     // Phase 1: Poll until the first change is detected (or we
-                    // exhaust the retry budget).  This handles the common case
-                    // where the PTY event fires slightly before the async Zig
-                    // parser finishes processing the chunk.
-                    for attempt in 0..ASYNC_PARSE_RETRY_LIMIT {
+                    // exhaust the retry budget).
+                    for attempt in 0..retry_limit {
                         let changed = match this.update(cx, |pane: &mut TerminalPane, _cx| {
                             pane.refresh_snapshot(false)
                         }) {
@@ -916,7 +947,7 @@ impl TerminalPane {
                         };
                         should_notify |= changed;
 
-                        if attempt + 1 == ASYNC_PARSE_RETRY_LIMIT {
+                        if attempt + 1 == retry_limit {
                             settled = true;
                             break;
                         }
@@ -926,19 +957,17 @@ impl TerminalPane {
                         }
 
                         cx.background_executor()
-                            .timer(std::time::Duration::from_millis(ASYNC_PARSE_SETTLE_MILLIS))
+                            .timer(Duration::from_millis(settle_ms))
                             .await;
                     }
 
                     // Phase 2: After the first change, do additional sweeps to
-                    // capture the full PSReadLine VT burst (echo + syntax
-                    // highlight + prediction text + cursor restore).  We keep
-                    // sweeping while has_pending_data() reports true, with a
-                    // hard cap to avoid unbounded loops during sustained output.
+                    // capture the full VT burst.  In fast mode we do more sweeps
+                    // with shorter gaps to drain sustained output quickly.
                     if should_notify && !settled {
-                        for _sweep in 0..ASYNC_PARSE_POST_CHANGE_SWEEPS {
+                        for _sweep in 0..sweep_limit {
                             cx.background_executor()
-                                .timer(std::time::Duration::from_millis(ASYNC_PARSE_SETTLE_MILLIS))
+                                .timer(Duration::from_millis(settle_ms))
                                 .await;
 
                             let sweep_changed = this
@@ -948,8 +977,6 @@ impl TerminalPane {
                                 .unwrap_or(false);
                             should_notify |= sweep_changed;
 
-                            // Check if the async parser still has data in its
-                            // ring buffer.  If not, one final sweep was enough.
                             let still_pending = this
                                 .update(cx, |pane: &mut TerminalPane, _cx| {
                                     pane.surface.has_pending_data()
@@ -970,6 +997,17 @@ impl TerminalPane {
                         break;
                     }
 
+                    // --- Update adaptive pacing counters ----------------------
+                    if should_notify {
+                        consecutive_busy = consecutive_busy.saturating_add(1);
+                        consecutive_idle = 0;
+                    } else {
+                        consecutive_idle = consecutive_idle.saturating_add(1);
+                        if consecutive_idle >= FAST_PACING_EXIT {
+                            consecutive_busy = 0;
+                        }
+                    }
+
                     if settled && !should_notify {
                         continue;
                     }
@@ -984,7 +1022,7 @@ impl TerminalPane {
                         break;
                     }
                     if should_notify {
-                        last_presented = Some(std::time::Instant::now());
+                        last_presented = Some(Instant::now());
                     }
                 }
             },

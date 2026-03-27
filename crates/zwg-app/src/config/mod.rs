@@ -205,8 +205,16 @@ pub struct AppConfig {
     pub ai_api_key: String,
     pub ai_model: String,
     pub gpu_acceleration: bool,
+    /// Frame pacing mode: "adaptive" (auto-detect sustained output),
+    /// or a fixed FPS limit (e.g. 60, 120, 300, 600).
+    #[serde(default = "default_renderer_fps")]
+    pub renderer_fps: String,
     pub default_window_cols: u16,
     pub default_window_rows: u16,
+}
+
+fn default_renderer_fps() -> String {
+    "adaptive".into()
 }
 
 impl Default for AppConfig {
@@ -235,6 +243,7 @@ impl Default for AppConfig {
             ai_api_key: String::new(),
             ai_model: String::new(),
             gpu_acceleration: false,
+            renderer_fps: default_renderer_fps(),
             default_window_cols: DEFAULT_WINDOW_COLS,
             default_window_rows: DEFAULT_WINDOW_ROWS,
         }
@@ -513,6 +522,7 @@ mod tests {
             ai_api_key: String::new(),
             ai_model: String::new(),
             gpu_acceleration: false,
+            renderer_fps: default_renderer_fps(),
             default_window_cols: DEFAULT_WINDOW_COLS,
             default_window_rows: DEFAULT_WINDOW_ROWS,
         }

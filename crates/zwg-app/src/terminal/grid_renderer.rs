@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use gpui::*;
 use parking_lot::Mutex;
+use smallvec::SmallVec;
 use unicode_width::UnicodeWidthChar;
 
 #[cfg(test)]
@@ -296,16 +297,17 @@ pub(crate) fn glyph_key_from_cell(cell: &GridCell) -> GlyphKey {
 }
 
 pub(crate) fn glyph_instances_from_cells(cells: &[GridCell], row: u16) -> Vec<GlyphInstance> {
-    cells
-        .iter()
-        .map(|cell| GlyphInstance {
+    let mut instances = Vec::with_capacity(cells.len());
+    for cell in cells {
+        instances.push(GlyphInstance {
             row,
             col: cell.col,
             fg_rgb: cell.fg_rgb,
             bg_rgb: cell.bg_rgb,
             key: glyph_key_from_cell(cell),
-        })
-        .collect()
+        });
+    }
+    instances
 }
 
 #[cfg(feature = "ghostty_vt")]
@@ -357,8 +359,9 @@ struct StyleDamageSignature {
 fn column_damage_signatures(
     cells: &[GridCell],
     max_cols: u16,
-) -> Vec<Option<ColumnDamageSignature>> {
-    let mut columns = vec![None; max_cols as usize];
+) -> SmallVec<[Option<ColumnDamageSignature>; 256]> {
+    let mut columns: SmallVec<[Option<ColumnDamageSignature>; 256]> =
+        smallvec::smallvec![None; max_cols as usize];
     for cell in cells {
         let signature = ColumnDamageSignature {
             head_col: cell.col,
@@ -386,18 +389,18 @@ fn style_damage_signatures(
     term_cols: u16,
     default_fg: u32,
     default_bg: u32,
-) -> Vec<StyleDamageSignature> {
-    (0..term_cols)
-        .map(|col| {
-            let (fg_rgb, bg_rgb, flags) =
-                grid_cell_style_at(style_runs, col + 1, default_fg, default_bg);
-            StyleDamageSignature {
-                fg_rgb,
-                bg_rgb,
-                flags,
-            }
-        })
-        .collect()
+) -> SmallVec<[StyleDamageSignature; 256]> {
+    let mut sigs = SmallVec::with_capacity(term_cols as usize);
+    for col in 0..term_cols {
+        let (fg_rgb, bg_rgb, flags) =
+            grid_cell_style_at(style_runs, col + 1, default_fg, default_bg);
+        sigs.push(StyleDamageSignature {
+            fg_rgb,
+            bg_rgb,
+            flags,
+        });
+    }
+    sigs
 }
 
 #[cfg(feature = "ghostty_vt")]
@@ -440,7 +443,7 @@ pub(crate) fn damage_spans_from_cells(
 ) -> Vec<DamageSpan> {
     let previous_columns = column_damage_signatures(previous, term_cols);
     let next_columns = column_damage_signatures(next, term_cols);
-    let mut spans = Vec::new();
+    let mut spans = Vec::with_capacity((term_cols as usize / 8).max(4));
     let mut span_start = None;
 
     for col in 0..term_cols {
@@ -478,7 +481,7 @@ pub(crate) fn damage_spans_from_style_runs(
 ) -> Vec<DamageSpan> {
     let previous_columns = style_damage_signatures(previous, term_cols, default_fg, default_bg);
     let next_columns = style_damage_signatures(next, term_cols, default_fg, default_bg);
-    let mut spans = Vec::new();
+    let mut spans = Vec::with_capacity((term_cols as usize / 8).max(4));
     let mut span_start = None;
 
     for col in 0..term_cols {
@@ -540,16 +543,17 @@ pub(crate) fn patch_cells_in_damage(
         return previous.to_vec();
     }
 
-    let mut cells: Vec<GridCell> = previous
-        .iter()
-        .filter(|cell| !cell_overlaps_damage(cell, damage_spans))
-        .cloned()
-        .collect();
-    cells.extend(
-        next.iter()
-            .filter(|cell| cell_overlaps_damage(cell, damage_spans))
-            .cloned(),
-    );
+    let mut cells = Vec::with_capacity(previous.len().max(next.len()));
+    for cell in previous {
+        if !cell_overlaps_damage(cell, damage_spans) {
+            cells.push(cell.clone());
+        }
+    }
+    for cell in next {
+        if cell_overlaps_damage(cell, damage_spans) {
+            cells.push(cell.clone());
+        }
+    }
     cells.sort_unstable_by_key(|cell| cell.col);
     cells
 }
@@ -581,11 +585,12 @@ pub(crate) fn patch_glyph_instances_in_damage(
         return previous.to_vec();
     }
 
-    let mut instances: Vec<GlyphInstance> = previous
-        .iter()
-        .filter(|instance| !instance_overlaps_damage(instance, damage_spans))
-        .cloned()
-        .collect();
+    let mut instances = Vec::with_capacity(previous.len());
+    for inst in previous {
+        if !instance_overlaps_damage(inst, damage_spans) {
+            instances.push(inst.clone());
+        }
+    }
     instances.extend(glyph_instances_in_damage(next_cells, row, damage_spans));
     instances.sort_unstable_by_key(|instance| instance.col);
     instances
