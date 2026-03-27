@@ -1,6 +1,16 @@
-[build]
-rustc-wrapper = "C:/Users/Owner/scoop/shims/sccache.exe"
-rustflags = ["-C", "target-cpu=native", "-C", "link-args=/STACK:8388608"]
-
+# 共通: sparse index
 [registries.crates-io]
 protocol = "sparse"
+
+# ネイティブターゲット向け（Linux / macOS / Windows いずれでもホスト向けビルド時に適用）
+[build]
+rustflags = ["-C", "target-cpu=native"]
+
+# Windows MSVC 向けビルド時のみ（WSL からの cross や Windows 本機ビルド）
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-cpu=native", "-C", "link-args=/STACK:8388608"]
+
+# sccache 等の rustc-wrapper はマシン依存のためリポジトリに含めない。
+# Windows で使う場合はユーザー ~/.cargo/config.toml 例:
+#   [build]
+#   rustc-wrapper = "C:\\path\\to\\sccache.exe"

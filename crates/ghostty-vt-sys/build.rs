@@ -42,12 +42,6 @@ fn main() {
     eprintln!("  zig source dir: {:?}", zig_dir);
     eprintln!("  output prefix: {:?}", prefix);
 
-    // Zig 0.15.2 on Windows: global cache must be on the same drive as source
-    // AND close to the source directory to avoid deep relative path resolution
-    // failures (too many ../.. levels from cargo's deep OUT_DIR).
-    let zig_global_cache = zig_dir.join(".zig-global-cache");
-    std::fs::create_dir_all(&zig_global_cache).ok();
-
     let prefix_str = prefix.display().to_string();
     let mut args = vec![
         "build".to_string(),
@@ -63,10 +57,36 @@ fn main() {
         args.push("-Dtarget=x86_64-windows-msvc".to_string());
     }
 
-    let status = Command::new(&zig)
-        .args(&args)
-        .env("ZIG_GLOBAL_CACHE_DIR", &zig_global_cache)
-        .current_dir(&zig_dir)
+    let mut cmd = Command::new(&zig);
+    cmd.args(&args).current_dir(&zig_dir);
+
+    // Zig 0.15.2 on Windows: global cache must be on the same drive as source
+    // AND close to the source directory to avoid deep relative path resolution
+    // failures (too many ../.. levels from cargo's deep OUT_DIR).
+    //
+    // On Linux/macOS (incl. WSL + repo on /mnt/<drv>): keep Zig caches under $HOME
+    // so rename(2) into .zig-cache works (DrvFs / NTFS mounts often deny it).
+    #[cfg(windows)]
+    {
+        let zig_global_cache = zig_dir.join(".zig-global-cache");
+        std::fs::create_dir_all(&zig_global_cache).ok();
+        cmd.env("ZIG_GLOBAL_CACHE_DIR", &zig_global_cache);
+    }
+    #[cfg(not(windows))]
+    {
+        let base = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| zig_dir.clone());
+        let cache_root = base.join(".cache").join("zwg-terminal-zig");
+        let zig_global_cache = cache_root.join("global");
+        let zig_local_cache = cache_root.join("local");
+        std::fs::create_dir_all(&zig_global_cache).ok();
+        std::fs::create_dir_all(&zig_local_cache).ok();
+        cmd.env("ZIG_GLOBAL_CACHE_DIR", &zig_global_cache);
+        cmd.env("ZIG_LOCAL_CACHE_DIR", &zig_local_cache);
+    }
+
+    let status = cmd
         .status()
         .unwrap_or_else(|e| panic!("Failed to run zig build: {}", e));
 
