@@ -506,10 +506,14 @@ fn run_split_window(
     if let Some(d) = start_dir { args.push("-c".into()); args.push(d.into()); }
     if !command.is_empty() { args.push("--".into()); args.extend_from_slice(command); }
 
+    // Always print pane info when -P or -F is specified.
+    // Claude Code uses `split-window -F '#{pane_id}'` and expects stdout output.
+    let should_print = print_info || format.is_some();
+
     let req = IpcRequest { id: 1, command: "split-window".into(), args };
     match send_ipc_request(&req) {
         Ok(resp) if resp.success => {
-            if print_info {
+            if should_print {
                 let id_str = resp.data.get("pane_id").and_then(|v| v.as_str()).unwrap_or("%0");
                 let id_num: u32 = id_str.trim_start_matches('%').parse().unwrap_or(0);
                 println!("{}", format.as_deref().map(|f| fmt_default(f, id_num)).unwrap_or_else(|| id_str.into()));
