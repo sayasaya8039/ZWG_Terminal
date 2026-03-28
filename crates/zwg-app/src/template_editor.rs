@@ -11,17 +11,6 @@ use crate::app::{
     toggle_ime_via_imm, utf16_range_to_byte_range,
 };
 
-fn debug_write(msg: String) {
-    use std::io::Write;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(r"D:\NEXTCLOUD\Windows_app\ZWG_Terminal\ime-debug.log")
-    {
-        let _ = f.write_all(msg.as_bytes());
-    }
-}
-
 const TEXT: u32 = 0xF5F5F7;
 const SUBTEXT1: u32 = 0x8E8E93;
 const ACCENT: u32 = 0x0A84FF;
@@ -161,6 +150,33 @@ impl TemplateEditorModal {
         }
     }
 
+    pub(crate) fn new_prefilled(
+        name: String,
+        content: String,
+        note: String,
+        tags: String,
+        favorite: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let cursor = name.len();
+        Self {
+            focus_handle: cx.focus_handle(),
+            editing_id: None,
+            draft: TemplateEditorDraft {
+                name,
+                content,
+                note,
+                tags,
+                favorite,
+            },
+            active_field: TemplateEditorField::Name,
+            cursor,
+            preedit_text: String::new(),
+            marked_range: None,
+            pending_outcome: None,
+        }
+    }
+
     pub(crate) fn new_edit(
         id: String,
         name: String,
@@ -208,10 +224,6 @@ impl TemplateEditorModal {
 
     fn active_text(&self) -> &str {
         self.draft.field(self.active_field)
-    }
-
-    fn active_text_mut(&mut self) -> &mut String {
-        self.draft.field_mut(self.active_field)
     }
 
     fn display_text_for(&self, field: TemplateEditorField) -> String {
@@ -511,20 +523,7 @@ impl TemplateEditorModal {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        debug_write(format!(
-            "[TMED] key={:?} key_char={:?} focused={} field={:?} text={:?}\n",
-            event.keystroke.key,
-            event.keystroke.key_char,
-            self.focus_handle.is_focused(window),
-            self.active_field,
-            self.active_text(),
-        ));
         let handled = self.handle_key_down(event, window, cx);
-        debug_write(format!(
-            "[TMED] handled={} text_after={:?}\n",
-            handled,
-            self.active_text()
-        ));
         if handled {
             cx.stop_propagation();
         }
@@ -699,12 +698,6 @@ impl Render for TemplateEditorModal {
         if !self.focus_handle.is_focused(_window) {
             self.focus_handle.focus(_window);
         }
-        debug_write(format!(
-            "[RENDER] TemplateEditorModal focused={} field={:?} text={:?}\n",
-            self.focus_handle.is_focused(_window),
-            self.active_field,
-            self.active_text(),
-        ));
         let modal_width = 654.0;
         let modal_height = 720.0;
         let entity = cx.entity();

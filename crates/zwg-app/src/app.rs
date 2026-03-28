@@ -1918,6 +1918,21 @@ impl RootView {
         }
     }
 
+    fn copy_snippet_to_clipboard(&mut self, cx: &mut Context<Self>) {
+        let Some(item) = self.snippet_palette.selected_snippet().cloned() else {
+            return;
+        };
+        let clipboard_item = ClipboardItem::new_string(item.content.clone());
+        cx.write_to_clipboard(clipboard_item);
+        let section_label = self.snippet_palette.active_section().title();
+        self.show_app_notice(
+            format!("{section_label}をクリップボードにコピーしました"),
+            format!("{} をクリップボードにコピーしました。", item.title),
+            1800,
+            cx,
+        );
+    }
+
     fn trigger_selected_snippet_primary_action(
         &mut self,
         window: &mut Window,
@@ -1998,6 +2013,30 @@ impl RootView {
         }
 
         self.open_template_editor(window, cx);
+    }
+
+    fn save_history_as_template(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.snippet_palette.selected_snippet().cloned() else {
+            return;
+        };
+        if item.section != SnippetSection::History {
+            return;
+        }
+        let tags_str = item.tags.join(", ");
+        let note_str = item.note.clone().unwrap_or_default();
+        let editor = cx.new(|cx| {
+            TemplateEditorModal::new_prefilled(
+                item.title.clone(),
+                item.content.clone(),
+                note_str,
+                tags_str,
+                item.pinned,
+                cx,
+            )
+        });
+        editor.read(cx).focus(window);
+        self.template_editor = Some(editor);
+        cx.notify();
     }
 
     fn sync_template_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2283,6 +2322,10 @@ impl RootView {
                 self.clear_snippet_search_text(cx);
                 true
             }
+            "c" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.copy_snippet_to_clipboard(cx);
+                true
+            }
             "e" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
                 self.open_template_editor_for_edit(window, cx);
                 true
@@ -2293,6 +2336,14 @@ impl RootView {
             }
             "f" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
                 self.toggle_snippet_pinned_only(cx);
+                true
+            }
+            "c" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.copy_snippet_to_clipboard(cx);
+                true
+            }
+            "s" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                self.save_history_as_template(window, cx);
                 true
             }
             _ => {
@@ -2942,8 +2993,16 @@ impl RootView {
                                 .child(
                                     div()
                                         .font_family(UI_FONT)
-                                        .text_size(px(13.0))
-                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_size(px(14.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(rgb(TEXT))
+                                        .overflow_hidden()
+                                        .child(item.title.clone()),
+                                )
+                                .child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(11.0))
                                         .text_color(rgb(SUBTEXT0))
                                         .child(detail_meta),
                                 ),
@@ -2968,8 +3027,28 @@ impl RootView {
                                     ),
                             )
                         })
+                        .when(!is_template, |el| {
+                            el.child(
+                                panel_icon_button("snippet-detail-save-template", "ui/snippets.svg", false)
+                                    .on_mouse_down(
+                                        MouseButton::Left,
+                                        cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                                            this.save_history_as_template(window, cx);
+                                        }),
+                                    ),
+                            )
+                        })
                         .child(
                             panel_icon_button("snippet-detail-copy", "ui/copy.svg", false)
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.copy_snippet_to_clipboard(cx);
+                                    }),
+                                ),
+                        )
+                        .child(
+                            panel_icon_button("snippet-detail-paste", "ui/settings-terminal.svg", false)
                                 .on_mouse_down(
                                     MouseButton::Left,
                                     cx.listener(|this, _: &MouseDownEvent, window, cx| {
@@ -2986,6 +3065,55 @@ impl RootView {
                                     }),
                                 ),
                         ),
+                )
+                .when(
+                    item.note.is_some() || !item.tags.is_empty(),
+                    |el| {
+                        let mut meta_section = div()
+                            .w_full()
+                            .px(px(18.0))
+                            .py(px(10.0))
+                            .border_b_1()
+                            .border_color(rgba(0xffffff08))
+                            .flex()
+                            .flex_col()
+                            .gap(px(8.0));
+                        if let Some(ref note) = item.note {
+                            if !note.trim().is_empty() {
+                                meta_section = meta_section.child(
+                                    div()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(12.0))
+                                        .text_color(rgb(SUBTEXT1))
+                                        .child(note.clone()),
+                                );
+                            }
+                        }
+                        if !item.tags.is_empty() {
+                            meta_section = meta_section.child(
+                                div()
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(6.0))
+                                    .children(
+                                        item.tags.iter().map(|tag| {
+                                            div()
+                                                .px(px(8.0))
+                                                .py(px(3.0))
+                                                .rounded(px(6.0))
+                                                .bg(rgba(0x0A84FF22))
+                                                .font_family(UI_FONT)
+                                                .text_size(px(11.0))
+                                                .text_color(rgb(0x7AA2F7))
+                                                .child(tag.clone())
+                                                .into_any_element()
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    ),
+                            );
+                        }
+                        el.child(meta_section)
+                    },
                 )
                 .child(
                     div()
