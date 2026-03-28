@@ -567,7 +567,8 @@ pub fn create_tmux_shims() -> anyhow::Result<std::path::PathBuf> {
         for name in ["claude.cmd", "claude-code.cmd"] {
             let wrapper = dir.join(name);
             let wrapper_content = r#"@echo off
-rem --- Re-entry guard: skip setlocal on nested calls ---
+rem --- ZWG Claude Code shim ---
+rem Re-entry guard: skip setlocal on nested calls
 if defined _ZWG_CLAUDE_ACTIVE goto :passthrough
 setlocal
 if defined ZWG_TMUX_VALUE (set "_TMUX=%ZWG_TMUX_VALUE%") else (set "_TMUX=")
@@ -577,6 +578,17 @@ if not defined _TARGET (
   echo zwg: failed to find real %~n0 executable in PATH. 1>&2
   endlocal
   exit /b 1
+)
+rem Auto-inject --teammate-mode tmux when ZWG_CLAUDE_TEAMMATE_MODE is set
+rem and user hasn't already specified --teammate-mode
+echo %* | findstr /C:"--teammate-mode" >nul 2>&1
+if errorlevel 1 if defined ZWG_CLAUDE_TEAMMATE_MODE (
+  if defined _TMUX (
+    endlocal & set "TMUX=%_TMUX%" & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" --teammate-mode tmux %*
+  ) else (
+    endlocal & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" --teammate-mode tmux %*
+  )
+  exit /b %ERRORLEVEL%
 )
 if defined _TMUX (
   endlocal & set "TMUX=%_TMUX%" & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" %*
@@ -603,6 +615,32 @@ goto :eof
             std::fs::write(&wrapper, wrapper_content)?;
             log::info!("{} shim written to {:?}", name, wrapper);
         }
+
+        // --- PowerShell claude wrapper profile snippet ---
+        // For PowerShell 7 sessions: create a profile snippet that defines
+        // a `claude` function injecting --teammate-mode tmux automatically.
+        let ps_profile_snippet = dir.join("zwg-claude-init.ps1");
+        let ps_content = r#"# ZWG Claude Code teammate-mode wrapper
+# Auto-injects --teammate-mode tmux when ZWG_CLAUDE_TEAMMATE_MODE is set
+if ($env:ZWG_CLAUDE_TEAMMATE_MODE) {
+    function Global:claude {
+        if ($args -contains '--teammate-mode') {
+            & claude.exe @args
+        } else {
+            & claude.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args
+        }
+    }
+    function Global:claude-code {
+        if ($args -contains '--teammate-mode') {
+            & claude-code.exe @args
+        } else {
+            & claude-code.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args
+        }
+    }
+}
+"#;
+        std::fs::write(&ps_profile_snippet, ps_content)?;
+        log::info!("PowerShell claude init snippet written to {:?}", ps_profile_snippet);
     }
 
     #[cfg(not(windows))]
@@ -705,9 +743,16 @@ pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
         ("TMUX_PANE".to_string(), format!("%{}", pane_id)),
         ("TERM".to_string(), "xterm-256color".to_string()),
         ("COLORTERM".to_string(), "truecolor".to_string()),
+        // Prevent MSYS2/Git-Bash from path-mangling TMUX value
+        ("MSYS2_ENV_CONV_EXCL".to_string(), "TMUX".to_string()),
         // Claude Code agent teams support
         ("CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS".to_string(), "1".to_string()),
         ("CLAUDE_CODE_FORCE_INTERACTIVE".to_string(), "1".to_string()),
+        // Claude Code teammate-mode workaround (claude-code#26244):
+        // Standalone Bun SFE binary ignores teammateMode from settings.json
+        // but honours --teammate-mode tmux CLI flag. PowerShell env-shim
+        // claude wrapper auto-injects the flag when this var is set.
+        ("ZWG_CLAUDE_TEAMMATE_MODE".to_string(), "tmux".to_string()),
     ]
 }
 
