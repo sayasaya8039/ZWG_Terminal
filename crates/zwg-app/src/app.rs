@@ -3239,7 +3239,7 @@ impl RootView {
                                         .text_size(px(13.0))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(rgb(TEXT))
-                                        .child("クリップボードマネージャー"),
+                                        .child("クリップボードマネージャー v2"),
                                 )
                                 .child(
                                     div()
@@ -3462,342 +3462,175 @@ impl RootView {
                                         )
                                         .into_any_element()
                                 } else {
-                                    // Use uniform_list for reliable hit-testing.
-                                    // Per-item hitbox dispatch inside a manual
-                                    // overflow_scroll container can misroute events
-                                    // in gpui; uniform_list handles its own scroll
-                                    // and hit testing correctly.
-                                    let item_count = snippet_item_data.len();
-                                    let data = snippet_item_data.clone();
-                                    let selected = selected_id.clone();
-                                    let section = active_section;
-                                    let weak = cx.weak_entity();
-                                    uniform_list(
-                                        "snippet-list-scroll",
-                                        item_count,
-                                        move |range, _window, _cx| {
-                                            range
-                                                .filter_map(|visible_index| {
-                                                    let item = data.get(visible_index)?;
-                                                    let is_selected = selected.as_deref()
-                                                        == Some(item.id.as_str());
-                                                    let wrapped_title =
-                                                        wrap_sidebar_preview(&item.title, 20.0, 2);
-                                                    let wrapped_summary =
-                                                        if item.summary.is_empty() {
-                                                            None
-                                                        } else {
-                                                            Some(wrap_sidebar_preview(
-                                                                &item.summary,
-                                                                24.0,
-                                                                2,
-                                                            ))
-                                                        };
-                                                    let meta_row =
-                                                        if section == SnippetSection::History {
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap(px(8.0))
-                                                                .child(
-                                                                    svg()
-                                                                        .path("ui/clock.svg")
-                                                                        .size(px(11.0))
-                                                                        .text_color(rgb(
-                                                                            if is_selected {
-                                                                                0xffffff
-                                                                            } else {
-                                                                                MUTED
-                                                                            },
-                                                                        )),
-                                                                )
-                                                                .children(
-                                                                    item.relative_created_label
-                                                                        .clone()
-                                                                        .into_iter()
-                                                                        .map(|label| {
-                                                                            div()
-                                                                                .font_family(
-                                                                                    UI_FONT,
-                                                                                )
-                                                                                .text_size(px(
-                                                                                    10.0,
-                                                                                ))
-                                                                                .font_weight(
-                                                                                    FontWeight::MEDIUM,
-                                                                                )
-                                                                                .text_color(rgb(
-                                                                                    if is_selected
-                                                                                    {
-                                                                                        0xffffff
-                                                                                    } else {
-                                                                                        SUBTEXT0
-                                                                                    },
-                                                                                ))
-                                                                                .child(label)
-                                                                                .into_any_element()
-                                                                        }),
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .font_family(UI_FONT)
-                                                                        .text_size(px(10.0))
-                                                                        .text_color(rgb(
-                                                                            if is_selected {
-                                                                                0xffffff
-                                                                            } else {
-                                                                                MUTED
-                                                                            },
-                                                                        ))
-                                                                        .child("•"),
-                                                                )
-                                                                .child(
-                                                                    div()
-                                                                        .font_family(UI_FONT)
-                                                                        .text_size(px(10.0))
-                                                                        .text_color(rgb(
-                                                                            if is_selected {
-                                                                                0xffffff
-                                                                            } else {
-                                                                                MUTED
-                                                                            },
-                                                                        ))
-                                                                        .child(
-                                                                            item.source.clone(),
-                                                                        ),
-                                                                )
-                                                                .into_any_element()
-                                                        } else if !item.source.is_empty() {
-                                                            div()
-                                                                .flex()
-                                                                .items_center()
-                                                                .gap(px(8.0))
-                                                                .child(
-                                                                    div()
-                                                                        .font_family(UI_FONT)
-                                                                        .text_size(px(10.0))
-                                                                        .text_color(rgb(
-                                                                            if is_selected { 0xffffff } else { MUTED },
-                                                                        ))
-                                                                        .child(item.source.clone()),
-                                                                )
-                                                                .into_any_element()
-                                                        } else {
-                                                            div().into_any_element()
-                                                        };
-
-                                                    // Build tag pills for sidebar card
-                                                    let card_tags: Vec<AnyElement> = if item.tags.is_empty() {
-                                                        Vec::new()
-                                                    } else {
-                                                        item.tags.iter().take(3).map(|tag| {
-                                                            div()
-                                                                .px(px(6.0))
-                                                                .py(px(2.0))
-                                                                .rounded(px(4.0))
-                                                                .bg(if is_selected {
-                                                                    rgba(0xffffff1F)
-                                                                } else {
-                                                                    rgba(0x0A84FF1A)
-                                                                })
-                                                                .font_family(UI_FONT)
-                                                                .text_size(px(10.0))
-                                                                .text_color(rgb(
-                                                                    if is_selected { 0xDBEAFE } else { 0x7AA2F7 },
-                                                                ))
-                                                                .child(tag.clone())
-                                                                .into_any_element()
-                                                        }).collect()
-                                                    };
-
-                                                    let item_id_for_handler = item.id.clone();
-                                                    let item_id_for_element = item.id.clone();
-                                                    let weak_for_click = weak.clone();
-                                                    let mut row = div()
-                                                        .id(ElementId::Name(
-                                                            item_id_for_element.into(),
-                                                        ))
-                                                        .debug_selector({
-                                                            let selector = format!(
-                                                                "snippet-item-{}",
-                                                                item.id
-                                                            );
-                                                            move || selector.clone()
-                                                        })
-                                                        .w_full()
-                                                        .rounded(px(12.0))
-                                                        .border_1()
-                                                        .border_color(if is_selected {
-                                                            rgba(0x3B82F6FF)
-                                                        } else {
-                                                            rgba(0xffffff00)
-                                                        })
-                                                        .bg(if is_selected {
-                                                            rgba(0x2563EBFF)
-                                                        } else {
-                                                            rgba(0xffffff00)
-                                                        })
-                                                        .px(px(12.0))
-                                                        .py(px(10.0))
-                                                        .cursor_pointer()
-                                                        .overflow_hidden()
-                                                        .when(!is_selected, |el| {
-                                                            el.hover(|style| {
-                                                                style.bg(rgba(0xffffff10))
-                                                            })
-                                                        })
-                                                        .on_mouse_down(
-                                                            MouseButton::Left,
-                                                            move |_: &MouseDownEvent,
-                                                                  _window,
-                                                                  cx| {
-                                                                let _ = weak_for_click.update(
-                                                                    cx,
-                                                                    |this, cx| {
-                                                                        this.select_snippet(
-                                                                            &item_id_for_handler,
-                                                                            cx,
-                                                                        );
-                                                                    },
-                                                                );
-                                                            },
-                                                        )
+                                    // Build card elements eagerly at render time
+                                    // (not inside a closure) to avoid stale-capture issues.
+                                    let card_elements: Vec<AnyElement> = snippet_item_data
+                                        .iter()
+                                        .map(|item| {
+                                            let is_selected = selected_id.as_deref()
+                                                == Some(item.id.as_str());
+                                            let wrapped_title =
+                                                wrap_sidebar_preview(&item.title, 20.0, 2);
+                                            let wrapped_summary =
+                                                if item.summary.is_empty() {
+                                                    None
+                                                } else {
+                                                    Some(wrap_sidebar_preview(
+                                                        &item.summary, 24.0, 2,
+                                                    ))
+                                                };
+                                            let meta_row =
+                                                if active_section == SnippetSection::History {
+                                                    div()
                                                         .flex()
-                                                        .items_start()
-                                                        .gap(px(10.0))
+                                                        .items_center()
+                                                        .gap(px(8.0))
                                                         .child(
-                                                            div()
-                                                                .w(px(28.0))
-                                                                .h(px(28.0))
-                                                                .rounded(px(8.0))
-                                                                .bg(if is_selected {
-                                                                    rgba(0xffffff1F)
-                                                                } else {
-                                                                    rgba(0xffffff10)
-                                                                })
-                                                                .flex()
-                                                                .items_center()
-                                                                .justify_center()
-                                                                .child(
-                                                                    svg()
-                                                                        .path(
-                                                                            "ui/snippet-palette.svg",
-                                                                        )
-                                                                        .size(px(14.0))
+                                                            svg()
+                                                                .path("ui/clock.svg")
+                                                                .size(px(11.0))
+                                                                .text_color(rgb(
+                                                                    if is_selected { 0xffffff } else { MUTED },
+                                                                )),
+                                                        )
+                                                        .children(
+                                                            item.relative_created_label
+                                                                .clone()
+                                                                .into_iter()
+                                                                .map(|label| {
+                                                                    div()
+                                                                        .font_family(UI_FONT)
+                                                                        .text_size(px(10.0))
+                                                                        .font_weight(FontWeight::MEDIUM)
                                                                         .text_color(rgb(
-                                                                            if is_selected {
-                                                                                0xffffff
-                                                                            } else {
-                                                                                TEXT_SOFT
-                                                                            },
-                                                                        )),
-                                                                ),
+                                                                            if is_selected { 0xffffff } else { SUBTEXT0 },
+                                                                        ))
+                                                                        .child(label)
+                                                                        .into_any_element()
+                                                                }),
                                                         )
                                                         .child(
-                                                            div()
-                                                                .flex_1()
-                                                                .min_w(px(0.0))
-                                                                .flex()
-                                                                .flex_col()
-                                                                .gap(px(4.0))
+                                                            div().font_family(UI_FONT).text_size(px(10.0))
+                                                                .text_color(rgb(if is_selected { 0xffffff } else { MUTED }))
+                                                                .child("•"),
+                                                        )
+                                                        .child(
+                                                            div().font_family(UI_FONT).text_size(px(10.0))
+                                                                .text_color(rgb(if is_selected { 0xffffff } else { MUTED }))
+                                                                .child(item.source.clone()),
+                                                        )
+                                                        .into_any_element()
+                                                } else if !item.source.is_empty() {
+                                                    div()
+                                                        .flex().items_center().gap(px(8.0))
+                                                        .child(
+                                                            div().font_family(UI_FONT).text_size(px(10.0))
+                                                                .text_color(rgb(if is_selected { 0xffffff } else { MUTED }))
+                                                                .child(item.source.clone()),
+                                                        )
+                                                        .into_any_element()
+                                                } else {
+                                                    div().into_any_element()
+                                                };
+
+                                            let card_tags: Vec<AnyElement> = item.tags.iter().take(3).map(|tag| {
+                                                div()
+                                                    .px(px(6.0)).py(px(2.0)).rounded(px(4.0))
+                                                    .bg(if is_selected { rgba(0xffffff1F) } else { rgba(0x0A84FF1A) })
+                                                    .font_family(UI_FONT).text_size(px(10.0))
+                                                    .text_color(rgb(if is_selected { 0xDBEAFE } else { 0x7AA2F7 }))
+                                                    .child(tag.clone())
+                                                    .into_any_element()
+                                            }).collect();
+
+                                            let click_id = item.id.clone();
+                                            let mut row = div()
+                                                .id(ElementId::Name(item.id.clone().into()))
+                                                .debug_selector({
+                                                    let sel = format!("snippet-item-{}", item.id);
+                                                    move || sel.clone()
+                                                })
+                                                .w_full()
+                                                .rounded(px(12.0))
+                                                .border_1()
+                                                .border_color(if is_selected { rgba(0x3B82F6FF) } else { rgba(0xffffff00) })
+                                                .bg(if is_selected { rgba(0x2563EBFF) } else { rgba(0xffffff00) })
+                                                .px(px(12.0)).py(px(10.0))
+                                                .cursor_pointer()
+                                                .overflow_hidden()
+                                                .when(!is_selected, |el| el.hover(|s| s.bg(rgba(0xffffff10))))
+                                                .on_mouse_down(
+                                                    MouseButton::Left,
+                                                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
+                                                        this.select_snippet(&click_id, cx);
+                                                    }),
+                                                )
+                                                .flex().items_start().gap(px(10.0))
+                                                .child(
+                                                    div().w(px(28.0)).h(px(28.0)).rounded(px(8.0))
+                                                        .bg(if is_selected { rgba(0xffffff1F) } else { rgba(0xffffff10) })
+                                                        .flex().items_center().justify_center()
+                                                        .child(
+                                                            svg().path("ui/snippet-palette.svg").size(px(14.0))
+                                                                .text_color(rgb(if is_selected { 0xffffff } else { TEXT_SOFT })),
+                                                        ),
+                                                )
+                                                .child(
+                                                    div().flex_1().min_w(px(0.0)).flex().flex_col().gap(px(4.0))
+                                                        .child(
+                                                            div().flex().items_start().gap(px(6.0))
                                                                 .child(
-                                                                    div()
-                                                                        .flex()
-                                                                        .items_start()
-                                                                        .gap(px(6.0))
-                                                                        .child(
-                                                                            div()
-                                                                                .flex_1()
-                                                                                .min_w(px(0.0))
-                                                                                .font_family(
-                                                                                    UI_FONT,
-                                                                                )
-                                                                                .text_size(px(
-                                                                                    13.0,
-                                                                                ))
-                                                                                .font_weight(
-                                                                                    FontWeight::MEDIUM,
-                                                                                )
-                                                                                .text_color(rgb(
-                                                                                    if is_selected
-                                                                                    {
-                                                                                        0xffffff
-                                                                                    } else {
-                                                                                        TEXT
-                                                                                    },
-                                                                                ))
-                                                                                .child(
-                                                                                    wrapped_title,
-                                                                                ),
-                                                                        )
-                                                                        .child(
-                                                                            if item.pinned {
-                                                                                svg()
-                                                                                    .path(
-                                                                                        "ui/star-filled.svg",
-                                                                                    )
-                                                                                    .size(px(
-                                                                                        12.0,
-                                                                                    ))
-                                                                                    .text_color(
-                                                                                        rgb(
-                                                                                            0xF5C542,
-                                                                                        ),
-                                                                                    )
-                                                                                    .into_any_element()
-                                                                            } else {
-                                                                                div()
-                                                                                    .into_any_element()
-                                                                            },
-                                                                        ),
+                                                                    div().flex_1().min_w(px(0.0))
+                                                                        .font_family(UI_FONT).text_size(px(13.0))
+                                                                        .font_weight(FontWeight::MEDIUM)
+                                                                        .text_color(rgb(if is_selected { 0xffffff } else { TEXT }))
+                                                                        .child(wrapped_title),
                                                                 )
                                                                 .child(
-                                                                    if let Some(summary) =
-                                                                        wrapped_summary
-                                                                    {
-                                                                        div()
-                                                                            .font_family(UI_FONT)
-                                                                            .text_size(px(11.0))
-                                                                            .text_color(rgb(
-                                                                                if is_selected {
-                                                                                    0xDBEAFE
-                                                                                } else {
-                                                                                    SUBTEXT1
-                                                                                },
-                                                                            ))
-                                                                            .child(summary)
+                                                                    if item.pinned {
+                                                                        svg().path("ui/star-filled.svg").size(px(12.0))
+                                                                            .text_color(rgb(0xF5C542))
                                                                             .into_any_element()
                                                                     } else {
                                                                         div().into_any_element()
                                                                     },
-                                                                )
-                                                                .child(meta_row)
-                                                                .when(!card_tags.is_empty(), |el| {
-                                                                    el.child(
-                                                                        div()
-                                                                            .flex()
-                                                                            .flex_wrap()
-                                                                            .gap(px(4.0))
-                                                                            .children(card_tags),
-                                                                    )
-                                                                }),
-                                                        );
+                                                                ),
+                                                        )
+                                                        .child(
+                                                            if let Some(summary) = wrapped_summary {
+                                                                div().font_family(UI_FONT).text_size(px(11.0))
+                                                                    .text_color(rgb(if is_selected { 0xDBEAFE } else { SUBTEXT1 }))
+                                                                    .child(summary)
+                                                                    .into_any_element()
+                                                            } else {
+                                                                div().into_any_element()
+                                                            },
+                                                        )
+                                                        .child(meta_row)
+                                                        .when(!card_tags.is_empty(), |el| {
+                                                            el.child(div().flex().flex_wrap().gap(px(4.0)).children(card_tags))
+                                                        }),
+                                                );
 
-                                                    if is_selected {
-                                                        row = row.shadow_lg();
-                                                    }
+                                            if is_selected { row = row.shadow_lg(); }
+                                            row.into_any_element()
+                                        })
+                                        .collect();
 
-                                                    Some(row.into_any_element())
-                                                })
-                                                .collect::<Vec<_>>()
-                                        },
-                                    )
-                                    .debug_selector(|| "snippet-list-scroll".to_string())
-                                    .flex_1()
-                                    .min_h(px(0.0))
-                                    .px(px(10.0))
-                                    .pb(px(10.0))
-                                    .into_any_element()
+                                    div()
+                                        .id("snippet-list-scroll")
+                                        .debug_selector(|| "snippet-list-scroll".to_string())
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .overflow_y_scroll()
+                                        .scrollbar_width(px(6.0))
+                                        .px(px(10.0))
+                                        .pb(px(10.0))
+                                        .flex()
+                                        .flex_col()
+                                        .gap(px(6.0))
+                                        .children(card_elements)
+                                        .into_any_element()
                                 })
                                 .child(
                                     div()
@@ -3813,7 +3646,11 @@ impl RootView {
                                                 .font_family(UI_FONT)
                                                 .text_size(px(11.0))
                                                 .text_color(rgb(SUBTEXT1))
-                                                .child(format!("表示中 {} 件", visible.len())),
+                                                .child(format!(
+                                                    "表示中 {} 件 | sel: {}",
+                                                    visible.len(),
+                                                    selected_id.as_deref().unwrap_or("none")
+                                                )),
                                         )
                                         .child(
                                             div()
@@ -3821,7 +3658,7 @@ impl RootView {
                                                 .text_size(px(11.0))
                                                 .text_color(rgb(MUTED))
                                                 .child(if search_query.is_empty() {
-                                                    "アンカード表示"
+                                                    "Ctrl+C コピー / Enter 貼付"
                                                 } else {
                                                     "Ctrl+L で検索クリア"
                                                 }),
