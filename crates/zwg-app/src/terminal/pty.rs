@@ -537,19 +537,14 @@ pub fn create_tmux_shims() -> anyhow::Result<std::path::PathBuf> {
         std::fs::write(&shim_cmd, content)?;
         log::info!("tmux.cmd shim written to {:?}", shim_cmd);
 
-        // --- tmux.exe (hardlink or copy) ---
+        // --- tmux.exe (always recreate to match current zwg.exe) ---
         let shim_exe = dir.join("tmux.exe");
-        if !shim_exe.exists()
-            || shim_exe.metadata().map(|m| m.len()).unwrap_or(0)
-                != zwg_exe.metadata().map(|m| m.len()).unwrap_or(1)
-        {
-            let _ = std::fs::remove_file(&shim_exe);
-            if std::fs::hard_link(&zwg_exe, &shim_exe).is_err() {
-                std::fs::copy(&zwg_exe, &shim_exe)?;
-                log::info!("tmux.exe shim copied to {:?}", shim_exe);
-            } else {
-                log::info!("tmux.exe shim hardlinked to {:?}", shim_exe);
-            }
+        let _ = std::fs::remove_file(&shim_exe);
+        if std::fs::hard_link(&zwg_exe, &shim_exe).is_err() {
+            std::fs::copy(&zwg_exe, &shim_exe)?;
+            log::info!("tmux.exe shim copied to {:?}", shim_exe);
+        } else {
+            log::info!("tmux.exe shim hardlinked to {:?}", shim_exe);
         }
 
         // --- zwg-agent-hook.cmd ---
