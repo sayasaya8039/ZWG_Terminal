@@ -732,6 +732,36 @@ pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
     let hook_cmd_path = shim.join("zwg-agent-hook");
     let hook_cmd = hook_cmd_path.to_string_lossy().to_string();
 
+    // Create TTY fix preload script (claude-code#26244 workaround):
+    // Bun SFE on Windows reports process.stdout.isTTY as undefined even
+    // inside ConPTY. This preload patches it to true so Claude Code
+    // accepts --teammate-mode tmux.
+    let tty_fix_path = shim.join("zwg-fix-tty.js");
+    if !tty_fix_path.exists() {
+        let _ = std::fs::write(
+            &tty_fix_path,
+            "// ZWG TTY fix for Claude Code on Windows (claude-code#26244)\n\
+             // Bun SFE reports isTTY=undefined inside ConPTY; patch it.\n\
+             if (typeof process !== 'undefined') {\n\
+               if (process.stdout && !process.stdout.isTTY) process.stdout.isTTY = true;\n\
+               if (process.stderr && !process.stderr.isTTY) process.stderr.isTTY = true;\n\
+             }\n",
+        );
+    }
+    let tty_fix_str = tty_fix_path.to_string_lossy().to_string();
+
+    // Build NODE_OPTIONS: append --require for the TTY fix preload.
+    // Preserve any existing NODE_OPTIONS the user may have set.
+    let existing_node_opts = std::env::var("NODE_OPTIONS").unwrap_or_default();
+    let require_flag = format!("--require={}", tty_fix_str);
+    let node_options = if existing_node_opts.contains(&require_flag) {
+        existing_node_opts
+    } else if existing_node_opts.is_empty() {
+        require_flag
+    } else {
+        format!("{} {}", existing_node_opts, require_flag)
+    };
+
     vec![
         ("ZWG".to_string(), "1".to_string()),
         ("ZWG_TMUX_VALUE".to_string(), tmux_value.clone()),
@@ -753,6 +783,9 @@ pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
         // but honours --teammate-mode tmux CLI flag. PowerShell env-shim
         // claude wrapper auto-injects the flag when this var is set.
         ("ZWG_CLAUDE_TEAMMATE_MODE".to_string(), "tmux".to_string()),
+        // Node preload TTY fix: patches process.stdout.isTTY = true
+        // inside Bun SFE on Windows ConPTY (claude-code#26244)
+        ("NODE_OPTIONS".to_string(), node_options),
     ]
 }
 
