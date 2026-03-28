@@ -2338,10 +2338,6 @@ impl RootView {
                 self.toggle_snippet_pinned_only(cx);
                 true
             }
-            "c" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
-                self.copy_snippet_to_clipboard(cx);
-                true
-            }
             "s" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
                 self.save_history_as_template(window, cx);
                 true
@@ -3615,10 +3611,11 @@ impl RootView {
                                                     };
 
                                                     let item_id_for_handler = item.id.clone();
+                                                    let item_id_for_element = item.id.clone();
                                                     let weak_for_click = weak.clone();
                                                     let mut row = div()
-                                                        .id(ElementId::Integer(
-                                                            visible_index as u64,
+                                                        .id(ElementId::Name(
+                                                            item_id_for_element.into(),
                                                         ))
                                                         .debug_selector({
                                                             let selector = format!(
@@ -3657,25 +3654,10 @@ impl RootView {
                                                                 let _ = weak_for_click.update(
                                                                     cx,
                                                                     |this, cx| {
-                                                                        let vis = this
-                                                                            .snippet_palette
-                                                                            .visible_snippets();
-                                                                        if let Some(snippet) =
-                                                                            vis.get(visible_index)
-                                                                        {
-                                                                            let id =
-                                                                                snippet.id.clone();
-                                                                            drop(vis);
-                                                                            this.select_snippet(
-                                                                                &id, cx,
-                                                                            );
-                                                                        } else {
-                                                                            drop(vis);
-                                                                            this.select_snippet(
-                                                                                &item_id_for_handler,
-                                                                                cx,
-                                                                            );
-                                                                        }
+                                                                        this.select_snippet(
+                                                                            &item_id_for_handler,
+                                                                            cx,
+                                                                        );
                                                                     },
                                                                 );
                                                             },
