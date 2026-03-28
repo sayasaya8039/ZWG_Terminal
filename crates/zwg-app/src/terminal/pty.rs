@@ -559,23 +559,46 @@ pub fn create_tmux_shims() -> anyhow::Result<std::path::PathBuf> {
         log::info!("zwg-agent-hook.cmd shim written to {:?}", hook_cmd);
 
         // --- claude.cmd / claude-code.cmd ---
+        // Uses `endlocal &` before exec to prevent setlocal recursion.
+        // When Claude Code spawns sub-processes that re-invoke `claude`,
+        // the shim is entered again. Without endlocal, each call adds a
+        // setlocal nesting level, hitting CMD's ~32 limit.
+        // _ZWG_CLAUDE_ACTIVE guards against re-entry entirely.
         for name in ["claude.cmd", "claude-code.cmd"] {
             let wrapper = dir.join(name);
             let wrapper_content = r#"@echo off
+rem --- Re-entry guard: skip setlocal on nested calls ---
+if defined _ZWG_CLAUDE_ACTIVE goto :passthrough
 setlocal
-if defined ZWG_TMUX_VALUE set "TMUX=%ZWG_TMUX_VALUE%"
+if defined ZWG_TMUX_VALUE (set "_TMUX=%ZWG_TMUX_VALUE%") else (set "_TMUX=")
 set "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1"
+call :find_target
+if not defined _TARGET (
+  echo zwg: failed to find real %~n0 executable in PATH. 1>&2
+  endlocal
+  exit /b 1
+)
+if defined _TMUX (
+  endlocal & set "TMUX=%_TMUX%" & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" %*
+) else (
+  endlocal & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" %*
+)
+exit /b %ERRORLEVEL%
+:passthrough
+call :find_target
+if not defined _TARGET (
+  echo zwg: failed to find real %~n0 executable in PATH. 1>&2
+  exit /b 1
+)
+"%_TARGET%" %*
+exit /b %ERRORLEVEL%
+:find_target
 set "_SELF=%~f0"
 set "_TARGET="
 for /f "delims=" %%I in ('where %~n0 2^>nul') do (
   if /I not "%%~fI"=="%_SELF%" if not defined _TARGET set "_TARGET=%%~fI"
 )
-if not defined _TARGET (
-  echo zwg: failed to find real %~n0 executable in PATH. 1>&2
-  exit /b 1
-)
-"%_TARGET%" --teammate-mode tmux %*
-exit /b %ERRORLEVEL%
+goto :eof
 "#;
             std::fs::write(&wrapper, wrapper_content)?;
             log::info!("{} shim written to {:?}", name, wrapper);
@@ -641,10 +664,29 @@ pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
     let pid = std::process::id();
     let tmux_value = format!("{},{},0", conn, pid);
 
+    // Prepend shim directory to PATH so `tmux` resolves to our shim.
+    // Skip if already present anywhere in PATH to avoid unbounded growth
+    // when PTYs nest (e.g. Claude spawning sub-shells).
     let shim = shim_dir();
     let current_path = std::env::var("PATH").unwrap_or_default();
     let separator = if cfg!(windows) { ";" } else { ":" };
-    let new_path = format!("{}{}{}", shim.display(), separator, current_path);
+    let shim_str = shim.to_string_lossy();
+    let already_present = current_path
+        .split(separator)
+        .any(|entry| {
+            let e = entry.trim_end_matches(['/', '\\']);
+            let s = shim_str.trim_end_matches(['/', '\\']);
+            if cfg!(windows) {
+                e.eq_ignore_ascii_case(s)
+            } else {
+                e == s
+            }
+        });
+    let new_path = if already_present {
+        current_path.clone()
+    } else {
+        format!("{}{}{}", shim.display(), separator, current_path)
+    };
 
     #[cfg(windows)]
     let hook_cmd_path = shim.join("zwg-agent-hook.cmd");
