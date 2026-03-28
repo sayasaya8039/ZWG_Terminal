@@ -331,6 +331,19 @@ fn main() {
     // CLI dispatch: if invoked with tmux subcommands, run as IPC client and exit
     let cli_command = cli::parse_args();
     if !matches!(cli_command, cli::CliCommand::Gui) {
+        // Re-attach to the parent console so stdout/stderr work.
+        // The release binary is a GUI app (windows_subsystem = "windows")
+        // which has no console by default. Without this, println!/eprintln!
+        // output is silently discarded — breaking tmux commands like
+        // `split-window -F '#{pane_id}'` that must print to stdout.
+        #[cfg(windows)]
+        {
+            unsafe extern "system" {
+                fn AttachConsole(process_id: u32) -> i32;
+            }
+            const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
+            unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
+        }
         cli::run_client(cli_command);
         // run_client calls process::exit() — unreachable
     }
