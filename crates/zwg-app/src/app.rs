@@ -2924,7 +2924,6 @@ impl RootView {
             source: String,
             #[allow(dead_code)]
             section: SnippetSection,
-            tags: Vec<String>,
             relative_created_label: Option<String>,
         }
         let snippet_item_data: std::rc::Rc<Vec<SnippetItemData>> = std::rc::Rc::new(
@@ -2937,7 +2936,6 @@ impl RootView {
                     pinned: item.pinned,
                     source: item.source.clone(),
                     section: item.section,
-                    tags: item.tags.clone(),
                     relative_created_label: item.relative_created_label(),
                 })
                 .collect(),
@@ -3483,7 +3481,7 @@ impl RootView {
                                                     let wrapped_summary = if item.summary.is_empty() {
                                                         None
                                                     } else {
-                                                        Some(wrap_sidebar_preview(&item.summary, 24.0, 2))
+                                                        Some(wrap_sidebar_preview(&item.summary, 28.0, 1))
                                                     };
 
                                                     let meta_row = if section == SnippetSection::History {
@@ -3512,14 +3510,6 @@ impl RootView {
                                                         div().into_any_element()
                                                     };
 
-                                                    let card_tags: Vec<AnyElement> = item.tags.iter().take(3).map(|tag| {
-                                                        div().px(px(6.0)).py(px(2.0)).rounded(px(4.0))
-                                                            .bg(if is_sel { rgba(0xffffff1F) } else { rgba(0x0A84FF1A) })
-                                                            .font_family(UI_FONT).text_size(px(10.0))
-                                                            .text_color(rgb(if is_sel { 0xDBEAFE } else { 0x7AA2F7 }))
-                                                            .child(tag.clone()).into_any_element()
-                                                    }).collect();
-
                                                     let click_id = item.id.clone();
                                                     let w = weak.clone();
                                                     let mut row = div()
@@ -3528,7 +3518,8 @@ impl RootView {
                                                             let s = format!("snippet-item-{}", item.id);
                                                             move || s.clone()
                                                         })
-                                                        .w_full().rounded(px(12.0)).border_1()
+                                                        .w_full().h(px(88.0))
+                                                        .rounded(px(12.0)).border_1()
                                                         .border_color(if is_sel { rgba(0x3B82F6FF) } else { rgba(0xffffff00) })
                                                         .bg(if is_sel { rgba(0x2563EBFF) } else { rgba(0xffffff00) })
                                                         .px(px(12.0)).py(px(10.0))
@@ -3570,10 +3561,7 @@ impl RootView {
                                                                 } else {
                                                                     div().into_any_element()
                                                                 })
-                                                                .child(meta_row)
-                                                                .when(!card_tags.is_empty(), |el| {
-                                                                    el.child(div().flex().flex_wrap().gap(px(4.0)).children(card_tags))
-                                                                }),
+                                                                .child(meta_row),
                                                         );
 
                                                     if is_sel { row = row.shadow_lg(); }
