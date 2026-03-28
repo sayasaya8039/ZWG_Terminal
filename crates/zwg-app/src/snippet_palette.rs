@@ -146,6 +146,10 @@ impl SnippetPaletteModel {
         self.active_section
     }
 
+    pub fn selected_snippet_id(&self) -> &Option<String> {
+        &self.selected_snippet_id
+    }
+
     pub fn has_history_items(&self) -> bool {
         self.snippets
             .iter()
@@ -583,22 +587,43 @@ pub fn filter_snippets<'a>(snippets: &'a [SnippetRecord], query: &str) -> Vec<&'
     snippets
         .iter()
         .filter(|snippet| {
-            snippet.title.to_lowercase().contains(&lowered)
-                || snippet.summary.to_lowercase().contains(&lowered)
-                || snippet.content.to_lowercase().contains(&lowered)
+            contains_ignore_case(&snippet.title, &lowered)
+                || contains_ignore_case(&snippet.summary, &lowered)
+                || contains_ignore_case(&snippet.content, &lowered)
                 || snippet
                     .note
                     .as_deref()
-                    .unwrap_or_default()
-                    .to_lowercase()
-                    .contains(&lowered)
-                || snippet.source.to_lowercase().contains(&lowered)
+                    .map_or(false, |n| contains_ignore_case(n, &lowered))
+                || contains_ignore_case(&snippet.source, &lowered)
                 || snippet
                     .tags
                     .iter()
-                    .any(|tag| tag.to_lowercase().contains(&lowered))
+                    .any(|tag| contains_ignore_case(tag, &lowered))
         })
         .collect()
+}
+
+/// Case-insensitive substring search without heap allocation.
+fn contains_ignore_case(haystack: &str, needle_lower: &str) -> bool {
+    if needle_lower.is_empty() {
+        return true;
+    }
+    let needle_bytes = needle_lower.len();
+    haystack
+        .char_indices()
+        .any(|(i, _)| {
+            haystack[i..]
+                .chars()
+                .flat_map(char::to_lowercase)
+                .zip(needle_lower.chars())
+                .all(|(h, n)| h == n)
+                && haystack[i..]
+                    .chars()
+                    .flat_map(char::to_lowercase)
+                    .take(needle_bytes)
+                    .count()
+                    >= needle_lower.chars().count()
+        })
 }
 
 fn history_store_path() -> PathBuf {
@@ -679,9 +704,14 @@ fn save_history_records(records: &[SnippetRecord]) -> std::io::Result<()> {
         version: HISTORY_STORE_VERSION,
         records: records.to_vec(),
     };
-    let contents = serde_json::to_string_pretty(&store)
+    // Use compact JSON (not pretty) for faster serialization.
+    // Spawn a thread to avoid blocking the UI.
+    let contents = serde_json::to_string(&store)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    fs::write(path, contents)
+    std::thread::spawn(move || {
+        let _ = fs::write(path, contents);
+    });
+    Ok(())
 }
 
 fn save_template_records(records: &[SnippetRecord]) -> std::io::Result<()> {
@@ -694,9 +724,12 @@ fn save_template_records(records: &[SnippetRecord]) -> std::io::Result<()> {
         version: TEMPLATE_STORE_VERSION,
         records: records.to_vec(),
     };
-    let contents = serde_json::to_string_pretty(&store)
+    let contents = serde_json::to_string(&store)
         .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
-    fs::write(path, contents)
+    std::thread::spawn(move || {
+        let _ = fs::write(path, contents);
+    });
+    Ok(())
 }
 
 fn clear_history_store() -> std::io::Result<()> {

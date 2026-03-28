@@ -2893,10 +2893,13 @@ impl RootView {
         let frame = snippet_panel_frame(viewport_w, viewport_h);
         let sidebar_w = (frame.width * 0.36).clamp(276.0, 332.0);
         let visible = self.snippet_palette.visible_snippets();
-        let selected_id = self
-            .snippet_palette
-            .selected_snippet()
-            .map(|snippet| snippet.id.clone());
+        // Derive selected_id from visible list directly to avoid extra visible_snippets() call.
+        let raw_selected_id = self.snippet_palette.selected_snippet_id();
+        let selected_id = raw_selected_id
+            .as_ref()
+            .filter(|id| visible.iter().any(|s| s.id == **id))
+            .cloned()
+            .or_else(|| visible.first().map(|s| s.id.clone()));
         let search_query = self.snippet_palette.search_query().to_string();
         let pinned_only = self.snippet_palette.pinned_only();
         let total_count = self.snippet_palette.total_count();
@@ -2943,7 +2946,12 @@ impl RootView {
         let list_is_empty = snippet_item_data.is_empty();
         let empty_search_query = search_query.clone();
 
-        let detail = if let Some(item) = self.snippet_palette.selected_snippet().cloned() {
+        // Use selected_id (already computed from visible) to find the detail item
+        // without calling visible_snippets() again.
+        let selected_item = selected_id.as_ref().and_then(|sel_id| {
+            visible.iter().find(|s| s.id == *sel_id).copied().cloned()
+        });
+        let detail = if let Some(item) = selected_item {
             let is_template = item.section == SnippetSection::Template;
             let detail_meta = format!("{} • {}", item.kind_label, item.source);
             let content_lines = item
