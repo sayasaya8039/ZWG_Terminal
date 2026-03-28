@@ -490,7 +490,7 @@ const APPEARANCE_FONT_FAMILIES: [&str; 3] = SUPPORTED_TERMINAL_FONT_FAMILIES;
 const SNIPPET_PANEL_MARGIN: f32 = 12.0;
 const SNIPPET_PANEL_TOP_OFFSET: f32 = 46.0;
 const SNIPPET_PANEL_MAX_WIDTH: f32 = 940.0;
-const SNIPPET_PANEL_MAX_HEIGHT: f32 = 560.0;
+const SNIPPET_PANEL_MAX_HEIGHT: f32 = 820.0;
 
 fn cycle_string_option(current: &str, options: &[&str], delta: i32) -> String {
     if options.is_empty() {
@@ -2907,6 +2907,8 @@ impl RootView {
         let pinned_count = self.snippet_palette.pinned_count();
         let active_section = self.snippet_palette.active_section();
         let active_section_label = active_section.title().to_string();
+        let history_count = self.snippet_palette.section_total_count(SnippetSection::History);
+        let template_count = self.snippet_palette.section_total_count(SnippetSection::Template);
         let compact_sidebar = frame.height <= 580.0;
         let sidebar_section_padding = if compact_sidebar { 12.0 } else { 16.0 };
         let sidebar_section_gap = if compact_sidebar { 8.0 } else { 12.0 };
@@ -2926,6 +2928,7 @@ impl RootView {
             source: String,
             #[allow(dead_code)]
             section: SnippetSection,
+            tags: Vec<String>,
             relative_created_label: Option<String>,
         }
         let snippet_item_data: std::rc::Rc<Vec<SnippetItemData>> = std::rc::Rc::new(
@@ -2938,6 +2941,7 @@ impl RootView {
                     pinned: item.pinned,
                     source: item.source.clone(),
                     section: item.section,
+                    tags: item.tags.clone(),
                     relative_created_label: item.relative_created_label(),
                 })
                 .collect(),
@@ -3340,11 +3344,15 @@ impl RootView {
                                                 .flex()
                                                 .gap(px(8.0))
                                                 .children(
-                                                    [SnippetSection::History, SnippetSection::Template]
+                                                    [
+                                                        (SnippetSection::History, history_count),
+                                                        (SnippetSection::Template, template_count),
+                                                    ]
                                                         .into_iter()
-                                                        .map(|section| {
+                                                        .map(|(section, count)| {
                                                             let active = active_section == section;
                                                             let section_value = section;
+                                                            let tab_label = format!("{} ({})", section.title(), count);
 
                                                             div()
                                                                 .id(ElementId::Name(
@@ -3401,7 +3409,7 @@ impl RootView {
                                                                         } else {
                                                                             SUBTEXT0
                                                                         }))
-                                                                        .child(section.title()),
+                                                                        .child(tab_label),
                                                                 )
                                                                 .into_any_element()
                                                         }),
@@ -3563,9 +3571,48 @@ impl RootView {
                                                                         ),
                                                                 )
                                                                 .into_any_element()
+                                                        } else if !item.source.is_empty() {
+                                                            div()
+                                                                .flex()
+                                                                .items_center()
+                                                                .gap(px(8.0))
+                                                                .child(
+                                                                    div()
+                                                                        .font_family(UI_FONT)
+                                                                        .text_size(px(10.0))
+                                                                        .text_color(rgb(
+                                                                            if is_selected { 0xffffff } else { MUTED },
+                                                                        ))
+                                                                        .child(item.source.clone()),
+                                                                )
+                                                                .into_any_element()
                                                         } else {
                                                             div().into_any_element()
                                                         };
+
+                                                    // Build tag pills for sidebar card
+                                                    let card_tags: Vec<AnyElement> = if item.tags.is_empty() {
+                                                        Vec::new()
+                                                    } else {
+                                                        item.tags.iter().take(3).map(|tag| {
+                                                            div()
+                                                                .px(px(6.0))
+                                                                .py(px(2.0))
+                                                                .rounded(px(4.0))
+                                                                .bg(if is_selected {
+                                                                    rgba(0xffffff1F)
+                                                                } else {
+                                                                    rgba(0x0A84FF1A)
+                                                                })
+                                                                .font_family(UI_FONT)
+                                                                .text_size(px(10.0))
+                                                                .text_color(rgb(
+                                                                    if is_selected { 0xDBEAFE } else { 0x7AA2F7 },
+                                                                ))
+                                                                .child(tag.clone())
+                                                                .into_any_element()
+                                                        }).collect()
+                                                    };
 
                                                     let item_id_for_handler = item.id.clone();
                                                     let weak_for_click = weak.clone();
@@ -3597,8 +3644,10 @@ impl RootView {
                                                         .py(px(10.0))
                                                         .cursor_pointer()
                                                         .overflow_hidden()
-                                                        .hover(|style| {
-                                                            style.bg(rgba(0xffffff10))
+                                                        .when(!is_selected, |el| {
+                                                            el.hover(|style| {
+                                                                style.bg(rgba(0xffffff10))
+                                                            })
                                                         })
                                                         .on_mouse_down(
                                                             MouseButton::Left,
@@ -3740,7 +3789,16 @@ impl RootView {
                                                                         div().into_any_element()
                                                                     },
                                                                 )
-                                                                .child(meta_row),
+                                                                .child(meta_row)
+                                                                .when(!card_tags.is_empty(), |el| {
+                                                                    el.child(
+                                                                        div()
+                                                                            .flex()
+                                                                            .flex_wrap()
+                                                                            .gap(px(4.0))
+                                                                            .children(card_tags),
+                                                                    )
+                                                                }),
                                                         );
 
                                                     if is_selected {
@@ -6607,7 +6665,7 @@ mod tests {
     #[gpui::test]
     fn snippet_palette_sidebar_allows_selecting_items_below_third_row(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| build_test_root_view(cx));
-        cx.simulate_resize(size(px(1280.0), px(900.0)));
+        cx.simulate_resize(size(px(1280.0), px(1600.0)));
         cx.run_until_parked();
 
         let target_bounds = cx
@@ -6644,7 +6702,7 @@ mod tests {
     #[gpui::test]
     fn snippet_palette_clicking_every_item_selects_correct_one(cx: &mut TestAppContext) {
         let (view, cx) = cx.add_window_view(|_, cx| build_test_root_view(cx));
-        cx.simulate_resize(size(px(1280.0), px(900.0)));
+        cx.simulate_resize(size(px(1280.0), px(1600.0)));
         cx.run_until_parked();
 
         let all_ids: Vec<String> = view.update(cx, |view, _| {
