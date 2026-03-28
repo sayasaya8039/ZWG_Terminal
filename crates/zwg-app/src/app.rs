@@ -3462,175 +3462,132 @@ impl RootView {
                                         )
                                         .into_any_element()
                                 } else {
-                                    // Build card elements eagerly at render time
-                                    // (not inside a closure) to avoid stale-capture issues.
-                                    let card_elements: Vec<AnyElement> = snippet_item_data
-                                        .iter()
-                                        .map(|item| {
-                                            let is_selected = selected_id.as_deref()
-                                                == Some(item.id.as_str());
-                                            let wrapped_title =
-                                                wrap_sidebar_preview(&item.title, 20.0, 2);
-                                            let wrapped_summary =
-                                                if item.summary.is_empty() {
-                                                    None
-                                                } else {
-                                                    Some(wrap_sidebar_preview(
-                                                        &item.summary, 24.0, 2,
-                                                    ))
-                                                };
-                                            let meta_row =
-                                                if active_section == SnippetSection::History {
-                                                    div()
-                                                        .flex()
-                                                        .items_center()
-                                                        .gap(px(8.0))
-                                                        .child(
-                                                            svg()
-                                                                .path("ui/clock.svg")
-                                                                .size(px(11.0))
-                                                                .text_color(rgb(
-                                                                    if is_selected { 0xffffff } else { MUTED },
-                                                                )),
-                                                        )
-                                                        .children(
-                                                            item.relative_created_label
-                                                                .clone()
-                                                                .into_iter()
-                                                                .map(|label| {
-                                                                    div()
-                                                                        .font_family(UI_FONT)
-                                                                        .text_size(px(10.0))
-                                                                        .font_weight(FontWeight::MEDIUM)
-                                                                        .text_color(rgb(
-                                                                            if is_selected { 0xffffff } else { SUBTEXT0 },
-                                                                        ))
-                                                                        .child(label)
-                                                                        .into_any_element()
-                                                                }),
-                                                        )
-                                                        .child(
-                                                            div().font_family(UI_FONT).text_size(px(10.0))
-                                                                .text_color(rgb(if is_selected { 0xffffff } else { MUTED }))
-                                                                .child("•"),
-                                                        )
-                                                        .child(
-                                                            div().font_family(UI_FONT).text_size(px(10.0))
-                                                                .text_color(rgb(if is_selected { 0xffffff } else { MUTED }))
-                                                                .child(item.source.clone()),
-                                                        )
-                                                        .into_any_element()
-                                                } else if !item.source.is_empty() {
-                                                    div()
-                                                        .flex().items_center().gap(px(8.0))
-                                                        .child(
-                                                            div().font_family(UI_FONT).text_size(px(10.0))
-                                                                .text_color(rgb(if is_selected { 0xffffff } else { MUTED }))
-                                                                .child(item.source.clone()),
-                                                        )
-                                                        .into_any_element()
-                                                } else {
-                                                    div().into_any_element()
-                                                };
+                                    // Use uniform_list for virtualized rendering (essential
+                                    // for 100+ history items). The root cause of the ghost
+                                    // selection bug was duplicate IDs in persisted data,
+                                    // not uniform_list itself. IDs are now deduplicated on load.
+                                    let item_count = snippet_item_data.len();
+                                    let data = snippet_item_data.clone();
+                                    let selected = selected_id.clone();
+                                    let section = active_section;
+                                    let weak = cx.weak_entity();
+                                    uniform_list(
+                                        "snippet-list-scroll",
+                                        item_count,
+                                        move |range, _window, _cx| {
+                                            range
+                                                .filter_map(|ix| {
+                                                    let item = data.get(ix)?;
+                                                    let is_sel = selected.as_deref() == Some(item.id.as_str());
+                                                    let wrapped_title = wrap_sidebar_preview(&item.title, 20.0, 2);
+                                                    let wrapped_summary = if item.summary.is_empty() {
+                                                        None
+                                                    } else {
+                                                        Some(wrap_sidebar_preview(&item.summary, 24.0, 2))
+                                                    };
 
-                                            let card_tags: Vec<AnyElement> = item.tags.iter().take(3).map(|tag| {
-                                                div()
-                                                    .px(px(6.0)).py(px(2.0)).rounded(px(4.0))
-                                                    .bg(if is_selected { rgba(0xffffff1F) } else { rgba(0x0A84FF1A) })
-                                                    .font_family(UI_FONT).text_size(px(10.0))
-                                                    .text_color(rgb(if is_selected { 0xDBEAFE } else { 0x7AA2F7 }))
-                                                    .child(tag.clone())
-                                                    .into_any_element()
-                                            }).collect();
+                                                    let meta_row = if section == SnippetSection::History {
+                                                        div().flex().items_center().gap(px(8.0))
+                                                            .child(svg().path("ui/clock.svg").size(px(11.0))
+                                                                .text_color(rgb(if is_sel { 0xffffff } else { MUTED })))
+                                                            .children(item.relative_created_label.clone().into_iter().map(|label| {
+                                                                div().font_family(UI_FONT).text_size(px(10.0))
+                                                                    .font_weight(FontWeight::MEDIUM)
+                                                                    .text_color(rgb(if is_sel { 0xffffff } else { SUBTEXT0 }))
+                                                                    .child(label).into_any_element()
+                                                            }))
+                                                            .child(div().font_family(UI_FONT).text_size(px(10.0))
+                                                                .text_color(rgb(if is_sel { 0xffffff } else { MUTED })).child("•"))
+                                                            .child(div().font_family(UI_FONT).text_size(px(10.0))
+                                                                .text_color(rgb(if is_sel { 0xffffff } else { MUTED }))
+                                                                .child(item.source.clone()))
+                                                            .into_any_element()
+                                                    } else if !item.source.is_empty() {
+                                                        div().flex().items_center().gap(px(8.0))
+                                                            .child(div().font_family(UI_FONT).text_size(px(10.0))
+                                                                .text_color(rgb(if is_sel { 0xffffff } else { MUTED }))
+                                                                .child(item.source.clone()))
+                                                            .into_any_element()
+                                                    } else {
+                                                        div().into_any_element()
+                                                    };
 
-                                            let click_id = item.id.clone();
-                                            let mut row = div()
-                                                .id(ElementId::Name(item.id.clone().into()))
-                                                .debug_selector({
-                                                    let sel = format!("snippet-item-{}", item.id);
-                                                    move || sel.clone()
-                                                })
-                                                .w_full()
-                                                .rounded(px(12.0))
-                                                .border_1()
-                                                .border_color(if is_selected { rgba(0x3B82F6FF) } else { rgba(0xffffff00) })
-                                                .bg(if is_selected { rgba(0x2563EBFF) } else { rgba(0xffffff00) })
-                                                .px(px(12.0)).py(px(10.0))
-                                                .cursor_pointer()
-                                                .overflow_hidden()
-                                                .when(!is_selected, |el| el.hover(|s| s.bg(rgba(0xffffff10))))
-                                                .on_mouse_down(
-                                                    MouseButton::Left,
-                                                    cx.listener(move |this, _: &MouseDownEvent, _window, cx| {
-                                                        this.select_snippet(&click_id, cx);
-                                                    }),
-                                                )
-                                                .flex().items_start().gap(px(10.0))
-                                                .child(
-                                                    div().w(px(28.0)).h(px(28.0)).rounded(px(8.0))
-                                                        .bg(if is_selected { rgba(0xffffff1F) } else { rgba(0xffffff10) })
-                                                        .flex().items_center().justify_center()
+                                                    let card_tags: Vec<AnyElement> = item.tags.iter().take(3).map(|tag| {
+                                                        div().px(px(6.0)).py(px(2.0)).rounded(px(4.0))
+                                                            .bg(if is_sel { rgba(0xffffff1F) } else { rgba(0x0A84FF1A) })
+                                                            .font_family(UI_FONT).text_size(px(10.0))
+                                                            .text_color(rgb(if is_sel { 0xDBEAFE } else { 0x7AA2F7 }))
+                                                            .child(tag.clone()).into_any_element()
+                                                    }).collect();
+
+                                                    let click_id = item.id.clone();
+                                                    let w = weak.clone();
+                                                    let mut row = div()
+                                                        .id(ElementId::Name(item.id.clone().into()))
+                                                        .debug_selector({
+                                                            let s = format!("snippet-item-{}", item.id);
+                                                            move || s.clone()
+                                                        })
+                                                        .w_full().rounded(px(12.0)).border_1()
+                                                        .border_color(if is_sel { rgba(0x3B82F6FF) } else { rgba(0xffffff00) })
+                                                        .bg(if is_sel { rgba(0x2563EBFF) } else { rgba(0xffffff00) })
+                                                        .px(px(12.0)).py(px(10.0))
+                                                        .cursor_pointer().overflow_hidden()
+                                                        .when(!is_sel, |el| el.hover(|s| s.bg(rgba(0xffffff10))))
+                                                        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                                                            let _ = w.update(cx, |this, cx| {
+                                                                this.select_snippet(&click_id, cx);
+                                                            });
+                                                        })
+                                                        .flex().items_start().gap(px(10.0))
                                                         .child(
-                                                            svg().path("ui/snippet-palette.svg").size(px(14.0))
-                                                                .text_color(rgb(if is_selected { 0xffffff } else { TEXT_SOFT })),
-                                                        ),
-                                                )
-                                                .child(
-                                                    div().flex_1().min_w(px(0.0)).flex().flex_col().gap(px(4.0))
+                                                            div().w(px(28.0)).h(px(28.0)).rounded(px(8.0))
+                                                                .bg(if is_sel { rgba(0xffffff1F) } else { rgba(0xffffff10) })
+                                                                .flex().items_center().justify_center()
+                                                                .child(svg().path("ui/snippet-palette.svg").size(px(14.0))
+                                                                    .text_color(rgb(if is_sel { 0xffffff } else { TEXT_SOFT }))),
+                                                        )
                                                         .child(
-                                                            div().flex().items_start().gap(px(6.0))
+                                                            div().flex_1().min_w(px(0.0)).flex().flex_col().gap(px(4.0))
                                                                 .child(
-                                                                    div().flex_1().min_w(px(0.0))
-                                                                        .font_family(UI_FONT).text_size(px(13.0))
-                                                                        .font_weight(FontWeight::MEDIUM)
-                                                                        .text_color(rgb(if is_selected { 0xffffff } else { TEXT }))
-                                                                        .child(wrapped_title),
+                                                                    div().flex().items_start().gap(px(6.0))
+                                                                        .child(div().flex_1().min_w(px(0.0))
+                                                                            .font_family(UI_FONT).text_size(px(13.0))
+                                                                            .font_weight(FontWeight::MEDIUM)
+                                                                            .text_color(rgb(if is_sel { 0xffffff } else { TEXT }))
+                                                                            .child(wrapped_title))
+                                                                        .child(if item.pinned {
+                                                                            svg().path("ui/star-filled.svg").size(px(12.0))
+                                                                                .text_color(rgb(0xF5C542)).into_any_element()
+                                                                        } else {
+                                                                            div().into_any_element()
+                                                                        }),
                                                                 )
-                                                                .child(
-                                                                    if item.pinned {
-                                                                        svg().path("ui/star-filled.svg").size(px(12.0))
-                                                                            .text_color(rgb(0xF5C542))
-                                                                            .into_any_element()
-                                                                    } else {
-                                                                        div().into_any_element()
-                                                                    },
-                                                                ),
-                                                        )
-                                                        .child(
-                                                            if let Some(summary) = wrapped_summary {
-                                                                div().font_family(UI_FONT).text_size(px(11.0))
-                                                                    .text_color(rgb(if is_selected { 0xDBEAFE } else { SUBTEXT1 }))
-                                                                    .child(summary)
-                                                                    .into_any_element()
-                                                            } else {
-                                                                div().into_any_element()
-                                                            },
-                                                        )
-                                                        .child(meta_row)
-                                                        .when(!card_tags.is_empty(), |el| {
-                                                            el.child(div().flex().flex_wrap().gap(px(4.0)).children(card_tags))
-                                                        }),
-                                                );
+                                                                .child(if let Some(summary) = wrapped_summary {
+                                                                    div().font_family(UI_FONT).text_size(px(11.0))
+                                                                        .text_color(rgb(if is_sel { 0xDBEAFE } else { SUBTEXT1 }))
+                                                                        .child(summary).into_any_element()
+                                                                } else {
+                                                                    div().into_any_element()
+                                                                })
+                                                                .child(meta_row)
+                                                                .when(!card_tags.is_empty(), |el| {
+                                                                    el.child(div().flex().flex_wrap().gap(px(4.0)).children(card_tags))
+                                                                }),
+                                                        );
 
-                                            if is_selected { row = row.shadow_lg(); }
-                                            row.into_any_element()
-                                        })
-                                        .collect();
-
-                                    div()
-                                        .id("snippet-list-scroll")
-                                        .debug_selector(|| "snippet-list-scroll".to_string())
-                                        .flex_1()
-                                        .min_h(px(0.0))
-                                        .overflow_y_scroll()
-                                        .scrollbar_width(px(6.0))
-                                        .px(px(10.0))
-                                        .pb(px(10.0))
-                                        .flex()
-                                        .flex_col()
-                                        .gap(px(6.0))
-                                        .children(card_elements)
-                                        .into_any_element()
+                                                    if is_sel { row = row.shadow_lg(); }
+                                                    Some(row.into_any_element())
+                                                })
+                                                .collect::<Vec<_>>()
+                                        },
+                                    )
+                                    .debug_selector(|| "snippet-list-scroll".to_string())
+                                    .flex_1()
+                                    .min_h(px(0.0))
+                                    .px(px(10.0))
+                                    .pb(px(10.0))
+                                    .into_any_element()
                                 })
                                 .child(
                                     div()
