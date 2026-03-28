@@ -955,7 +955,7 @@ impl RootView {
                     break;
                 };
                 cx.background_executor()
-                    .timer(Duration::from_millis(40))
+                    .timer(Duration::from_millis(5))
                     .await;
                 let _ = this.update(cx, |view: &mut RootView, cx| {
                     if view.last_clipboard_sequence == Some(event.sequence_number) {
@@ -2491,24 +2491,6 @@ impl RootView {
     }
 
     fn on_key_down(&mut self, event: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        let root_ime_target = self.compute_root_ime_target();
-        {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(r"D:\NEXTCLOUD\Windows_app\ZWG_Terminal\ime-debug.log")
-            {
-                let _ = writeln!(
-                    f,
-                    "[ROOT] key={:?} tpl_editor={} root_ime={:?}",
-                    event.keystroke.key,
-                    self.template_editor.is_some(),
-                    root_ime_target,
-                );
-            }
-        }
-
         if self.template_editor.is_some() {
             return;
         }
@@ -2520,6 +2502,7 @@ impl RootView {
             return;
         }
 
+        let root_ime_target = self.root_ime_target;
         if root_ime_target.is_some() {
             if should_route_keystroke_via_text_input(&event.keystroke) {
                 return;
