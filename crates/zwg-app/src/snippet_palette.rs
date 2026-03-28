@@ -98,6 +98,24 @@ impl SnippetPaletteModel {
                 .filter(|record| record.section == SnippetSection::Template),
         );
 
+        // Deduplicate IDs: if two records share the same id, reassign a fresh UUID.
+        let mut seen_ids = HashSet::with_capacity(snippets.len());
+        let mut repaired = false;
+        for snippet in &mut snippets {
+            if !seen_ids.insert(snippet.id.clone()) {
+                let prefix = if snippet.section == SnippetSection::History {
+                    "history"
+                } else {
+                    "template"
+                };
+                snippet.id = format!("{}-{}", prefix, Uuid::new_v4().simple());
+                repaired = true;
+            }
+        }
+        if repaired {
+            log::warn!("Repaired duplicate snippet IDs in persisted data");
+        }
+
         let mut model = Self {
             snippets,
             active_section: SnippetSection::History,
@@ -107,6 +125,10 @@ impl SnippetPaletteModel {
             cached_visible_ids: None,
         };
         model.sync_selection();
+        if repaired {
+            model.persist_history();
+            model.persist_templates();
+        }
         model
     }
 
