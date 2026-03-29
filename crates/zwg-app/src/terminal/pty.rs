@@ -781,6 +781,10 @@ pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
         // Node preload TTY fix: patches process.stdout.isTTY = true
         // inside Bun SFE on Windows ConPTY (claude-code#26244)
         ("NODE_OPTIONS".to_string(), node_options),
+        // Auto-source the ZWG init script in new PowerShell panes.
+        // This provides the `env` shim (POSIX env command emulation)
+        // and the `claude` wrapper (--teammate-mode tmux injection).
+        ("ZWG_INIT_SCRIPT".to_string(), shim.join("zwg-claude-init.ps1").to_string_lossy().to_string()),
     ]
 }
 
