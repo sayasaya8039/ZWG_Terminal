@@ -11,6 +11,28 @@
 
 ---
 
+## Agent Configuration
+
+When spawning subagents, use the teammate system
+(team_name + name parameters) instead of worktree isolation.
+Do NOT use isolation: "worktree" — use teammates instead.
+
+### ZWG tmux 互換レイヤー（2026-03-29 実装済み）
+
+ZWG Terminal は tmux 互換の IPC レイヤーを内蔵しており、
+Claude Code の TeamCreate / teammate モードが動作します。
+
+**TeamCreate は ZWG 内で使用可能です。** 以下が自動設定されます:
+- `$TMUX` 環境変数（IPC接続文字列）
+- `--teammate-mode tmux` の自動注入（claude.cmd / PS wrapper）
+- `process.stdout.isTTY = true` パッチ（NODE_OPTIONS 経由）
+- tmux コマンドシム（split-window, send-keys, list-panes 等）
+
+グローバル CLAUDE.md の「TeamCreate は Windows では使用禁止」ルールは
+ZWG 内では**無効**です。ZWG の tmux シムが tmux コマンドを処理します。
+
+---
+
 ## 基本方針
 
 | ルール | 内容 |
@@ -23,7 +45,7 @@
 
 ---
 
-## Ghostty ビルドルール（Tier 0 — 最重要）
+## Ghostty ビルドルール（Tier 0 $2014 最重要）
 
 > **コード変更後は必ず最後にビルドを実行し、成功を確認すること。途中で止めない。**
 
