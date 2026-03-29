@@ -444,8 +444,8 @@ impl Default for WindowState {
         Self {
             x: 100.0,
             y: 100.0,
-            width: 1400.0,
-            height: 900.0,
+            width: 1200.0,
+            height: 540.0,
             maximized: false,
         }
     }
