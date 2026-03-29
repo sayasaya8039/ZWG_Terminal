@@ -4,10 +4,19 @@ use std::io::Write;
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
+
+/// Global channel for pane auto-close requests.
+/// TerminalPane sends its pane_id here when process exits and auto_close is true.
+static PANE_AUTO_CLOSE: OnceLock<flume::Sender<u32>> = OnceLock::new();
+
+/// Get the sender for auto-close requests. Returns None before IPC server init.
+pub fn pane_auto_close_sender() -> Option<&'static flume::Sender<u32>> {
+    PANE_AUTO_CLOSE.get()
+}
 
 use gpui::prelude::FluentBuilder;
 use gpui::*;
@@ -1001,6 +1010,30 @@ impl RootView {
         }
         log::info!("IPC server started for tmux compatibility");
 
+        // ── Auto-close listener: close panes whose process exited with auto_close ──
+        let (auto_close_tx, auto_close_rx) = flume::unbounded::<u32>();
+        PANE_AUTO_CLOSE.set(auto_close_tx).ok();
+        let this_close = cx.entity().downgrade();
+        cx.spawn(async move |_, cx: &mut AsyncApp| {
+            while let Ok(pane_id) = auto_close_rx.recv_async().await {
+                let _ = this_close.update(cx, |root_view: &mut RootView, cx| {
+                    // Collect split entities (cloned) before any mutable access
+                    let splits: Vec<_> = {
+                        let state = root_view.state.read(cx);
+                        state.tabs.iter().map(|t| t.split.clone()).collect()
+                    };
+                    for split in splits {
+                        let killed = split.update(cx, |sc, cx| sc.kill_pane_by_id(pane_id, cx));
+                        if killed {
+                            log::info!("auto-close: pane %{} (process exited)", pane_id);
+                            break;
+                        }
+                    }
+                });
+            }
+        })
+        .detach();
+
         let this = cx.entity().downgrade();
         cx.spawn(async move |_, cx: &mut AsyncApp| {
             while let Ok(cmd) = cmd_rx.recv_async().await {
@@ -1017,6 +1050,7 @@ impl RootView {
         match cmd {
             GpuiCommand::SplitWindow {
                 horizontal,
+                command,
                 resp_tx,
                 ..
             } => {
@@ -1025,6 +1059,7 @@ impl RootView {
                 } else {
                     SplitDirection::Vertical
                 };
+                let has_command = command.is_some();
                 let split = {
                     let state = self.state.read(cx);
                     let Some(s) = state.active_split().cloned() else {
@@ -1036,6 +1071,12 @@ impl RootView {
                 split.update(cx, |sc, cx| {
                     sc.split(direction, cx);
                     let pane_id = sc.focused_pane_id().unwrap_or(0);
+                    // Auto-close panes spawned with an explicit command (e.g. teammate agents)
+                    if has_command {
+                        if let Some(term) = sc.find_pane_by_id(pane_id) {
+                            term.update(cx, |tp, _| tp.set_auto_close(pane_id));
+                        }
+                    }
                     let _ = resp_tx.send(GpuiResponse::SplitOk { pane_id });
                 });
             }
@@ -1283,11 +1324,12 @@ impl RootView {
         cx.notify();
     }
 
-    fn close_settings_panel(&mut self, cx: &mut Context<Self>) {
+    fn close_settings_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_settings = false;
         self.keyboard_settings_active_text = None;
         self.ai_settings_active_text = None;
         self.refresh_global_key_bindings(cx);
+        self.focus_active_terminal(window, cx);
         cx.notify();
     }
 
@@ -2612,14 +2654,20 @@ impl RootView {
     fn render_modal_traffic_lights(&mut self, modal: &'static str, cx: &mut Context<Self>) -> Div {
         let close_modal = move |this: &mut RootView,
                                 _: &MouseDownEvent,
-                                _window: &mut Window,
+                                window: &mut Window,
                                 cx: &mut Context<RootView>| {
             match modal {
-                "shell" => this.show_shell_menu = false,
-                "settings" => this.show_settings = false,
-                _ => {}
+                "shell" => {
+                    this.show_shell_menu = false;
+                    cx.notify();
+                }
+                "settings" => {
+                    this.close_settings_panel(window, cx);
+                }
+                _ => {
+                    cx.notify();
+                }
             }
-            cx.notify();
         };
 
         div()
@@ -3715,8 +3763,8 @@ impl RootView {
                 .id("settings-panel")
                 .track_focus(&self.focus_handle)
                 .on_key_down(cx.listener(Self::on_key_down))
-                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, _window, cx| {
-                    this.close_settings_panel(cx);
+                .on_mouse_down_out(cx.listener(|this, _: &MouseDownEvent, window, cx| {
+                    this.close_settings_panel(window, cx);
                 }))
                 .absolute()
                 .top(px(top))

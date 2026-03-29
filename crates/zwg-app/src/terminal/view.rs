@@ -592,10 +592,18 @@ fn terminal_input_method_native_mode_active() -> bool {
         IME_CMODE_FULLSHAPE, IME_CMODE_NATIVE, IME_CONVERSION_MODE, IME_SENTENCE_MODE,
         ImmGetContext, ImmGetConversionStatus, ImmGetOpenStatus, ImmReleaseContext,
     };
-    use windows::Win32::UI::WindowsAndMessaging::GetForegroundWindow;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    use windows::Win32::System::Threading::GetCurrentProcessId;
 
     unsafe {
         let hwnd = GetForegroundWindow();
+        // Validate foreground window belongs to our process to avoid
+        // reading another application's IME context after Alt+Tab.
+        let mut window_pid: u32 = 0;
+        GetWindowThreadProcessId(hwnd, Some(&mut window_pid));
+        if window_pid != GetCurrentProcessId() {
+            return false;
+        }
         let himc = ImmGetContext(hwnd);
         if himc.0.is_null() {
             return false;
@@ -793,6 +801,11 @@ pub struct TerminalPane {
     /// Keystrokes buffered while PTY is still connecting (Pending state)
     pending_input: Vec<u8>,
     pending_process_exit_status: Option<i32>,
+    /// When true, the pane is automatically closed when the process exits.
+    /// Set for teammate panes spawned via IPC split-window with a command.
+    auto_close: bool,
+    /// Numeric pane ID for auto-close (set together with auto_close)
+    auto_close_pane_id: Option<u32>,
     /// Set by the blink timer to indicate only cursor visibility changed — no content refresh needed.
     cursor_blink_pending: bool,
     /// Cross-frame glyph layout cache — avoids reshaping unchanged glyphs every paint
@@ -802,6 +815,8 @@ pub struct TerminalPane {
     gpu_state: Option<Arc<Mutex<GpuTerminalState>>>,
     #[cfg(not(feature = "ghostty_vt"))]
     row_generations: Vec<u64>,
+    /// Subscription for focus-in listener (lazy-initialized in render)
+    _focus_in_sub: Option<gpui::Subscription>,
 }
 
 impl TerminalPane {
@@ -926,6 +941,13 @@ impl TerminalPane {
                         && this
                             .update(cx, |pane: &mut TerminalPane, _cx| {
                                 pane.pending_process_exit_status = process_exit_status;
+                                if pane.auto_close {
+                                    if let Some(pane_id) = pane.auto_close_pane_id {
+                                        if let Some(tx) = crate::app::pane_auto_close_sender() {
+                                            let _ = tx.send(pane_id);
+                                        }
+                                    }
+                                }
                             })
                             .is_err()
                     {
@@ -1146,12 +1168,15 @@ impl TerminalPane {
             recent_user_inputs: VecDeque::new(),
             pending_input: Vec::new(),
             pending_process_exit_status: None,
+            auto_close: false,
+            auto_close_pane_id: None,
             cursor_blink_pending: false,
             glyph_cache: Default::default(),
             #[cfg(feature = "ghostty_vt")]
             gpu_state: None,
             #[cfg(not(feature = "ghostty_vt"))]
             row_generations: vec![0; settings.rows as usize],
+            _focus_in_sub: None,
         }
     }
 
@@ -1199,6 +1224,12 @@ impl TerminalPane {
 
     pub fn take_process_exit_status(&mut self) -> Option<i32> {
         self.pending_process_exit_status.take()
+    }
+
+    /// Mark this pane for auto-close when its process exits.
+    pub fn set_auto_close(&mut self, pane_id: u32) {
+        self.auto_close = true;
+        self.auto_close_pane_id = Some(pane_id);
     }
 
     pub fn clear_history(&mut self) {
@@ -1727,6 +1758,19 @@ impl TerminalPane {
 
 impl Render for TerminalPane {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Lazy-init focus-in listener to reset stale IME state
+        if self._focus_in_sub.is_none() {
+            let sub = cx.on_focus_in(&self.focus_handle, window, |pane: &mut TerminalPane, _window, _cx| {
+                IME_VK_PROCESSKEY.store(false, Ordering::Release);
+                pane.ime_composing = false;
+                #[cfg(target_os = "windows")]
+                {
+                    // Drain stale composition queue
+                    let _ = take_ime_endcomposition_texts();
+                }
+            });
+            self._focus_in_sub = Some(sub);
+        }
         match &self.state {
             TerminalState::Pending => self.render_pending(cx).into_any_element(),
             TerminalState::Failed(err) => {
@@ -1871,13 +1915,17 @@ impl TerminalPane {
                     && elapsed <= Duration::from_millis(SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS)
             });
 
-        // Cap the deque to prevent unbounded growth
-        const MAX_RECENT_ENTRIES: usize = 32;
-        if self.recent_user_inputs.len() >= MAX_RECENT_ENTRIES {
-            self.recent_user_inputs.pop_front();
+        // Only record non-duplicate entries to prevent cascading false positives
+        // where a dropped ImeEndComposition entry causes the next legitimate
+        // TextCommit of the same character to be falsely detected as cross-route duplicate.
+        if !duplicate {
+            const MAX_RECENT_ENTRIES: usize = 32;
+            if self.recent_user_inputs.len() >= MAX_RECENT_ENTRIES {
+                self.recent_user_inputs.pop_front();
+            }
+            self.recent_user_inputs
+                .push_back((source, data.to_vec(), now));
         }
-        self.recent_user_inputs
-            .push_back((source, data.to_vec(), now));
 
         if duplicate && terminal_ime_trace_enabled() {
             log::debug!(
@@ -2106,6 +2154,9 @@ impl TerminalPane {
         }
 
         if should_route_keystroke_via_text_input(&event.keystroke) {
+            // Consume IME flag to prevent residual state if replace_text_in_range
+            // is not subsequently called by gpui (safety net).
+            IME_VK_PROCESSKEY.store(false, Ordering::Release);
             if self.clear_selection() {
                 cx.notify();
             }
