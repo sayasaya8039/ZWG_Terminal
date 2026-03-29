@@ -615,22 +615,48 @@ goto :eof
         // For PowerShell 7 sessions: create a profile snippet that defines
         // a `claude` function injecting --teammate-mode tmux automatically.
         let ps_profile_snippet = dir.join("zwg-claude-init.ps1");
-        let ps_content = r#"# ZWG Claude Code teammate-mode wrapper
-# Auto-injects --teammate-mode tmux when ZWG_CLAUDE_TEAMMATE_MODE is set
+        let ps_content = r#"# ZWG Claude Code integration for PowerShell 7
+# Provides env shim + claude teammate-mode wrapper
+
+# env shim: translates POSIX env VAR=val command to PowerShell
+# Required for Claude Code agent teams which spawn teammates with
+# env CLAUDECODE=1 ... claude.exe --agent-id ...
+function Global:env {
+    $v = @{}; $i = 0
+    while ($i -lt $args.Count) {
+        if ([string]$args[$i] -match '^([A-Za-z_]\w*)=(.*)$') {
+            $v[$Matches[1]] = $Matches[2]; $i++
+        } else { break }
+    }
+    if ($i -lt $args.Count) {
+        foreach ($e in $v.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($e.Key, $e.Value, 'Process')
+        }
+        $cmd = [string]$args[$i]
+        if ($cmd -match "^'(.+)'$") { $cmd = $Matches[1] }
+        $rest = @()
+        if ($i + 1 -lt $args.Count) {
+            $rest = @($args[($i+1)..($args.Count-1)])
+        }
+        & $cmd @rest
+    } elseif ($v.Count -gt 0) {
+        foreach ($e in $v.GetEnumerator()) {
+            [Environment]::SetEnvironmentVariable($e.Key, $e.Value, 'Process')
+        }
+    } else {
+        Get-ChildItem Env: | ForEach-Object { $_.Name + '=' + $_.Value }
+    }
+}
+
+# Claude teammate-mode wrapper
 if ($env:ZWG_CLAUDE_TEAMMATE_MODE) {
     function Global:claude {
-        if ($args -contains '--teammate-mode') {
-            & claude.exe @args
-        } else {
-            & claude.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args
-        }
+        if ($args -contains '--teammate-mode') { & claude.exe @args }
+        else { & claude.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args }
     }
     function Global:claude-code {
-        if ($args -contains '--teammate-mode') {
-            & claude-code.exe @args
-        } else {
-            & claude-code.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args
-        }
+        if ($args -contains '--teammate-mode') { & claude-code.exe @args }
+        else { & claude-code.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args }
     }
 }
 "#;
