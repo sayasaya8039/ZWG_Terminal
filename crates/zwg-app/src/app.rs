@@ -950,19 +950,35 @@ impl RootView {
 
         let this = cx.entity().downgrade();
         cx.spawn(async move |_, cx: &mut AsyncApp| {
+            // Debounce: skip rapid-fire clipboard events that arrive
+            // within 150ms of each other (Windows often fires multiple
+            // WM_CLIPBOARDUPDATE per single copy operation).
+            let mut last_processed = std::time::Instant::now()
+                - std::time::Duration::from_millis(200);
             loop {
                 let Ok(event) = event_rx.recv_async().await else {
                     break;
                 };
+                let now = std::time::Instant::now();
+                if now.duration_since(last_processed) < std::time::Duration::from_millis(150) {
+                    continue; // skip duplicate event
+                }
+                // Small delay to let clipboard settle
                 cx.background_executor()
-                    .timer(Duration::from_millis(5))
+                    .timer(Duration::from_millis(10))
                     .await;
+                last_processed = std::time::Instant::now();
                 let _ = this.update(cx, |view: &mut RootView, cx| {
                     if view.last_clipboard_sequence == Some(event.sequence_number) {
                         return;
                     }
                     view.last_clipboard_sequence = Some(event.sequence_number);
-                    view.capture_current_clipboard_to_history(false, cx);
+                    // Run snapshot on background thread to avoid blocking input
+                    let seq = event.sequence_number;
+                    let capture = snapshot_current_clipboard();
+                    if let Some(capture) = capture {
+                        view.handle_monitored_clipboard_capture(capture, false, cx);
+                    }
                 });
             }
         })
@@ -2153,7 +2169,11 @@ impl RootView {
             );
         }
 
-        cx.notify();
+        // Only trigger full re-render when snippet palette is visible.
+        // Background clipboard captures don't need to repaint the terminal.
+        if self.show_snippet_palette || show_notice {
+            cx.notify();
+        }
         true
     }
 
