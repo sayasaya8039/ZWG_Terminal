@@ -568,6 +568,8 @@ if defined _ZWG_CLAUDE_ACTIVE goto :passthrough
 setlocal
 if defined ZWG_TMUX_VALUE (set "_TMUX=%ZWG_TMUX_VALUE%") else (set "_TMUX=")
 set "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1"
+rem Apply TTY fix ONLY for claude (not globally via NODE_OPTIONS)
+if defined ZWG_TTY_FIX set "NODE_OPTIONS=--require=%ZWG_TTY_FIX%"
 call :find_target
 if not defined _TARGET (
   echo zwg: failed to find real %~n0 executable in PATH. 1>&2
@@ -575,20 +577,19 @@ if not defined _TARGET (
   exit /b 1
 )
 rem Auto-inject --teammate-mode tmux when ZWG_CLAUDE_TEAMMATE_MODE is set
-rem and user hasn't already specified --teammate-mode
 echo %* | findstr /C:"--teammate-mode" >nul 2>&1
 if errorlevel 1 if defined ZWG_CLAUDE_TEAMMATE_MODE (
   if defined _TMUX (
-    endlocal & set "TMUX=%_TMUX%" & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" --teammate-mode tmux %*
+    endlocal & set "TMUX=%_TMUX%" & set "NODE_OPTIONS=%NODE_OPTIONS%" & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" --teammate-mode tmux %*
   ) else (
-    endlocal & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" --teammate-mode tmux %*
+    endlocal & set "NODE_OPTIONS=%NODE_OPTIONS%" & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" --teammate-mode tmux %*
   )
   exit /b %ERRORLEVEL%
 )
 if defined _TMUX (
-  endlocal & set "TMUX=%_TMUX%" & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" %*
+  endlocal & set "TMUX=%_TMUX%" & set "NODE_OPTIONS=%NODE_OPTIONS%" & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" %*
 ) else (
-  endlocal & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" %*
+  endlocal & set "NODE_OPTIONS=%NODE_OPTIONS%" & set "_ZWG_CLAUDE_ACTIVE=1" & "%_TARGET%" %*
 )
 exit /b %ERRORLEVEL%
 :passthrough
@@ -648,15 +649,23 @@ function Global:env {
     }
 }
 
-# Claude teammate-mode wrapper
+# Claude teammate-mode wrapper (sets NODE_OPTIONS only for claude, not globally)
 if ($env:ZWG_CLAUDE_TEAMMATE_MODE) {
     function Global:claude {
-        if ($args -contains '--teammate-mode') { & claude.exe @args }
-        else { & claude.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args }
+        $savedNodeOpts = $env:NODE_OPTIONS
+        if ($env:ZWG_TTY_FIX) { $env:NODE_OPTIONS = "--require=$env:ZWG_TTY_FIX" }
+        try {
+            if ($args -contains '--teammate-mode') { & claude.exe @args }
+            else { & claude.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args }
+        } finally { $env:NODE_OPTIONS = $savedNodeOpts }
     }
     function Global:claude-code {
-        if ($args -contains '--teammate-mode') { & claude-code.exe @args }
-        else { & claude-code.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args }
+        $savedNodeOpts = $env:NODE_OPTIONS
+        if ($env:ZWG_TTY_FIX) { $env:NODE_OPTIONS = "--require=$env:ZWG_TTY_FIX" }
+        try {
+            if ($args -contains '--teammate-mode') { & claude-code.exe @args }
+            else { & claude-code.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args }
+        } finally { $env:NODE_OPTIONS = $savedNodeOpts }
     }
 }
 "#;
@@ -754,9 +763,8 @@ pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
     let hook_cmd = hook_cmd_path.to_string_lossy().to_string();
 
     // Create TTY fix preload script (claude-code#26244 workaround):
-    // Bun SFE on Windows reports process.stdout.isTTY as undefined even
-    // inside ConPTY. This preload patches it to true so Claude Code
-    // accepts --teammate-mode tmux.
+    // Only used by the claude.cmd/PS wrapper, NOT via global NODE_OPTIONS
+    // (which would slow down every Node.js/Bun process in the terminal).
     let tty_fix_path = shim.join("zwg-fix-tty.js");
     if !tty_fix_path.exists() {
         let _ = std::fs::write(
@@ -770,18 +778,6 @@ pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
         );
     }
     let tty_fix_str = tty_fix_path.to_string_lossy().to_string();
-
-    // Build NODE_OPTIONS: append --require for the TTY fix preload.
-    // Preserve any existing NODE_OPTIONS the user may have set.
-    let existing_node_opts = std::env::var("NODE_OPTIONS").unwrap_or_default();
-    let require_flag = format!("--require={}", tty_fix_str);
-    let node_options = if existing_node_opts.contains(&require_flag) {
-        existing_node_opts
-    } else if existing_node_opts.is_empty() {
-        require_flag
-    } else {
-        format!("{} {}", existing_node_opts, require_flag)
-    };
 
     vec![
         ("ZWG".to_string(), "1".to_string()),
@@ -804,9 +800,9 @@ pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
         // but honours --teammate-mode tmux CLI flag. PowerShell env-shim
         // claude wrapper auto-injects the flag when this var is set.
         ("ZWG_CLAUDE_TEAMMATE_MODE".to_string(), "tmux".to_string()),
-        // Node preload TTY fix: patches process.stdout.isTTY = true
-        // inside Bun SFE on Windows ConPTY (claude-code#26244)
-        ("NODE_OPTIONS".to_string(), node_options),
+        // Path to TTY fix script — used by claude.cmd/PS wrapper ONLY.
+        // NOT set via NODE_OPTIONS to avoid slowing all Node/Bun processes.
+        ("ZWG_TTY_FIX".to_string(), tty_fix_str),
         // Auto-source the ZWG init script in new PowerShell panes.
         // This provides the `env` shim (POSIX env command emulation)
         // and the `claude` wrapper (--teammate-mode tmux injection).
