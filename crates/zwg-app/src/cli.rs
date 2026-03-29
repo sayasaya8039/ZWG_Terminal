@@ -509,25 +509,18 @@ fn run_split_window(
     // Always print pane info when -P or -F is specified.
     // Claude Code uses `split-window -F '#{pane_id}'` and expects stdout output.
     let should_print = print_info || format.is_some();
-    eprintln!("[zwg-debug] split-window: print_info={} format={:?} should_print={}", print_info, format, should_print);
 
     let req = IpcRequest { id: 1, command: "split-window".into(), args };
     match send_ipc_request(&req) {
         Ok(resp) if resp.success => {
-            eprintln!("[zwg-debug] split-window OK: data={}", resp.data);
             if should_print {
                 let id_str = resp.data.get("pane_id").and_then(|v| v.as_str()).unwrap_or("%0");
                 let id_num: u32 = id_str.trim_start_matches('%').parse().unwrap_or(0);
-                let output = format.as_deref().map(|f| fmt_default(f, id_num)).unwrap_or_else(|| id_str.into());
-                eprintln!("[zwg-debug] printing: {}", output);
-                println!("{}", output);
+                println!("{}", format.as_deref().map(|f| fmt_default(f, id_num)).unwrap_or_else(|| id_str.into()));
             }
             std::process::exit(0);
         }
-        Ok(resp) => {
-            eprintln!("[zwg-debug] split-window failed: {:?}", resp.error);
-            eprint_and_exit(resp.error);
-        }
+        Ok(resp) => { eprint_and_exit(resp.error); }
         Err(e) => { eprintln!("zwg: failed to connect to server: {}", e); std::process::exit(1); }
     }
 }
