@@ -610,10 +610,20 @@ fn send_ipc_request(request: &IpcRequest) -> anyhow::Result<IpcResponse> {
     send_ipc_named_pipe(request).or_else(|_| send_ipc_tcp(request))
 }
 
+/// Parse the $TMUX env var to extract the IPC endpoint.
+/// Format: "<pipe_or_socket>,<pid>,<session>"  e.g. "\\.\pipe\zwg,5678,0"
+fn ipc_endpoint_from_env() -> Option<String> {
+    std::env::var("TMUX")
+        .ok()
+        .and_then(|v| v.split(',').next().map(|s| s.to_string()))
+        .filter(|s| !s.is_empty())
+}
+
 fn send_ipc_named_pipe(request: &IpcRequest) -> anyhow::Result<IpcResponse> {
+    let pipe_name = ipc_endpoint_from_env().unwrap_or_else(|| r"\\.\pipe\zwg".to_string());
     let mut pipe = std::fs::OpenOptions::new().read(true).write(true)
-        .open(r"\\.\pipe\zwg")
-        .map_err(|e| anyhow::anyhow!("named pipe not available: {}", e))?;
+        .open(&pipe_name)
+        .map_err(|e| anyhow::anyhow!("named pipe {} not available: {}", pipe_name, e))?;
     let json = serde_json::to_string(request)?;
     writeln!(pipe, "{}", json)?;
     pipe.flush()?;
@@ -628,8 +638,14 @@ fn send_ipc_named_pipe(request: &IpcRequest) -> anyhow::Result<IpcResponse> {
 
 fn send_ipc_tcp(request: &IpcRequest) -> anyhow::Result<IpcResponse> {
     use std::net::TcpStream;
-    let mut stream = TcpStream::connect("127.0.0.1:51985")
-        .map_err(|e| anyhow::anyhow!("cannot connect to zwg (is it running?): {}", e))?;
+    // Route to correct port based on $TMUX: smux=51983, zwg=51985
+    let tcp_port = match ipc_endpoint_from_env().as_deref() {
+        Some(r"\\.\pipe\smux") => 51983,
+        _ => 51985,
+    };
+    let addr = format!("127.0.0.1:{}", tcp_port);
+    let mut stream = TcpStream::connect(&addr)
+        .map_err(|e| anyhow::anyhow!("cannot connect to {} (is it running?): {}", addr, e))?;
     stream.set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
     stream.set_write_timeout(Some(std::time::Duration::from_secs(20)))?;
     let json = serde_json::to_string(request)?;
