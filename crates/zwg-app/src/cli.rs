@@ -24,7 +24,8 @@ pub enum CliCommand {
     Gui,
     SplitWindow {
         horizontal: bool, start_directory: Option<String>,
-        command: Vec<String>, print_info: bool, format: Option<String>,
+        command: Vec<String>, env: Vec<(String, String)>,
+        print_info: bool, format: Option<String>,
     },
     SendKeys { target: Option<String>, keys: Vec<String> },
     ListPanes { format: Option<String> },
@@ -97,6 +98,7 @@ fn skip_global_flags(args: &[String]) -> Vec<String> {
 fn parse_split_window(args: &[String]) -> CliCommand {
     let (mut horiz, mut dir, mut cmd, mut pr, mut fmt) =
         (false, None, Vec::new(), false, None);
+    let mut env = Vec::new();
     let mut after_sep = false;
     let mut i = 0;
     while i < args.len() {
@@ -111,6 +113,21 @@ fn parse_split_window(args: &[String]) -> CliCommand {
             s if s.starts_with("-F") && s.len() > 2 => { fmt = Some(s[2..].into()); i += 1; }
             "-c" => { dir = args.get(i+1).cloned(); i += 2; }
             s if s.starts_with("-c") && s.len() > 2 => { dir = Some(s[2..].into()); i += 1; }
+            // Parse -e KEY=VALUE (tmux env var flag for team_name etc.)
+            "-e" => {
+                if let Some(kv) = args.get(i+1) {
+                    if let Some((k, v)) = kv.split_once('=') {
+                        env.push((k.to_string(), v.to_string()));
+                    }
+                    i += 2;
+                } else { i += 1; }
+            }
+            s if s.starts_with("-e") && s.len() > 2 => {
+                if let Some((k, v)) = s[2..].split_once('=') {
+                    env.push((k.to_string(), v.to_string()));
+                }
+                i += 1;
+            }
             "-d" | "-b" => { i += 1; }
             "-l" | "-p" => { i += 2; }
             s if s.starts_with("-l") || s.starts_with("-p") => { i += 1; }
@@ -120,7 +137,8 @@ fn parse_split_window(args: &[String]) -> CliCommand {
         }
     }
     CliCommand::SplitWindow {
-        horizontal: horiz, start_directory: dir, command: cmd, print_info: pr, format: fmt,
+        horizontal: horiz, start_directory: dir, command: cmd, env,
+        print_info: pr, format: fmt,
     }
 }
 
@@ -305,8 +323,8 @@ pub fn run_client(command: CliCommand) -> ! {
         CliCommand::DisplayMessage { print_stdout, format } => {
             run_display_message(print_stdout, format);
         }
-        CliCommand::SplitWindow { horizontal, start_directory, command, print_info, format } => {
-            run_split_window(horizontal, start_directory.as_deref(), &command, print_info, format);
+        CliCommand::SplitWindow { horizontal, start_directory, command, env, print_info, format } => {
+            run_split_window(horizontal, start_directory.as_deref(), &command, &env, print_info, format);
         }
         CliCommand::SendKeys { target, keys } => {
             let mut a = Vec::new();
@@ -499,11 +517,14 @@ fn run_list_windows(format: Option<String>) -> ! {
 
 fn run_split_window(
     horizontal: bool, start_dir: Option<&str>, command: &[String],
+    env: &[(String, String)],
     print_info: bool, format: Option<String>,
 ) -> ! {
     let mut args = Vec::new();
     if horizontal { args.push("-h".into()); }
     if let Some(d) = start_dir { args.push("-c".into()); args.push(d.into()); }
+    // Forward -e KEY=VALUE flags so IPC bridge handler can parse them
+    for (k, v) in env { args.push("-e".into()); args.push(format!("{}={}", k, v)); }
     if !command.is_empty() { args.push("--".into()); args.extend_from_slice(command); }
 
     // Always print pane info when -P or -F is specified.

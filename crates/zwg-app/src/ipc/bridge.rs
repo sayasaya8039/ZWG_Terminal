@@ -105,6 +105,7 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
         let horizontal = req.args.iter().any(|a| a == "-h");
         let mut working_directory = None;
         let mut command_parts = Vec::new();
+        let mut env_vars: Vec<(String, String)> = Vec::new();
         let mut after_separator = false;
         let mut i = 0usize;
 
@@ -130,6 +131,24 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
                 }
                 s if s.starts_with("-c") && s.len() > 2 => {
                     working_directory = Some(s[2..].to_string());
+                    i += 1;
+                }
+                // Parse -e KEY=VALUE (tmux env var flag for team_name etc.)
+                "-e" => {
+                    if let Some(kv) = req.args.get(i + 1) {
+                        if let Some((k, v)) = kv.split_once('=') {
+                            env_vars.push((k.to_string(), v.to_string()));
+                        }
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                s if s.starts_with("-e") && s.len() > 2 => {
+                    let kv = &s[2..];
+                    if let Some((k, v)) = kv.split_once('=') {
+                        env_vars.push((k.to_string(), v.to_string()));
+                    }
                     i += 1;
                 }
                 "-h" | "-v" | "-d" | "-b" | "-f" | "-P" => {
@@ -164,7 +183,7 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
             horizontal,
             working_directory,
             command,
-            env: Vec::new(),
+            env: env_vars,
             resp_tx,
         };
 

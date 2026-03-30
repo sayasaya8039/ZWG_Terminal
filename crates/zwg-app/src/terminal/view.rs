@@ -506,6 +506,48 @@ fn install_ime_hook() {
 #[cfg(not(target_os = "windows"))]
 fn install_ime_hook() {}
 
+/// Read clipboard text using native Windows API as fallback when GPUI fails.
+#[cfg(target_os = "windows")]
+fn read_clipboard_native_text() -> Option<String> {
+    use windows::Win32::Foundation::HGLOBAL;
+    use windows::Win32::System::DataExchange::{
+        CloseClipboard, GetClipboardData, OpenClipboard,
+    };
+    use windows::Win32::System::Memory::{GlobalLock, GlobalSize, GlobalUnlock};
+    use windows::Win32::System::Ole::CF_UNICODETEXT;
+
+    unsafe {
+        if OpenClipboard(None).is_err() {
+            return None;
+        }
+        let result = (|| {
+            let global = HGLOBAL(GetClipboardData(CF_UNICODETEXT.0 as u32).ok()?.0);
+            let size = GlobalSize(global);
+            if size == 0 {
+                return None;
+            }
+            let ptr = GlobalLock(global);
+            if ptr.is_null() {
+                return None;
+            }
+            let u16_count = size / 2;
+            let slice = std::slice::from_raw_parts(ptr as *const u16, u16_count);
+            // Find null terminator
+            let len = slice.iter().position(|&c| c == 0).unwrap_or(u16_count);
+            let text = String::from_utf16_lossy(&slice[..len]);
+            let _ = GlobalUnlock(global);
+            if text.is_empty() { None } else { Some(text) }
+        })();
+        let _ = CloseClipboard();
+        result
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn read_clipboard_native_text() -> Option<String> {
+    None
+}
+
 fn normalize_terminal_newlines(text: &str) -> Vec<u8> {
     let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
     normalized.into_bytes()
@@ -665,6 +707,37 @@ fn should_defer_keystroke_to_ime_with_state(
     }
 
     if !ime_native_mode_active {
+        return false;
+    }
+
+    // 制御キーはIME処理と無関係 → deferせずターミナル直通
+    if matches!(
+        ks.key.as_ref(),
+        "escape"
+            | "tab"
+            | "up"
+            | "down"
+            | "left"
+            | "right"
+            | "home"
+            | "end"
+            | "pageup"
+            | "pagedown"
+            | "delete"
+            | "insert"
+            | "f1"
+            | "f2"
+            | "f3"
+            | "f4"
+            | "f5"
+            | "f6"
+            | "f7"
+            | "f8"
+            | "f9"
+            | "f10"
+            | "f11"
+            | "f12"
+    ) {
         return false;
     }
 
@@ -835,6 +908,9 @@ impl TerminalPane {
         let shell_owned = shell.to_string();
         let initial_cols = settings.cols;
         let initial_rows = settings.rows;
+        // Pre-compute env vars on UI thread (requires IPC connection string)
+        let pane_id = crate::split::next_pane_id();
+        let env = crate::terminal::pty::zwg_env_vars(pane_id);
         cx.spawn(
             async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
                 // Run ConPTY creation on background executor (off UI thread)
@@ -846,7 +922,7 @@ impl TerminalPane {
                             shell: shell_for_spawn,
                             cols: initial_cols,
                             rows: initial_rows,
-                            env: Vec::new(),
+                            env,
                         };
                         spawn_pty(config)
                     })
@@ -2002,7 +2078,13 @@ impl TerminalPane {
     }
 
     fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
-        let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+        // Try GPUI clipboard first, fall back to native Windows API
+        let text = cx
+            .read_from_clipboard()
+            .and_then(|item| item.text())
+            .or_else(|| read_clipboard_native_text());
+
+        let Some(text) = text else {
             return false;
         };
 
@@ -2235,11 +2317,16 @@ impl TerminalPane {
             return;
         }
 
-        if should_copy_selection_on_right_click(self.selection_range())
-            && self.copy_selection_to_clipboard(cx)
-        {
-            cx.stop_propagation();
+        if should_copy_selection_on_right_click(self.selection_range()) {
+            // Selection exists → copy
+            let _ = self.copy_selection_to_clipboard(cx);
+        } else {
+            // No selection → paste from clipboard
+            if self.paste_from_clipboard(cx) {
+                cx.notify();
+            }
         }
+        cx.stop_propagation();
     }
 
     fn on_mouse_move(
@@ -2416,7 +2503,7 @@ impl EntityInputHandler for TerminalPane {
         _range: Option<Range<usize>>,
         text: &str,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         if self.input_suppressed.load(Ordering::Relaxed) {
             return;
@@ -2439,6 +2526,11 @@ impl EntityInputHandler for TerminalPane {
         let should_forward = should_forward_replace_text_to_terminal(text, was_composing);
         self.ime_composing = false;
         IME_VK_PROCESSKEY.store(false, Ordering::Release);
+
+        // Flush any pending IME queue entries before writing the TextCommit,
+        // so that duplicate detection can properly suppress the queue duplicate.
+        self.flush_ime_endcomposition_queue();
+
         if terminal_ime_trace_enabled() {
             log::debug!(
                 "IME_TERM replace_text_in_range forward={} composing_before_reset={}",
@@ -2450,6 +2542,8 @@ impl EntityInputHandler for TerminalPane {
             return;
         }
         self.write_user_input_text(UserInputSource::TextCommit, text);
+        // Trigger re-render so terminal displays the PTY echo promptly
+        cx.notify();
     }
 
     /// Preedit (composing) text from IME — currently not displayed,
@@ -2460,7 +2554,7 @@ impl EntityInputHandler for TerminalPane {
         _new_text: &str,
         _new_selected: Option<Range<usize>>,
         _window: &mut Window,
-        _cx: &mut Context<Self>,
+        cx: &mut Context<Self>,
     ) {
         if terminal_ime_trace_enabled() {
             log::debug!(
@@ -2472,8 +2566,13 @@ impl EntityInputHandler for TerminalPane {
         if self.input_suppressed.load(Ordering::Relaxed) {
             return;
         }
+        let was_composing = self.ime_composing;
         self.ime_composing = !_new_text.is_empty();
         IME_VK_PROCESSKEY.store(false, Ordering::Release);
+        // Notify so that the next render cycle flushes any pending IME queue
+        if was_composing != self.ime_composing {
+            cx.notify();
+        }
     }
 
     fn bounds_for_range(

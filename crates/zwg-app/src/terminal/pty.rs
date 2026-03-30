@@ -658,6 +658,8 @@ if ($env:ZWG_CLAUDE_TEAMMATE_MODE) {
             if ($args -contains '--teammate-mode') { & claude.exe @args }
             else { & claude.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args }
         } finally { $env:NODE_OPTIONS = $savedNodeOpts }
+        # Auto-exit shell when teammate pane's claude process finishes
+        if ($args -contains '--teammate-mode') { exit $LASTEXITCODE }
     }
     function Global:claude-code {
         $savedNodeOpts = $env:NODE_OPTIONS
@@ -666,11 +668,49 @@ if ($env:ZWG_CLAUDE_TEAMMATE_MODE) {
             if ($args -contains '--teammate-mode') { & claude-code.exe @args }
             else { & claude-code.exe --teammate-mode $env:ZWG_CLAUDE_TEAMMATE_MODE @args }
         } finally { $env:NODE_OPTIONS = $savedNodeOpts }
+        if ($args -contains '--teammate-mode') { exit $LASTEXITCODE }
     }
 }
 "#;
         std::fs::write(&ps_profile_snippet, ps_content)?;
         log::info!("PowerShell claude init snippet written to {:?}", ps_profile_snippet);
+    }
+
+    // ── Auto-configure PowerShell 7 profile to source zwg-claude-init.ps1 ──
+    #[cfg(windows)]
+    {
+        if let Some(docs) = dirs::document_dir() {
+            let ps_profile = docs
+                .join("PowerShell")
+                .join("Microsoft.PowerShell_profile.ps1");
+            let marker = "# zwg/psmux env-shim";
+            let snippet = format!(
+                "\n{marker}: auto-load when inside a tmux-compatible terminal\n\
+                 if (($env:TMUX -or $env:ZWG) -and (Test-Path \"$env:LOCALAPPDATA\\zwg\\bin\\zwg-claude-init.ps1\")) {{\n\
+                 \x20\x20\x20\x20. \"$env:LOCALAPPDATA\\zwg\\bin\\zwg-claude-init.ps1\"\n\
+                 }}\n"
+            );
+            if let Ok(existing) = std::fs::read_to_string(&ps_profile) {
+                if !existing.contains(marker) {
+                    let updated = format!("{}{}", existing, snippet);
+                    if let Err(e) = std::fs::write(&ps_profile, updated) {
+                        eprintln!("zwg: failed to update PS profile: {}", e);
+                    } else {
+                        log::info!("PowerShell profile updated: {:?}", ps_profile);
+                    }
+                }
+            } else {
+                // Profile doesn't exist yet — create it
+                if let Some(parent) = ps_profile.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Err(e) = std::fs::write(&ps_profile, &snippet) {
+                    eprintln!("zwg: failed to create PS profile: {}", e);
+                } else {
+                    log::info!("PowerShell profile created: {:?}", ps_profile);
+                }
+            }
+        }
     }
 
     #[cfg(not(windows))]
@@ -800,6 +840,7 @@ pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
         // but honours --teammate-mode tmux CLI flag. PowerShell env-shim
         // claude wrapper auto-injects the flag when this var is set.
         ("ZWG_CLAUDE_TEAMMATE_MODE".to_string(), "tmux".to_string()),
+        ("ZWG_REQUIRE_TEAM_NAME".to_string(), "1".to_string()),
         // Path to TTY fix script — used by claude.cmd/PS wrapper ONLY.
         // NOT set via NODE_OPTIONS to avoid slowing all Node/Bun processes.
         ("ZWG_TTY_FIX".to_string(), tty_fix_str),
