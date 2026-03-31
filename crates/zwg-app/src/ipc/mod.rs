@@ -235,80 +235,11 @@ impl IpcServer {
         pipe: windows::Win32::Foundation::HANDLE,
         handlers: &Arc<Mutex<HashMap<String, CommandHandler>>>,
     ) {
-        use windows::Win32::Storage::FileSystem::{FlushFileBuffers, ReadFile, WriteFile};
-
-        let mut read_buf = [0u8; 8192];
-        let mut bytes_read: u32 = 0;
-
-        loop {
-            let success =
-                unsafe { ReadFile(pipe, Some(&mut read_buf), Some(&mut bytes_read), None) };
-
-            if success.is_err() || bytes_read == 0 {
-                break;
-            }
-
-            let data = &read_buf[..bytes_read as usize];
-
-            // Process each line (JSON-RPC style)
-            for line in data.split(|&b| b == b'\n') {
-                let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
-                if line.is_empty() {
-                    continue;
-                }
-
-                let line_str = match std::str::from_utf8(line) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-
-                let request: IpcRequest = match serde_json::from_str(line_str) {
-                    Ok(r) => r,
-                    Err(e) => {
-                        let resp = IpcResponse::err(0, &format!("Invalid JSON: {}", e));
-                        let resp_json = format!(
-                            "{}\n",
-                            serde_json::to_string(&resp).unwrap_or_else(|e| format!(
-                                "{{\"error\":\"serialization: {}\"}}",
-                                e
-                            ))
-                        );
-                        let resp_bytes = resp_json.as_bytes();
-                        let mut written: u32 = 0;
-                        unsafe {
-                            WriteFile(pipe, Some(resp_bytes), Some(&mut written), None).ok();
-                            FlushFileBuffers(pipe).ok();
-                        }
-                        continue;
-                    }
-                };
-
-                let response = {
-                    let handlers = handlers.lock().unwrap_or_else(|e| e.into_inner());
-                    match handlers.get(&request.command) {
-                        Some(h) => h(&request),
-                        None => IpcResponse::err(
-                            request.id,
-                            &format!("Unknown command: {}", request.command),
-                        ),
-                    }
-                };
-
-                let resp_json = format!(
-                    "{}\n",
-                    serde_json::to_string(&response).unwrap_or_else(|e| format!(
-                        "{{\"error\":\"serialization: {}\"}}",
-                        e
-                    ))
-                );
-                let resp_bytes = resp_json.as_bytes();
-                let mut written: u32 = 0;
-                unsafe {
-                    WriteFile(pipe, Some(resp_bytes), Some(&mut written), None).ok();
-                    FlushFileBuffers(pipe).ok();
-                }
-            }
-        }
+        // Wrap the raw HANDLE in a Read/Write adapter so we can use BufReader
+        // for proper line-based reading (fixes message fragmentation bug).
+        let reader = NamedPipeReader(pipe);
+        let writer = NamedPipeWriter(pipe);
+        Self::handle_connection(BufReader::new(reader), writer, handlers);
     }
 
     #[cfg(windows)]
@@ -351,12 +282,21 @@ impl IpcServer {
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
-                Err(_) => break,
+                Err(e) => {
+                    log::warn!("[IPC] connection read error: {}", e);
+                    break;
+                }
             };
+
+            if line.trim().is_empty() {
+                continue;
+            }
 
             let request: IpcRequest = match serde_json::from_str(&line) {
                 Ok(r) => r,
                 Err(e) => {
+                    let preview: String = line.chars().take(200).collect();
+                    log::error!("[IPC] invalid JSON (len={}): {} | data: {}", line.len(), e, preview);
                     let resp = IpcResponse::err(0, &format!("Invalid JSON: {}", e));
                     let _ = writeln!(
                         writer,
@@ -366,6 +306,7 @@ impl IpcServer {
                             e
                         ))
                     );
+                    let _ = writer.flush();
                     continue;
                 }
             };
@@ -389,6 +330,7 @@ impl IpcServer {
                     e
                 ))
             );
+            let _ = writer.flush();
         }
     }
 
@@ -412,6 +354,71 @@ impl IpcServer {
         {
             Self::socket_path().to_string_lossy().to_string()
         }
+    }
+}
+
+// ── Named Pipe Read/Write wrappers (Windows only) ──────────────────────────
+//
+// These wrap a raw Windows HANDLE in `std::io::Read` / `std::io::Write` so
+// that `BufReader::lines()` can be used for proper line-buffered IPC reading,
+// identical to the TCP and Unix socket paths.
+
+/// Wrapper to implement `std::io::Read` for a Windows Named Pipe HANDLE.
+#[cfg(windows)]
+struct NamedPipeReader(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for NamedPipeReader {}
+
+#[cfg(windows)]
+impl std::io::Read for NamedPipeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use windows::Win32::Storage::FileSystem::ReadFile;
+
+        let mut bytes_read: u32 = 0;
+        let result = unsafe { ReadFile(self.0, Some(buf), Some(&mut bytes_read), None) };
+
+        match result {
+            Ok(()) => Ok(bytes_read as usize),
+            Err(e) => {
+                // ERROR_BROKEN_PIPE (109) means client disconnected — treat as EOF
+                let os_err = std::io::Error::last_os_error();
+                if os_err.raw_os_error() == Some(109) {
+                    Ok(0)
+                } else {
+                    log::warn!("[IPC] named pipe ReadFile error: {} (win32: {})", os_err, e);
+                    Err(os_err)
+                }
+            }
+        }
+    }
+}
+
+/// Wrapper to implement `std::io::Write` for a Windows Named Pipe HANDLE.
+#[cfg(windows)]
+struct NamedPipeWriter(windows::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for NamedPipeWriter {}
+
+#[cfg(windows)]
+impl std::io::Write for NamedPipeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        use windows::Win32::Storage::FileSystem::WriteFile;
+
+        let mut written: u32 = 0;
+        let result = unsafe { WriteFile(self.0, Some(buf), Some(&mut written), None) };
+
+        match result {
+            Ok(()) => Ok(written as usize),
+            Err(_) => Err(std::io::Error::last_os_error()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        use windows::Win32::Storage::FileSystem::FlushFileBuffers;
+
+        unsafe { FlushFileBuffers(self.0) }.map_err(|_| std::io::Error::last_os_error())
     }
 }
 

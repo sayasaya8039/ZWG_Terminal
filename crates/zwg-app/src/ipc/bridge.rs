@@ -73,9 +73,11 @@ pub type CommandSender = flume::Sender<GpuiCommand>;
 /// Type alias for the command channel receiver
 pub type CommandReceiver = flume::Receiver<GpuiCommand>;
 
-/// Create a bounded command channel for IPC->GPUI bridge
+/// Create a bounded command channel for IPC→GPUI bridge.
+/// Capacity 128 to prevent backpressure when many teammate agents send
+/// IPC commands concurrently (e.g., 8+ Claude Code agents in a team).
 pub fn create_channel() -> (CommandSender, CommandReceiver) {
-    flume::bounded(32)
+    flume::bounded(128)
 }
 
 /// Parse `-t %N` or `-t%N` target pane ID from args, returning (pane_id, remaining_args)
