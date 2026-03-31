@@ -47,6 +47,8 @@ pub struct SplitContainer {
     shell: String,
     terminal_settings: TerminalSettings,
     resize_drag: Option<ResizeDragState>,
+    /// When true, only the focused leaf is rendered (zoom mode)
+    maximized: bool,
 }
 
 /// SmallVec with inline capacity 8 — typical split depth rarely exceeds 8
@@ -69,6 +71,7 @@ impl SplitContainer {
             shell: shell.to_string(),
             terminal_settings,
             resize_drag: None,
+            maximized: false,
         }
     }
 
@@ -178,6 +181,37 @@ impl SplitContainer {
     }
 
     /// Close the focused pane. Returns false if it's the last pane.
+    /// Toggle maximize (zoom) for the focused pane
+    pub fn toggle_maximize(&mut self, cx: &mut Context<Self>) {
+        self.maximized = !self.maximized;
+        cx.notify();
+    }
+
+    /// Find a terminal entity by leaf UUID
+    fn find_terminal_by_id(&self, id: Uuid) -> Option<&Entity<TerminalPane>> {
+        Self::find_terminal_in_node(&self.root, id)
+    }
+
+    fn find_terminal_in_node(node: &SplitNode, id: Uuid) -> Option<&Entity<TerminalPane>> {
+        match node {
+            SplitNode::Leaf {
+                id: leaf_id,
+                terminal,
+                ..
+            } => {
+                if *leaf_id == id {
+                    Some(terminal)
+                } else {
+                    None
+                }
+            }
+            SplitNode::Branch { first, second, .. } => {
+                Self::find_terminal_in_node(first, id)
+                    .or_else(|| Self::find_terminal_in_node(second, id))
+            }
+        }
+    }
+
     pub fn close_focused(&mut self, cx: &mut Context<Self>) -> bool {
         let target_id = self.focused_id;
 
@@ -571,6 +605,25 @@ fn leaf_border_style(is_focused: bool) -> (u8, u32) {
 impl Render for SplitContainer {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused_id = self.focused_id;
+
+        // In maximized mode, render only the focused leaf
+        if self.maximized {
+            if let Some(terminal) = self.find_terminal_by_id(focused_id) {
+                return div()
+                    .size_full()
+                    .child(terminal.clone())
+                    .on_mouse_move(cx.listener(|_, _, _, _| {}))
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, _| {}),
+                    )
+                    .on_mouse_up_out(
+                        MouseButton::Left,
+                        cx.listener(|_, _, _, _| {}),
+                    );
+            }
+        }
+
         let empty_path: BranchPath = SmallVec::new();
         Self::render_node(&self.root, focused_id, cx.entity().clone(), &empty_path)
             .on_mouse_move(cx.listener(|this, ev: &MouseMoveEvent, window, cx| {

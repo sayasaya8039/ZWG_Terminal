@@ -304,6 +304,7 @@ actions!(
         SplitRight,
         SplitDown,
         ClosePane,
+        MaximizePane,
         FocusNext,
         FocusPrev,
         OpenSettings,

@@ -53,7 +53,8 @@ use crate::template_editor::{TemplateEditorModal, TemplateEditorOutcome};
 use crate::terminal::TerminalSettings;
 use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
 use crate::{
-    ClosePane, CloseTab, FocusNext, FocusPrev, NewTab, OpenSettings, Quit, SplitDown, SplitRight,
+    ClosePane, CloseTab, FocusNext, FocusPrev, MaximizePane, NewTab, OpenSettings, Quit,
+    SplitDown, SplitRight,
 };
 
 const WINDOW_BG: u32 = 0x1C1C1E;
@@ -1455,6 +1456,24 @@ impl RootView {
         let split = self.state.read(cx).active_split().cloned();
         if let Some(split) = split {
             split.update(cx, |sc, cx| sc.split(SplitDirection::Vertical, cx));
+        }
+        cx.defer_in(window, |this, window, cx| {
+            this.focus_active_terminal(window, cx);
+        });
+    }
+
+    fn on_maximize_pane(
+        &mut self,
+        _action: &MaximizePane,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.shortcut_actions_blocked() {
+            return;
+        }
+        let split = self.state.read(cx).active_split().cloned();
+        if let Some(split) = split {
+            split.update(cx, |sc, cx| sc.toggle_maximize(cx));
         }
         cx.defer_in(window, |this, window, cx| {
             this.focus_active_terminal(window, cx);
@@ -5095,6 +5114,7 @@ impl Render for RootView {
             .on_action(cx.listener(Self::on_split_right))
             .on_action(cx.listener(Self::on_split_down))
             .on_action(cx.listener(Self::on_close_pane))
+            .on_action(cx.listener(Self::on_maximize_pane))
             .on_action(cx.listener(Self::on_focus_next))
             .on_action(cx.listener(Self::on_focus_prev))
             .on_action(cx.listener(Self::on_open_settings))

@@ -890,6 +890,9 @@ pub struct TerminalPane {
     row_generations: Vec<u64>,
     /// Subscription for focus-in listener (lazy-initialized in render)
     _focus_in_sub: Option<gpui::Subscription>,
+    /// Right-click context menu state
+    context_menu_visible: bool,
+    context_menu_position: Point<Pixels>,
 }
 
 impl TerminalPane {
@@ -1253,6 +1256,8 @@ impl TerminalPane {
             #[cfg(not(feature = "ghostty_vt"))]
             row_generations: vec![0; settings.rows as usize],
             _focus_in_sub: None,
+            context_menu_visible: false,
+            context_menu_position: Point::default(),
         }
     }
 
@@ -1828,7 +1833,14 @@ impl TerminalPane {
 
         // Keep the IME registration canvas behind the terminal surface so the
         // pane itself remains the mouse event owner for drag selection/copy.
-        pane.child(self.ime_canvas(cx)).child(terminal_element)
+        pane = pane.child(self.ime_canvas(cx)).child(terminal_element);
+
+        // Context menu overlay
+        if self.context_menu_visible {
+            pane = pane.child(self.render_context_menu(cx));
+        }
+
+        pane
     }
 }
 
@@ -1941,6 +1953,162 @@ impl TerminalPane {
 
         cx.write_to_clipboard(ClipboardItem::new_string(text));
         true
+    }
+
+    /// Copy the current line (where cursor is) to clipboard
+    fn copy_current_line_to_clipboard(&self, cx: &mut Context<Self>) {
+        let row = self.snapshot.cursor_y as usize;
+        if let Some(row_data) = self.snapshot.rows.get(row) {
+            let text = row_data.text.trim_end().to_string();
+            if !text.is_empty() {
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+            }
+        }
+    }
+
+    /// Reset terminal: clear screen and scrollback
+    fn reset_terminal(&mut self) {
+        // Send "reset" escape sequence: clear screen + home cursor + clear scrollback
+        self.write_terminal_bytes(b"\x1b[2J\x1b[H\x1b[3J");
+    }
+
+    // ── Context menu rendering ───────────────────────────────────────────
+
+    fn render_context_menu(&self, cx: &mut Context<Self>) -> Div {
+        let menu_x = f32::from(self.context_menu_position.x);
+        let menu_y = f32::from(self.context_menu_position.y);
+        // Offset from last_bounds origin so the menu is positioned relative to pane
+        let (offset_x, offset_y) = if let Some(bounds) = self.last_bounds {
+            (
+                menu_x - f32::from(bounds.origin.x),
+                menu_y - f32::from(bounds.origin.y),
+            )
+        } else {
+            (menu_x, menu_y)
+        };
+
+        div()
+            .absolute()
+            .top(px(offset_y))
+            .left(px(offset_x))
+            .bg(rgb(0x313244))
+            .border_1()
+            .border_color(rgb(0x45475a))
+            .rounded(px(6.0))
+            .shadow_md()
+            .py(px(4.0))
+            .min_w(px(220.0))
+            .font_family("Cascadia Code")
+            .text_size(px(12.0))
+            .text_color(rgb(0xcdd6f4))
+            // Clipboard group
+            .child(Self::menu_item("コピーする", "(c)", {
+                let listener = cx.listener(|this, _: &MouseDownEvent, _win, cx| {
+                    this.context_menu_visible = false;
+                    let _ = this.copy_selection_to_clipboard(cx);
+                    cx.notify();
+                });
+                listener
+            }))
+            .child(Self::menu_item("1行コピーする", "(L)", {
+                let listener = cx.listener(|this, _: &MouseDownEvent, _win, cx| {
+                    this.context_menu_visible = false;
+                    this.copy_current_line_to_clipboard(cx);
+                    cx.notify();
+                });
+                listener
+            }))
+            .child(Self::menu_item("ペーストする", "(C-y)", {
+                let listener = cx.listener(|this, _: &MouseDownEvent, _win, cx| {
+                    this.context_menu_visible = false;
+                    let _ = this.paste_from_clipboard(cx);
+                    cx.notify();
+                });
+                listener
+            }))
+            // Separator
+            .child(Self::menu_separator())
+            // Pane split group
+            .child(Self::menu_item("ペインを横に増やす", "(h)", {
+                let listener = cx.listener(|this, _: &MouseDownEvent, win, cx| {
+                    this.context_menu_visible = false;
+                    win.dispatch_action(Box::new(crate::SplitRight), cx);
+                    cx.notify();
+                });
+                listener
+            }))
+            .child(Self::menu_item("ペインを縦に増やす", "(v)", {
+                let listener = cx.listener(|this, _: &MouseDownEvent, win, cx| {
+                    this.context_menu_visible = false;
+                    win.dispatch_action(Box::new(crate::SplitDown), cx);
+                    cx.notify();
+                });
+                listener
+            }))
+            // Separator
+            .child(Self::menu_separator())
+            // Pane management group
+            .child(Self::menu_item("ペインを閉じる", "(X)", {
+                let listener = cx.listener(|this, _: &MouseDownEvent, win, cx| {
+                    this.context_menu_visible = false;
+                    win.dispatch_action(Box::new(crate::ClosePane), cx);
+                    cx.notify();
+                });
+                listener
+            }))
+            .child(Self::menu_item("ペインを初期化する", "(R)", {
+                let listener = cx.listener(|this, _: &MouseDownEvent, _win, cx| {
+                    this.context_menu_visible = false;
+                    this.reset_terminal();
+                    cx.notify();
+                });
+                listener
+            }))
+            .child(Self::menu_item("ペインを最大化する", "(z)", {
+                let listener = cx.listener(|this, _: &MouseDownEvent, win, cx| {
+                    this.context_menu_visible = false;
+                    win.dispatch_action(Box::new(crate::MaximizePane), cx);
+                    cx.notify();
+                });
+                listener
+            }))
+    }
+
+    fn menu_item(
+        label: &str,
+        shortcut: &str,
+        on_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    ) -> Div {
+        div()
+            .px(px(12.0))
+            .py(px(6.0))
+            .mx(px(4.0))
+            .rounded(px(4.0))
+            .cursor_pointer()
+            .hover(|e| e.bg(rgb(0x45475a)))
+            .flex()
+            .items_center()
+            .justify_between()
+            .on_mouse_down(MouseButton::Left, on_click)
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .child(label.to_string()),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(rgb(0x6c7086))
+                    .child(shortcut.to_string()),
+            )
+    }
+
+    fn menu_separator() -> Div {
+        div()
+            .my(px(4.0))
+            .mx(px(8.0))
+            .h(px(1.0))
+            .bg(rgb(0x45475a))
     }
 
     fn write_terminal_bytes(&mut self, data: &[u8]) {
@@ -2208,6 +2376,16 @@ impl TerminalPane {
     fn on_key_down(&mut self, event: &KeyDownEvent, _window: &mut Window, cx: &mut Context<Self>) {
         log_terminal_ime_keystroke("on_key_down", &event.keystroke, "terminal pane keydown");
 
+        // Close context menu on Escape
+        if self.context_menu_visible {
+            self.context_menu_visible = false;
+            cx.notify();
+            if event.keystroke.key == "escape" {
+                cx.stop_propagation();
+                return;
+            }
+        }
+
         if self.input_suppressed.load(Ordering::Relaxed) {
             return;
         }
@@ -2292,6 +2470,12 @@ impl TerminalPane {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle);
+        // Dismiss context menu on left-click
+        if self.context_menu_visible {
+            self.context_menu_visible = false;
+            cx.notify();
+            return;
+        }
         if self.input_suppressed.load(Ordering::Relaxed) {
             return;
         }
@@ -2308,7 +2492,7 @@ impl TerminalPane {
 
     fn on_mouse_right_down(
         &mut self,
-        _event: &MouseDownEvent,
+        event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2317,15 +2501,10 @@ impl TerminalPane {
             return;
         }
 
-        if should_copy_selection_on_right_click(self.selection_range()) {
-            // Selection exists → copy
-            let _ = self.copy_selection_to_clipboard(cx);
-        } else {
-            // No selection → paste from clipboard
-            if self.paste_from_clipboard(cx) {
-                cx.notify();
-            }
-        }
+        // Show context menu at click position
+        self.context_menu_visible = true;
+        self.context_menu_position = event.position;
+        cx.notify();
         cx.stop_propagation();
     }
 
