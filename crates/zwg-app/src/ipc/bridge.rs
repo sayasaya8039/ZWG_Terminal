@@ -21,6 +21,10 @@ pub enum GpuiCommand {
         data: Vec<u8>,
         resp_tx: flume::Sender<GpuiResponse>,
     },
+    SendKeysAll {
+        data: Vec<u8>,
+        resp_tx: flume::Sender<GpuiResponse>,
+    },
     ListPanes {
         resp_tx: flume::Sender<GpuiResponse>,
     },
@@ -30,6 +34,9 @@ pub enum GpuiCommand {
     },
     KillPane {
         pane_id: u32,
+        resp_tx: flume::Sender<GpuiResponse>,
+    },
+    KillAllPanes {
         resp_tx: flume::Sender<GpuiResponse>,
     },
     CapturePane {
@@ -43,9 +50,11 @@ pub enum GpuiCommand {
 pub enum GpuiResponse {
     SplitOk { pane_id: u32 },
     SendKeysOk,
+    SendKeysAllOk { count: usize },
     PaneList(Vec<PaneInfo>),
     SelectPaneOk,
     KillPaneOk,
+    KillAllPanesOk { count: usize },
     PaneContent(String),
     Error(String),
 }
@@ -70,31 +79,44 @@ pub fn create_channel() -> (CommandSender, CommandReceiver) {
 }
 
 /// Parse `-t %N` or `-t%N` target pane ID from args, returning (pane_id, remaining_args)
-fn parse_target_pane(args: &[String]) -> (u32, Vec<String>) {
+/// Parse `-t %N` target from args. Returns (pane_id, remaining_args, is_broadcast).
+/// `-t *`, `-t all`, or `-a` flag sets is_broadcast=true.
+fn parse_target_pane(args: &[String]) -> (u32, Vec<String>, bool) {
     let mut pane_id: u32 = 0;
     let mut remaining = Vec::new();
     let mut skip_next = false;
+    let mut broadcast = false;
 
     for (i, arg) in args.iter().enumerate() {
         if skip_next {
             skip_next = false;
             continue;
         }
-        if arg == "-t" {
+        if arg == "-a" {
+            broadcast = true;
+        } else if arg == "-t" {
             if let Some(target) = args.get(i + 1) {
-                let target = target.trim_start_matches('%');
-                pane_id = target.parse().unwrap_or(0);
+                let trimmed = target.trim_start_matches('%');
+                if trimmed == "*" || trimmed == "all" {
+                    broadcast = true;
+                } else {
+                    pane_id = trimmed.parse().unwrap_or(0);
+                }
                 skip_next = true;
             }
         } else if arg.starts_with("-t") {
-            let target = arg[2..].trim_start_matches('%');
-            pane_id = target.parse().unwrap_or(0);
+            let trimmed = arg[2..].trim_start_matches('%');
+            if trimmed == "*" || trimmed == "all" {
+                broadcast = true;
+            } else {
+                pane_id = trimmed.parse().unwrap_or(0);
+            }
         } else {
             remaining.push(arg.clone());
         }
     }
 
-    (pane_id, remaining)
+    (pane_id, remaining, broadcast)
 }
 
 /// Register IPC command handlers that forward to the GPUI bridge channel
@@ -205,8 +227,28 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
     // ── send-keys ───────────────────────────────────────────────────
     let tx = cmd_tx.clone();
     server.on_command("send-keys", move |req| {
-        let (pane_id, key_args) = parse_target_pane(&req.args);
+        let (pane_id, key_args, broadcast) = parse_target_pane(&req.args);
         let data = convert_tmux_keys(&key_args);
+
+        // Broadcast mode: -t * sends to all panes
+        if broadcast {
+            log::info!("[IPC] send-keys BROADCAST: data_len={}", data.len());
+            let (resp_tx, resp_rx) = flume::bounded(1);
+            let cmd = GpuiCommand::SendKeysAll { data, resp_tx };
+
+            if tx.send(cmd).is_err() {
+                return super::IpcResponse::err(req.id, "GPUI bridge disconnected");
+            }
+
+            return match resp_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                Ok(GpuiResponse::SendKeysAllOk { count }) => {
+                    super::IpcResponse::ok(req.id, serde_json::json!({ "count": count }))
+                }
+                Ok(GpuiResponse::Error(e)) => super::IpcResponse::err(req.id, &e),
+                Ok(_) => super::IpcResponse::err(req.id, "unexpected response"),
+                Err(_) => super::IpcResponse::err(req.id, "GPUI response timeout"),
+            };
+        }
 
         let (resp_tx, resp_rx) = flume::bounded(1);
         let cmd = GpuiCommand::SendKeys {
@@ -252,7 +294,7 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
     // ── select-pane ─────────────────────────────────────────────────
     let tx = cmd_tx.clone();
     server.on_command("select-pane", move |req| {
-        let (pane_id, _remaining) = parse_target_pane(&req.args);
+        let (pane_id, _remaining, _broadcast) = parse_target_pane(&req.args);
 
         let (resp_tx, resp_rx) = flume::bounded(1);
         let cmd = GpuiCommand::SelectPane { pane_id, resp_tx };
@@ -274,7 +316,7 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
     // ── capture-pane ────────────────────────────────────────────────
     let tx = cmd_tx.clone();
     server.on_command("capture-pane", move |req| {
-        let (pane_id, _remaining) = parse_target_pane(&req.args);
+        let (pane_id, _remaining, _broadcast) = parse_target_pane(&req.args);
 
         let (resp_tx, resp_rx) = flume::bounded(1);
         let cmd = GpuiCommand::CapturePane { pane_id, resp_tx };
@@ -296,7 +338,28 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
     // ── kill-pane ───────────────────────────────────────────────────
     let tx = cmd_tx;
     server.on_command("kill-pane", move |req| {
-        let (pane_id, _remaining) = parse_target_pane(&req.args);
+        let (pane_id, _remaining, broadcast) = parse_target_pane(&req.args);
+
+        // Kill all split panes: -a or -t *
+        if broadcast {
+            log::info!("[IPC] kill-pane -a: killing all split panes");
+            let (resp_tx, resp_rx) = flume::bounded(1);
+            let cmd = GpuiCommand::KillAllPanes { resp_tx };
+
+            if tx.send(cmd).is_err() {
+                return super::IpcResponse::err(req.id, "GPUI bridge disconnected");
+            }
+
+            return match resp_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+                Ok(GpuiResponse::KillAllPanesOk { count }) => {
+                    log::info!("[IPC] kill-pane -a OK: killed {} panes", count);
+                    super::IpcResponse::ok(req.id, serde_json::json!({ "killed": count }))
+                }
+                Ok(GpuiResponse::Error(e)) => super::IpcResponse::err(req.id, &e),
+                Ok(_) => super::IpcResponse::err(req.id, "unexpected response"),
+                Err(_) => super::IpcResponse::err(req.id, "GPUI response timeout"),
+            };
+        }
 
         let (resp_tx, resp_rx) = flume::bounded(1);
         let cmd = GpuiCommand::KillPane { pane_id, resp_tx };

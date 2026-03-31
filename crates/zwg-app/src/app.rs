@@ -1108,6 +1108,20 @@ impl RootView {
                 }
             }
 
+            GpuiCommand::SendKeysAll { data, resp_tx } => {
+                let mut count = 0usize;
+                let state = self.state.read(cx);
+                for tab in &state.tabs {
+                    let panes = tab.split.read(cx).list_panes();
+                    for (_pid, _uuid, term) in &panes {
+                        if term.read(cx).write_to_pty(&data).is_ok() {
+                            count += 1;
+                        }
+                    }
+                }
+                let _ = resp_tx.send(GpuiResponse::SendKeysAllOk { count });
+            }
+
             GpuiCommand::ListPanes { resp_tx } => {
                 let split = {
                     let state = self.state.read(cx);
@@ -1173,6 +1187,34 @@ impl RootView {
                         ));
                     }
                 });
+            }
+
+            GpuiCommand::KillAllPanes { resp_tx } => {
+                let split = {
+                    let state = self.state.read(cx);
+                    let Some(s) = state.active_split().cloned() else {
+                        let _ = resp_tx.send(GpuiResponse::KillAllPanesOk { count: 0 });
+                        return;
+                    };
+                    s
+                };
+                let panes = split.read(cx).list_panes();
+                if panes.len() <= 1 {
+                    let _ = resp_tx.send(GpuiResponse::KillAllPanesOk { count: 0 });
+                    return;
+                }
+                // Keep the first pane (primary), kill the rest
+                let to_kill: Vec<u32> = panes.iter().skip(1).map(|(pid, _, _)| *pid).collect();
+                let mut killed = 0usize;
+                for pid in to_kill {
+                    split.update(cx, |sc, cx| {
+                        if sc.kill_pane_by_id(pid, cx) {
+                            killed += 1;
+                        }
+                    });
+                }
+                log::info!("[APP] kill_all_panes: killed {} split panes", killed);
+                let _ = resp_tx.send(GpuiResponse::KillAllPanesOk { count: killed });
             }
 
             GpuiCommand::CapturePane { pane_id, resp_tx } => {

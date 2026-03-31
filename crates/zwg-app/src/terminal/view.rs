@@ -48,7 +48,7 @@ const FAST_PACING_ENTER: u32 = 4;
 /// Consecutive idle frames before reverting to normal pacing mode.
 const FAST_PACING_EXIT: u32 = 8;
 const CROSS_ROUTE_DUPLICATE_WINDOW_MS: u64 = 250;
-const SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS: u64 = 30;
+const SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS: u64 = 100;
 /// Fallback values — replaced at runtime by measured font metrics
 const CELL_WIDTH_FALLBACK: f32 = 8.4;
 const CELL_HEIGHT_FALLBACK: f32 = 19.5;
@@ -405,7 +405,6 @@ unsafe extern "system" fn ime_getmessage_hook_proc(
     wparam: windows::Win32::Foundation::WPARAM,
     lparam: windows::Win32::Foundation::LPARAM,
 ) -> windows::Win32::Foundation::LRESULT {
-    use windows::Win32::UI::Input::Ime::{GCS_RESULTREADSTR, GCS_RESULTSTR};
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, MSG, PM_REMOVE, TranslateMessage, WM_IME_COMPOSITION,
         WM_IME_ENDCOMPOSITION, WM_IME_STARTCOMPOSITION, WM_KEYDOWN,
@@ -426,14 +425,11 @@ unsafe extern "system" fn ime_getmessage_hook_proc(
                     }
                 }
                 message if message == WM_IME_COMPOSITION => {
-                    // Read committed result text during composition — required for
-                    // multi-segment input (e.g. "今日は" typed as separate conversions).
-                    // WM_IME_ENDCOMPOSITION only returns the last segment, so we must
-                    // capture intermediate GCS_RESULTSTR results here.
-                    let composition_flags = msg.lParam.0 as u32;
-                    if (composition_flags & (GCS_RESULTSTR.0 | GCS_RESULTREADSTR.0)) != 0 {
-                        queue_ime_endcomposition_text(msg.hwnd);
-                    }
+                    // NOTE: Do NOT queue text here.  gpui 0.2.2 handles
+                    // WM_IME_COMPOSITION → GCS_RESULTSTR → replace_text_in_range
+                    // directly, so queueing the same text from the hook causes
+                    // double delivery.  WM_IME_ENDCOMPOSITION (below) still
+                    // queues as a safety net in case gpui fails to deliver.
                     if terminal_ime_trace_enabled() {
                         log::debug!(
                             "IME_TERM_CMP message time={} wparam=0x{:X} lparam=0x{:X}",
@@ -2768,10 +2764,9 @@ impl EntityInputHandler for TerminalPane {
                 self.ime_composing
             );
         }
-        if !self.ime_composing {
-            return None;
-        }
-        // Position IME candidate window near cursor
+        // Always return cursor position so the IME candidate window
+        // tracks the correct location. Returning None causes the window
+        // to appear at screen origin (bottom-left).
         Some(Bounds::new(
             point(
                 element_bounds.origin.x

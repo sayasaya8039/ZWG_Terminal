@@ -5,3 +5,16 @@
     ]
   }
 }
+{
+   "env": {
+    "CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS": "1",
+    "CLAUDE_CODE_SPAWN_BACKEND": "tmux"
+   },
+  "enabledPlugins": {
+    "rust-analyzer-lsp@claude-plugins-official": true
+  },
+  "effortLevel": "max",
+  "includeCoAuthoredBy": false,
+  "teammateMode": "tmux",
+  "spawnBackend": "direct-tmux"
+}
