@@ -31,7 +31,7 @@ pub enum CliCommand {
     ListPanes { format: Option<String> },
     SelectPane { target: String },
     DisplayMessage { print_stdout: bool, format: Option<String> },
-    KillPane { target: String },
+    KillPane { target: String, all: bool },
     CapturePane { target: Option<String>, print_stdout: bool },
     HasSession,
     NewSession { print_info: bool, format: Option<String>, session_name: Option<String> },
@@ -183,7 +183,11 @@ fn parse_select_pane(args: &[String]) -> CliCommand {
 }
 
 fn parse_kill_pane(args: &[String]) -> CliCommand {
-    CliCommand::KillPane { target: parse_target_flag(args) }
+    let all = args.iter().any(|a| a == "-a");
+    let target = parse_target_flag(args);
+    // -t * or -t all also means kill all
+    let broadcast = target == "*" || target == "all";
+    CliCommand::KillPane { target, all: all || broadcast }
 }
 
 fn parse_capture_pane(args: &[String]) -> CliCommand {
@@ -340,8 +344,12 @@ pub fn run_client(command: CliCommand) -> ! {
         CliCommand::SelectPane { target } => {
             run_ipc_command("select-pane", vec!["-t".into(), target]);
         }
-        CliCommand::KillPane { target } => {
-            run_ipc_command("kill-pane", vec!["-t".into(), target]);
+        CliCommand::KillPane { target, all } => {
+            if all {
+                run_ipc_command("kill-pane", vec!["-a".into()]);
+            } else {
+                run_ipc_command("kill-pane", vec!["-t".into(), target]);
+            }
         }
         CliCommand::CapturePane { target, print_stdout } => {
             run_capture_pane(target, print_stdout);

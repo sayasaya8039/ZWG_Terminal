@@ -919,6 +919,7 @@ impl TerminalPane {
                     .spawn(async move {
                         let config = ConPtyConfig {
                             shell: shell_for_spawn,
+                            working_directory: None,
                             cols: initial_cols,
                             rows: initial_rows,
                             env,
@@ -2611,6 +2612,7 @@ fn selection_range_from_points(
     }
 }
 
+#[cfg(test)]
 fn should_copy_selection_on_right_click(
     selection: Option<(SelectionPoint, SelectionPoint)>,
 ) -> bool {

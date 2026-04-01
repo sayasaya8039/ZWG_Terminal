@@ -8,6 +8,7 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct ConPtyConfig {
     pub shell: String,
+    pub working_directory: Option<String>,
     pub env: Vec<(String, String)>,
     pub cols: u16,
     pub rows: u16,
@@ -17,6 +18,7 @@ impl Default for ConPtyConfig {
     fn default() -> Self {
         Self {
             shell: String::new(),
+            working_directory: None,
             env: Vec::new(),
             cols: 80,
             rows: 24,
@@ -713,9 +715,166 @@ if ($env:ZWG_CLAUDE_TEAMMATE_MODE) {
         }
     }
 
+    // --- psmux/pmux shims (psmux-compatible CLI aliases) ---
+    #[cfg(windows)]
+    {
+        for shim_name in ["psmux.cmd", "pmux.cmd"] {
+            let shim = dir.join(shim_name);
+            let content = format!("@\"{}\" %*\r\n", zwg_exe.display());
+            if let Err(e) = std::fs::write(&shim, &content) {
+                eprintln!("zwg: failed to write {} shim: {}", shim_name, e);
+            } else {
+                log::info!("{} shim checked: {:?}", shim_name, shim);
+            }
+        }
+
+        for exe_name in ["psmux.exe", "pmux.exe"] {
+            let shim_exe = dir.join(exe_name);
+            let _ = std::fs::remove_file(&shim_exe);
+            if std::fs::hard_link(&zwg_exe, &shim_exe).is_err() {
+                if let Err(e) = std::fs::copy(&zwg_exe, &shim_exe) {
+                    eprintln!("zwg: failed to create {} shim: {}", exe_name, e);
+                } else {
+                    log::info!("{} shim copied to {:?}", exe_name, shim_exe);
+                }
+            } else {
+                log::info!("{} shim hardlinked to {:?}", exe_name, shim_exe);
+            }
+        }
+    }
+
+    // --- team_name enforcement hook for Claude Code ---
+    {
+        let team_check = dir.join("zwg-check-team-name.js");
+        let team_check_content = r#"// zwg: Enforce team_name for Agent tool calls inside ZWG
+// Called by Claude Code PreToolUse hook for the Agent tool.
+// Reads tool input from stdin (JSON), checks for team_name.
+// Exit 0 = allow, exit 2 + JSON to stdout = block with message.
+const chunks = [];
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', c => chunks.push(c));
+process.stdin.on('end', () => {
+  try {
+    const input = JSON.parse(chunks.join(''));
+    const params = input.tool_input || input.tool_params || {};
+    if (process.env.ZWG_REQUIRE_TEAM_NAME !== '1') process.exit(0);
+    if (!process.env.TMUX) process.exit(0);
+    if (params.team_name && params.team_name.trim() !== '') {
+      process.exit(0);
+    }
+    const msg = '[zwg] Agent tool requires team_name parameter inside ZWG. ' +
+      'Use TeamCreate first, then pass team_name + name to all Agent calls.';
+    process.stdout.write(JSON.stringify({
+      decision: 'block',
+      reason: msg
+    }));
+    process.exit(2);
+  } catch (e) {
+    process.exit(0);
+  }
+});
+"#;
+        if let Err(e) = std::fs::write(&team_check, team_check_content) {
+            eprintln!("zwg: failed to write zwg-check-team-name.js: {}", e);
+        } else {
+            log::info!("zwg-check-team-name.js written to {:?}", team_check);
+        }
+
+        // Auto-configure Claude Code PreToolUse hook
+        let claude_dir = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".claude");
+        let _ = std::fs::create_dir_all(&claude_dir);
+        let settings_path = claude_dir.join("settings.json");
+
+        let check_script = team_check
+            .to_string_lossy()
+            .replace('\\', "\\\\");
+
+        let hook_marker = "zwg-check-team-name";
+        let hook_entry = format!(
+            r#"{{
+        "matcher": "Agent",
+        "hooks": [
+          {{
+            "type": "command",
+            "command": "node \"{check_script}\"",
+            "description": "zwg: enforce team_name for Agent calls"
+          }}
+        ]
+      }}"#
+        );
+
+        let needs_inject = if let Ok(content) = std::fs::read_to_string(&settings_path) {
+            !content.contains(hook_marker)
+        } else {
+            true
+        };
+
+        if needs_inject {
+            if let Ok(content) = std::fs::read_to_string(&settings_path) {
+                if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&content) {
+                    let hooks = json
+                        .as_object_mut()
+                        .and_then(|o| {
+                            o.entry("hooks")
+                                .or_insert_with(|| serde_json::json!({}))
+                                .as_object_mut()
+                        });
+                    if let Some(hooks) = hooks {
+                        let pre_tool = hooks
+                            .entry("PreToolUse")
+                            .or_insert_with(|| serde_json::json!([]));
+                        if let Some(arr) = pre_tool.as_array_mut() {
+                            if let Ok(entry) =
+                                serde_json::from_str::<serde_json::Value>(&hook_entry)
+                            {
+                                arr.push(entry);
+                            }
+                        }
+                    }
+                    if let Ok(pretty) = serde_json::to_string_pretty(&json) {
+                        if let Err(e) = std::fs::write(&settings_path, &pretty) {
+                            eprintln!("zwg: failed to update settings.json: {}", e);
+                        } else {
+                            log::info!("Claude Code settings.json: injected team_name hook");
+                        }
+                    }
+                }
+            } else {
+                let minimal = format!(
+                    r#"{{
+  "hooks": {{
+    "PreToolUse": [
+      {hook_entry}
+    ]
+  }}
+}}"#
+                );
+                if let Err(e) = std::fs::write(&settings_path, &minimal) {
+                    eprintln!("zwg: failed to create settings.json: {}", e);
+                } else {
+                    log::info!("Claude Code settings.json: created with team_name hook");
+                }
+            }
+        }
+    }
+
     #[cfg(not(windows))]
     {
         use std::os::unix::fs::PermissionsExt;
+
+        // --- psmux/pmux (Unix) ---
+        for shim_name in ["psmux", "pmux"] {
+            let shim_path = dir.join(shim_name);
+            let content = format!("#!/bin/sh\nexec \"{}\" \"$@\"\n", zwg_exe.display());
+            if let Err(e) = std::fs::write(&shim_path, &content) {
+                eprintln!("zwg: failed to write {} shim: {}", shim_name, e);
+            } else {
+                let _ = std::fs::set_permissions(&shim_path, std::fs::Permissions::from_mode(0o755));
+                log::info!("{} shim written to {:?}", shim_name, shim_path);
+            }
+        }
 
         // --- tmux ---
         let shim_path = dir.join("tmux");
@@ -821,13 +980,18 @@ pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
 
     vec![
         ("ZWG".to_string(), "1".to_string()),
+        ("PSMUX".to_string(), "1".to_string()),
         ("ZWG_TMUX_VALUE".to_string(), tmux_value.clone()),
         ("TMUX".to_string(), tmux_value),
         ("PATH".to_string(), new_path),
         ("ZWG_AGENT_HOOK".to_string(), hook_cmd.clone()),
-        ("CLAUDE_CODE_HOOK_CMD".to_string(), hook_cmd),
+        ("CLAUDE_CODE_HOOK_CMD".to_string(), hook_cmd.clone()),
+        ("AIDER_HOOK_CMD".to_string(), hook_cmd.clone()),
+        ("CURSOR_AGENT_HOOK_CMD".to_string(), hook_cmd),
         // Pane identification (psmux-compatible)
         ("TMUX_PANE".to_string(), format!("%{}", pane_id)),
+        ("TERM_PROGRAM".to_string(), "zwg".to_string()),
+        ("TERM_PROGRAM_VERSION".to_string(), env!("CARGO_PKG_VERSION").to_string()),
         ("TERM".to_string(), "xterm-256color".to_string()),
         ("COLORTERM".to_string(), "truecolor".to_string()),
         // Prevent MSYS2/Git-Bash from path-mangling TMUX value

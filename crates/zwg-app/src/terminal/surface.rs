@@ -355,6 +355,15 @@ impl TerminalSurface {
         #[cfg(not(feature = "ghostty_vt"))]
         let async_ptr: Option<usize> = None;
 
+        // Windows: spawn a process-exit watcher as a safety net.
+        // ConPTY may not deliver EOF when grandchild processes hold console handles.
+        #[cfg(windows)]
+        {
+            let child_pid = pty.child_pid();
+            let exit_tx = self.event_tx.clone();
+            Self::spawn_process_watcher(child_pid, exit_tx);
+        }
+
         let handle = std::thread::Builder::new()
             .name("zwg-pty-reader".into())
             .spawn(move || {
@@ -468,6 +477,58 @@ impl TerminalSurface {
 
     pub fn set_default_colors(&self, fg_rgb: u32, bg_rgb: u32) {
         self.backend.lock().set_default_colors(fg_rgb, bg_rgb);
+    }
+}
+
+impl TerminalSurface {
+    /// Spawn a background thread that monitors the child process and sends
+    /// ProcessExited when it terminates. This is a safety net for Windows
+    /// ConPTY which may not deliver EOF when grandchild processes hold handles.
+    #[cfg(windows)]
+    pub fn spawn_process_watcher(child_pid: u32, event_tx: Sender<TerminalEvent>) {
+        std::thread::Builder::new()
+            .name("zwg-proc-watcher".into())
+            .spawn(move || {
+                use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+                use windows::Win32::System::Threading::{
+                    GetExitCodeProcess, OpenProcess, WaitForSingleObject,
+                    PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
+                };
+
+                let handle = unsafe {
+                    OpenProcess(
+                        PROCESS_QUERY_INFORMATION | PROCESS_SYNCHRONIZE,
+                        false,
+                        child_pid,
+                    )
+                };
+
+                let Ok(handle) = handle else {
+                    log::warn!("[proc-watcher] failed to open process {}", child_pid);
+                    return;
+                };
+
+                // Wait indefinitely for the process to exit
+                let wait = unsafe { WaitForSingleObject(handle, u32::MAX) };
+
+                let exit_code = if wait == WAIT_OBJECT_0 {
+                    let mut code: u32 = 0;
+                    let _ = unsafe { GetExitCodeProcess(handle, &mut code) };
+                    code as i32
+                } else {
+                    -1
+                };
+
+                unsafe { let _ = CloseHandle(handle); }
+
+                log::info!(
+                    "[proc-watcher] child {} exited with code {}",
+                    child_pid,
+                    exit_code
+                );
+                let _ = event_tx.send(TerminalEvent::ProcessExited(exit_code));
+            })
+            .ok();
     }
 }
 

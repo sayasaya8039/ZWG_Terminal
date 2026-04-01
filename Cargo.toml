@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/zwg-app",
+    "crates/zwg-intelligence",
     "crates/ghostty-vt",
     "crates/ghostty-vt-sys",
 ]
@@ -28,6 +29,7 @@ smallvec = { version = "1", features = ["union"] }
 libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 unicode-width = "0.2"
+ort = { version = "2.0.0-rc.12", features = ["directml"] }
 
 [workspace.dependencies.windows]
 version = "0.61"

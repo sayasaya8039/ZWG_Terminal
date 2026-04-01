@@ -590,6 +590,7 @@ pub struct AppState {
     pub config: AppConfig,
     terminal_input_suppressed: Arc<AtomicBool>,
     /// Session name for psmux compatibility (default: "work")
+    #[allow(dead_code)]
     pub session_name: String,
 }
 
@@ -984,7 +985,6 @@ impl RootView {
                     }
                     view.last_clipboard_sequence = Some(event.sequence_number);
                     // Run snapshot on background thread to avoid blocking input
-                    let seq = event.sequence_number;
                     let capture = snapshot_current_clipboard();
                     if let Some(capture) = capture {
                         view.handle_monitored_clipboard_capture(capture, false, cx);

@@ -1,0 +1,31 @@
+[package]
+name = "zwg-intelligence"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+dirs.workspace = true
+parking_lot.workspace = true
+ort.workspace = true
+windows.workspace = true
+tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
+ureq = { version = "2.12", features = ["json"] }
+sha2 = "0.10"
+ndarray = "0.17"
+rayon = { version = "1", optional = true }
+burn = { version = "0.16", default-features = false, features = ["ndarray"], optional = true }
+
+[features]
+default = []
+ollama = []
+parallel = ["dep:rayon"]
+burn_backend = ["dep:burn"]
+
+[dev-dependencies]
+env_logger.workspace = true
