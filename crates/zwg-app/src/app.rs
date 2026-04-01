@@ -582,6 +582,13 @@ pub struct ShellEntry {
     pub display_name: String,
 }
 
+/// Global RAM disk handle — available when `intelligence` feature is enabled
+/// and ImDisk is installed. Holds an `Arc` so cloning is cheap.
+#[cfg(feature = "intelligence")]
+pub struct GlobalRamDisk(pub Option<std::sync::Arc<zwg_intelligence::RamDisk>>);
+#[cfg(feature = "intelligence")]
+impl Global for GlobalRamDisk {}
+
 /// Global application state.
 pub struct AppState {
     pub tabs: Vec<Tab>,
@@ -1051,9 +1058,10 @@ impl RootView {
         match cmd {
             GpuiCommand::SplitWindow {
                 horizontal,
+                working_directory,
                 command,
+                env,
                 resp_tx,
-                ..
             } => {
                 let direction = if horizontal {
                     SplitDirection::Horizontal
@@ -1070,8 +1078,13 @@ impl RootView {
                     s
                 };
                 split.update(cx, |sc, cx| {
-                    sc.split(direction, cx);
-                    let pane_id = sc.focused_pane_id().unwrap_or(0);
+                    let pane_id = sc.split_with_command(
+                        direction,
+                        command,
+                        working_directory,
+                        env,
+                        cx,
+                    );
                     // Auto-close panes spawned with an explicit command (e.g. teammate agents)
                     if has_command {
                         if let Some(term) = sc.find_pane_by_id(pane_id) {

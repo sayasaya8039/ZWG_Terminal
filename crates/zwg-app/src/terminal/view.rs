@@ -893,6 +893,42 @@ pub struct TerminalPane {
 
 impl TerminalPane {
     pub fn new(shell: &str, settings: TerminalSettings, cx: &mut Context<Self>) -> Self {
+        Self::new_inner(shell, None, None, Vec::new(), settings, cx)
+    }
+
+    /// Create a new terminal pane with a specific command, environment variables,
+    /// and pre-assigned pane_id. Used by IPC split-window to spawn teammate agents.
+    pub fn new_with_command(
+        shell: &str,
+        command: Option<String>,
+        working_directory: Option<String>,
+        extra_env: Vec<(String, String)>,
+        pane_id: u32,
+        settings: TerminalSettings,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        // If a command is provided, wrap it in a non-interactive shell so the PTY
+        // process exits when the command finishes (critical for auto_close).
+        let effective_shell = match command {
+            Some(cmd) => {
+                #[cfg(windows)]
+                { format!("cmd.exe /C {}", cmd) }
+                #[cfg(not(windows))]
+                { format!("sh -c '{}'", cmd.replace('\'', "'\\''")) }
+            }
+            None => shell.to_string(),
+        };
+        Self::new_inner(&effective_shell, working_directory, Some(pane_id), extra_env, settings, cx)
+    }
+
+    fn new_inner(
+        shell: &str,
+        working_directory: Option<String>,
+        assigned_pane_id: Option<u32>,
+        extra_env: Vec<(String, String)>,
+        settings: TerminalSettings,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Install IME hook once per process
         install_ime_hook();
 
@@ -907,9 +943,12 @@ impl TerminalPane {
         let shell_owned = shell.to_string();
         let initial_cols = settings.cols;
         let initial_rows = settings.rows;
-        // Pre-compute env vars on UI thread (requires IPC connection string)
-        let pane_id = crate::split::next_pane_id();
-        let env = crate::terminal::pty::zwg_env_vars(pane_id);
+        // Use pre-assigned pane_id if provided, otherwise allocate a new one.
+        // This prevents the double-allocation bug where split() and new() each
+        // called next_pane_id(), causing SplitNode pane_id and TMUX_PANE to diverge.
+        let pane_id = assigned_pane_id.unwrap_or_else(|| crate::split::next_pane_id());
+        let mut env = crate::terminal::pty::zwg_env_vars(pane_id);
+        env.extend(extra_env);
         cx.spawn(
             async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
                 // Run ConPTY creation on background executor (off UI thread)
@@ -919,7 +958,7 @@ impl TerminalPane {
                     .spawn(async move {
                         let config = ConPtyConfig {
                             shell: shell_for_spawn,
-                            working_directory: None,
+                            working_directory,
                             cols: initial_cols,
                             rows: initial_rows,
                             env,

@@ -8395,6 +8395,7 @@ dependencies = [
  "wasmi",
  "windows 0.61.3",
  "winresource",
+ "zwg-intelligence",
 ]
 
 [[package]]
@@ -8406,6 +8407,7 @@ dependencies = [
  "dirs 6.0.0",
  "env_logger",
  "log",
+ "memmap2",
  "ndarray 0.17.2",
  "ort",
  "parking_lot",
@@ -8413,6 +8415,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "socket2",
  "tokenizers",
  "ureq 2.12.1",
  "windows 0.61.3",

@@ -34,6 +34,7 @@ ureq = { version = "2.12", features = ["json"] }
 wasmi = { version = "2.0.0-beta.2", default-features = true }
 unicode-segmentation = "1.12"
 ghostty-vt = { path = "../ghostty-vt", optional = true }
+zwg-intelligence = { path = "../zwg-intelligence", optional = true }
 
 [build-dependencies]
 cc = "1"
@@ -43,5 +44,6 @@ winresource = "0.1"
 gpui = { workspace = true, features = ["test-support"] }
 
 [features]
-default = ["ghostty_vt"]
+default = ["ghostty_vt", "intelligence"]
 ghostty_vt = ["dep:ghostty-vt"]
+intelligence = ["dep:zwg-intelligence"]

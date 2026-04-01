@@ -82,7 +82,20 @@ impl SplitContainer {
         let new_id = Uuid::new_v4();
         let new_pane_id = next_pane_id();
         let terminal_settings = self.terminal_settings.clone();
-        let new_terminal = cx.new(|cx| TerminalPane::new(&shell, terminal_settings, cx));
+        // Pass the pre-allocated pane_id to TerminalPane so the SplitNode pane_id
+        // and TMUX_PANE env var use the same value. This fixes the double-allocation
+        // bug where split() and TerminalPane::new() each called next_pane_id().
+        let new_terminal = cx.new(|cx| {
+            TerminalPane::new_with_command(
+                &shell,
+                None, // no command
+                None, // no working_directory
+                Vec::new(), // no extra env
+                new_pane_id,
+                terminal_settings,
+                cx,
+            )
+        });
 
         self.root = Self::split_node(
             std::mem::replace(
@@ -102,6 +115,55 @@ impl SplitContainer {
 
         self.focused_id = new_id;
         cx.notify();
+    }
+
+    /// Split the focused pane and spawn a command with environment variables.
+    /// Used by IPC split-window for teammate agent creation.
+    /// Returns (pane_id, terminal_entity) for the new pane.
+    pub fn split_with_command(
+        &mut self,
+        direction: SplitDirection,
+        command: Option<String>,
+        working_directory: Option<String>,
+        env: Vec<(String, String)>,
+        cx: &mut Context<Self>,
+    ) -> u32 {
+        let target_id = self.focused_id;
+        let shell = self.shell.clone();
+        let new_id = Uuid::new_v4();
+        let new_pane_id = next_pane_id();
+        let terminal_settings = self.terminal_settings.clone();
+        let new_terminal = cx.new(|cx| {
+            TerminalPane::new_with_command(
+                &shell,
+                command,
+                working_directory,
+                env,
+                new_pane_id,
+                terminal_settings,
+                cx,
+            )
+        });
+
+        self.root = Self::split_node(
+            std::mem::replace(
+                &mut self.root,
+                SplitNode::Leaf {
+                    id: Uuid::nil(),
+                    pane_id: u32::MAX,
+                    terminal: new_terminal.clone(),
+                },
+            ),
+            target_id,
+            direction,
+            new_id,
+            new_pane_id,
+            new_terminal,
+        );
+
+        self.focused_id = new_id;
+        cx.notify();
+        new_pane_id
     }
 
     /// Get the pane_id of the most recently focused pane

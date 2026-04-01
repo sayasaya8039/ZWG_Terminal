@@ -16,6 +16,8 @@ ort.workspace = true
 windows.workspace = true
 tokenizers = { version = "0.21", default-features = false, features = ["fancy-regex"] }
 ureq = { version = "2.12", features = ["json"] }
+socket2 = "0.6"
+memmap2 = "0.9"
 sha2 = "0.10"
 ndarray = "0.17"
 rayon = { version = "1", optional = true }

@@ -7,8 +7,19 @@ protocol = "sparse"
 rustflags = ["-C", "target-cpu=native"]
 
 # Windows MSVC 向けビルド時のみ（WSL からの cross や Windows 本機ビルド）
+# Use rust-lld for faster linking (~2x speedup over MSVC link.exe)
 [target.x86_64-pc-windows-msvc]
 rustflags = ["-C", "target-cpu=native", "-C", "link-args=/STACK:8388608"]
+linker = "rust-lld"
+
+# Dev profile: faster incremental builds
+[profile.dev]
+split-debuginfo = "unpacked"
+
+# Release profile: maximize parallelism
+[profile.release]
+codegen-units = 16
+lto = "thin"
 
 # sccache 等の rustc-wrapper はマシン依存のためリポジトリに含めない。
 # Windows で使う場合はユーザー ~/.cargo/config.toml 例:

@@ -350,6 +350,27 @@ fn main() {
     }
 
     log::info!("ZWG Terminal v{} starting", env!("CARGO_PKG_VERSION"));
+
+    // Initialize RAM disk for high-speed cache/scrollback (if ImDisk is available)
+    #[cfg(feature = "intelligence")]
+    let _ramdisk = {
+        use zwg_intelligence::ramdisk::{RamDisk, RamDiskConfig};
+        match RamDisk::create(RamDiskConfig::zwg()) {
+            Ok(Some(rd)) => {
+                log::info!("RAM disk active: {}", rd);
+                Some(rd)
+            }
+            Ok(None) => {
+                log::info!("ImDisk not found — RAM disk acceleration disabled");
+                None
+            }
+            Err(e) => {
+                log::warn!("RAM disk creation failed: {e}");
+                None
+            }
+        }
+    };
+
     let wasm_runtime = wasm_runtime::initialize().expect("embedded WASM runtime init failed");
     log::info!(
         "WASM runtime ready: abi={} capabilities=0x{:X} ({})",
@@ -362,13 +383,28 @@ fn main() {
     let app = Application::new().with_assets(Assets {
         base: resources_path,
     });
-    app.run(|cx: &mut App| {
+    app.run(move |cx: &mut App| {
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
+
+        // Register RAM disk as global resource and export env vars
+        #[cfg(feature = "intelligence")]
+        {
+            let rd_arc = _ramdisk.map(std::sync::Arc::new);
+            if let Some(ref rd) = rd_arc {
+                let path_str = rd.path().to_string_lossy().to_string();
+                // SAFETY: called before spawning terminal child processes
+                unsafe { std::env::set_var("ZWG_RAMDISK", &path_str) };
+                unsafe { std::env::set_var("ZWG_RAMDISK_CACHE", rd.cache_dir().to_string_lossy().as_ref()) };
+                unsafe { std::env::set_var("ZWG_RAMDISK_TMP", rd.tmp_dir().to_string_lossy().as_ref()) };
+                log::info!("Exported ZWG_RAMDISK={}", path_str);
+            }
+            cx.set_global(app::GlobalRamDisk(rd_arc));
+        }
 
         // Load saved window state (position + size)
         let window_state = config::WindowState::load();
