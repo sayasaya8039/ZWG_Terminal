@@ -1767,17 +1767,26 @@ impl TerminalPane {
             };
             #[cfg(target_os = "windows")]
             {
-                let _ = cursor;
-                let _ = snapshot_can_present_natively(&render_snapshot);
-                let _ = gpu_terminal_canvas;
-                gpu.lock().hide_native_presenter();
-                terminal_canvas(
-                    Arc::clone(&render_snapshot),
-                    selection,
-                    config,
-                    self.glyph_cache.clone(),
-                )
-                .into_any_element()
+                if snapshot_can_present_natively(&render_snapshot) {
+                    gpu_terminal_canvas(
+                        Arc::clone(&render_snapshot),
+                        cursor,
+                        selection,
+                        config,
+                        Arc::clone(gpu),
+                        self.glyph_cache.clone(),
+                    )
+                    .into_any_element()
+                } else {
+                    gpu.lock().hide_native_presenter();
+                    terminal_canvas(
+                        Arc::clone(&render_snapshot),
+                        selection,
+                        config,
+                        self.glyph_cache.clone(),
+                    )
+                    .into_any_element()
+                }
             }
             #[cfg(not(target_os = "windows"))]
             {

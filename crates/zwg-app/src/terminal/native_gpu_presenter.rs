@@ -10,6 +10,7 @@ use windows::{
             Direct3D12::*,
             Dxgi::{Common::*, *},
         },
+        System::Threading::WaitForSingleObjectEx,
         UI::WindowsAndMessaging::{
             CreateWindowExW, DestroyWindow, SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER,
             SetWindowPos, ShowWindow, WS_CHILD, WS_CLIPSIBLINGS, WS_DISABLED, WS_EX_TRANSPARENT,
@@ -32,6 +33,8 @@ pub(crate) struct NativeGpuPresenter {
     rtv_stride: usize,
     width: u32,
     height: u32,
+    tearing_supported: bool,
+    frame_latency_waitable: Option<windows::Win32::Foundation::HANDLE>,
 }
 
 #[cfg(target_os = "windows")]
@@ -50,7 +53,23 @@ impl NativeGpuPresenter {
             clone_interface::<ID3D12Device>(device_ptr).context("borrowing D3D12 device")?;
         let command_queue = clone_interface::<ID3D12CommandQueue>(queue_ptr)
             .context("borrowing D3D12 command queue")?;
-        let swap_chain = create_swap_chain(&command_queue, hwnd, bounds)?;
+        let tearing_supported = check_tearing_support();
+        let swap_chain = create_swap_chain(&command_queue, hwnd, bounds, tearing_supported)?;
+
+        // Frame latency waitable — reduce CPU-GPU synchronization overhead.
+        let frame_latency_waitable = swap_chain
+            .cast::<IDXGISwapChain2>()
+            .ok()
+            .and_then(|sc2| unsafe {
+                let _ = sc2.SetMaximumFrameLatency(1);
+                let handle = sc2.GetFrameLatencyWaitableObject();
+                if handle.is_invalid() {
+                    None
+                } else {
+                    Some(handle)
+                }
+            });
+
         let rtv_heap = create_rtv_heap(&device)?;
         let rtv_stride = unsafe {
             device.GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV) as usize
@@ -66,6 +85,8 @@ impl NativeGpuPresenter {
             rtv_stride,
             width: pixels_to_u32(bounds.size.width),
             height: pixels_to_u32(bounds.size.height),
+            tearing_supported,
+            frame_latency_waitable,
         })
     }
 
@@ -109,7 +130,20 @@ impl NativeGpuPresenter {
     }
 
     pub(crate) fn present(&mut self) -> Result<()> {
-        unsafe { self.swap_chain.Present(0, DXGI_PRESENT(0)) }
+        // Wait for the previous frame to finish before queuing a new one.
+        if let Some(handle) = self.frame_latency_waitable {
+            unsafe {
+                WaitForSingleObjectEx(handle, 1000, false);
+            }
+        }
+        // Use ALLOW_TEARING for lowest latency when supported (implies vsync off).
+        let flags = if self.tearing_supported {
+            DXGI_PRESENT_ALLOW_TEARING
+        } else {
+            DXGI_PRESENT(0)
+        };
+        let sync_interval = if self.tearing_supported { 0 } else { 1 };
+        unsafe { self.swap_chain.Present(sync_interval, flags) }
             .ok()
             .context("presenting native GPU swapchain")?;
         Ok(())
@@ -118,13 +152,19 @@ impl NativeGpuPresenter {
     fn resize_swap_chain(&mut self, parent_hwnd: HWND, width: u32, height: u32) -> Result<()> {
         let _ = parent_hwnd;
         self.back_buffers.fill(None);
+        let resize_flags = if self.tearing_supported {
+            DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING
+                | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT
+        } else {
+            DXGI_SWAP_CHAIN_FLAG(0)
+        };
         unsafe {
             self.swap_chain.ResizeBuffers(
                 BUFFER_COUNT as u32,
                 width,
                 height,
                 DXGI_FORMAT_R8G8B8A8_UNORM,
-                DXGI_SWAP_CHAIN_FLAG(0),
+                resize_flags,
             )
         }
         .context("resizing native GPU swapchain")?;
@@ -180,13 +220,40 @@ fn create_child_window(parent_hwnd: HWND, bounds: Bounds<Pixels>) -> Result<HWND
 }
 
 #[cfg(target_os = "windows")]
+fn check_tearing_support() -> bool {
+    let factory: Option<IDXGIFactory5> =
+        unsafe { CreateDXGIFactory2::<IDXGIFactory5>(DXGI_CREATE_FACTORY_FLAGS(0)) }.ok();
+    factory
+        .and_then(|f| {
+            let mut allow_tearing: i32 = 0;
+            unsafe {
+                f.CheckFeatureSupport(
+                    DXGI_FEATURE_PRESENT_ALLOW_TEARING,
+                    &mut allow_tearing as *mut _ as *mut _,
+                    std::mem::size_of::<i32>() as u32,
+                )
+            }
+            .ok()?;
+            Some(allow_tearing != 0)
+        })
+        .unwrap_or(false)
+}
+
+#[cfg(target_os = "windows")]
 fn create_swap_chain(
     command_queue: &ID3D12CommandQueue,
     hwnd: HWND,
     bounds: Bounds<Pixels>,
+    tearing_supported: bool,
 ) -> Result<IDXGISwapChain3> {
     let factory: IDXGIFactory4 = unsafe { CreateDXGIFactory2(DXGI_CREATE_FACTORY_FLAGS(0)) }
         .context("creating DXGI factory for native presenter")?;
+    let swap_flags = if tearing_supported {
+        (DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING | DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT)
+            .0 as u32
+    } else {
+        0
+    };
     let desc = DXGI_SWAP_CHAIN_DESC1 {
         Width: pixels_to_u32(bounds.size.width),
         Height: pixels_to_u32(bounds.size.height),
@@ -199,9 +266,9 @@ fn create_swap_chain(
         BufferUsage: DXGI_USAGE_RENDER_TARGET_OUTPUT,
         BufferCount: BUFFER_COUNT as u32,
         Scaling: DXGI_SCALING_STRETCH,
-        SwapEffect: DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+        SwapEffect: DXGI_SWAP_EFFECT_FLIP_DISCARD,
         AlphaMode: DXGI_ALPHA_MODE_IGNORE,
-        Flags: 0,
+        Flags: swap_flags,
     };
     let swap_chain =
         unsafe { factory.CreateSwapChainForHwnd(command_queue, hwnd, &desc, None, None) }
