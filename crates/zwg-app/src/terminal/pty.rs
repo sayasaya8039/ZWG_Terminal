@@ -931,29 +931,28 @@ pub fn zwg_env_vars(pane_id: u32) -> Vec<(String, String)> {
     let pid = std::process::id();
     let tmux_value = format!("{},{},0", conn, pid);
 
-    // Prepend shim directory to PATH so `tmux` resolves to our shim.
-    // Skip if already present anywhere in PATH to avoid unbounded growth
-    // when PTYs nest (e.g. Claude spawning sub-shells).
+    // Always place our shim dir at the FRONT of PATH, removing any
+    // existing entry first.  When both smux and ZWG are installed,
+    // the other terminal's shim dir may appear earlier in PATH,
+    // causing `tmux.exe` / `claude.cmd` to resolve to the wrong binary.
+    // This was the root cause of FINDINGS #4 (teammate-mode fallback).
     let shim = shim_dir();
     let current_path = std::env::var("PATH").unwrap_or_default();
     let separator = if cfg!(windows) { ";" } else { ":" };
     let shim_str = shim.to_string_lossy();
-    let already_present = current_path
+    let filtered: Vec<&str> = current_path
         .split(separator)
-        .any(|entry| {
+        .filter(|entry| {
             let e = entry.trim_end_matches(['/', '\\']);
             let s = shim_str.trim_end_matches(['/', '\\']);
             if cfg!(windows) {
-                e.eq_ignore_ascii_case(s)
+                !e.eq_ignore_ascii_case(s)
             } else {
-                e == s
+                e != s
             }
-        });
-    let new_path = if already_present {
-        current_path.clone()
-    } else {
-        format!("{}{}{}", shim.display(), separator, current_path)
-    };
+        })
+        .collect();
+    let new_path = format!("{}{}{}", shim.display(), separator, filtered.join(separator));
 
     #[cfg(windows)]
     let hook_cmd_path = shim.join("zwg-agent-hook.cmd");

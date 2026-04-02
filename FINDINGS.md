@@ -420,3 +420,179 @@ gpui 0.2.2が同じ`WM_IME_COMPOSITION`メッセージから`replace_text_in_ran
 | `crates/zwg-app/src/terminal/view.rs` | L193(IME_VK_PROCESSKEY), L212(queue), L403(hook), L2130(dedup), L2680(replace_text_in_range) |
 | `crates/zwg-app/src/app.rs` | L79(INPUT_METHOD_VK_PROCESSKEY), L215(root hook), L5394(RootView replace_text) |
 | gpui-0.2.2 `events.rs` | L372(handle_keydown_msg), L657(handle_ime_composition), L685(GCS_RESULTSTR) |
+
+---
+
+# FINDINGS #4: tmux スポーンバックエンド障害（Agent Teams 展開失敗）
+
+**日付**: 2026-04-03
+**調査方式**: Delegate Mode（5仮説エージェント並行調査 + リードによるクロス検証）
+**ステータス**: 根本原因確定
+
+---
+
+## エグゼクティブサマリー
+
+ZWG Terminal 内で Claude Code の Agent team_name スポーンが失敗し、
+「tmuxスポーンバックエンドに問題があります。直接分析に切り替えて並行実行します」
+とフォールバックする。smux では同じ仕組みで正常動作。
+
+**根本原因**: ZWG の PATH 処理バグにより、smux の shim が優先解決され、
+smux の `claude.cmd` が ZWG 環境の `TMUX` 変数を空に上書きする。
+
+---
+
+## 根本原因: PATH 処理バグ（CRITICAL）
+
+**ファイル**: `crates/zwg-app/src/terminal/pty.rs:941-956`
+
+### ZWG の現行ロジック（バグあり）
+
+```rust
+// pty.rs:941-956
+let already_present = current_path.split(separator).any(|entry| {
+    let e = entry.trim_end_matches(['/', '\\']);
+    let s = shim_str.trim_end_matches(['/', '\\']);
+    if cfg!(windows) { e.eq_ignore_ascii_case(s) } else { e == s }
+});
+let new_path = if already_present {
+    current_path.clone()   // <-- バグ: 何もしない！位置を変更しない！
+} else {
+    format!("{}{}{}", shim.display(), separator, current_path)
+};
+```
+
+### smux の正常ロジック（参照実装）
+
+**ファイル**: `smux/crates/smux-app/src/terminal/pty.rs:1062-1078`
+
+```rust
+// Always place our shim dir at the FRONT of PATH, removing any
+// existing entry first.  When both smux and ZWG are installed,
+// the other terminal's shim dir may appear earlier in PATH,
+// causing `tmux.exe` to resolve to the wrong binary.
+let filtered: Vec<&str> = current_path
+    .split(separator)
+    .filter(|entry| {
+        let e = entry.trim_end_matches(['/', '\\']);
+        let s = shim_str.trim_end_matches(['/', '\\']);
+        if cfg!(windows) { !e.eq_ignore_ascii_case(s) } else { e != s }
+    })
+    .collect();
+let new_path = format!("{}{}{}", shim.display(), separator, filtered.join(separator));
+```
+
+### 障害メカニズム
+
+**実測 PATH 順序** (2026-04-03):
+```
+C:\Users\Owner\AppData\Local\smux\bin    ← 位置 ~10（先に解決される）
+...
+C:\Users\Owner\AppData\Local\zwg\bin     ← 位置 ~30（後ろ）
+```
+
+**障害フロー**:
+1. ZWG が PTY を生成し PATH を構築
+2. `zwg/bin` が PATH に既存 → `already_present = true` → **PATH 変更なし**
+3. `smux/bin` が `zwg/bin` より前に残る
+4. `tmux.exe` → smux 版に解決（ZWG 版ではなく）
+5. `claude.cmd` → smux 版に解決
+
+### claude.cmd クロス汚染の詳細
+
+smux の `claude.cmd` が ZWG 環境で実行されると:
+
+```batch
+rem smux の claude.cmd:
+if defined SMUX_TMUX_VALUE (set "_TMUX=%SMUX_TMUX_VALUE%") else (set "_TMUX=")
+rem ↑ ZWG環境では SMUX_TMUX_VALUE 未定義 → _TMUX = "" (空文字)
+
+if defined _TMUX (
+    endlocal & set "TMUX=%_TMUX%" & ...
+rem ↑ CMD では空文字も "defined" → TMUX="" に上書き！
+)
+```
+
+結果:
+- `TMUX` が空に上書き → Claude Code が tmux 環境を検出不能
+- `SMUX_CLAUDE_TEAMMATE_MODE` 未設定 → `--teammate-mode tmux` 未注入
+- チームスポーン不能 → フォールバック
+
+---
+
+## 修正方針
+
+`pty.rs:941-956` を smux と同じ「削除→先頭再配置」ロジックに変更:
+
+```rust
+// Fix: Always place zwg shim dir at FRONT, removing existing entry first.
+// When both smux and ZWG are installed, the other terminal's shim dir
+// may appear earlier in PATH, causing wrong binary resolution.
+let filtered: Vec<&str> = current_path
+    .split(separator)
+    .filter(|entry| {
+        let e = entry.trim_end_matches(['/', '\\']);
+        let s = shim_str.trim_end_matches(['/', '\\']);
+        if cfg!(windows) {
+            !e.eq_ignore_ascii_case(s)
+        } else {
+            e != s
+        }
+    })
+    .collect();
+let new_path = format!("{}{}{}", shim.display(), separator, filtered.join(separator));
+```
+
+---
+
+## 棄却された仮説
+
+| # | 仮説 | 結果 | Agent | 根拠 |
+|---|------|------|-------|------|
+| 1 | $TMUX 環境変数未設定 | 棄却 | Agent-1/5 | pty.rs:985 で設定済み |
+| 2 | IPC Named Pipe 互換性 | 棄却 | Agent-2 | 同一プロトコル・フォーマット |
+| 3 | tmux コマンドパーサー欠落 | 棄却 | Agent-3 | 同等の実装（両方に tmux shim あり） |
+| 4 | ペイン分割 API 不整合 | 棄却 | Agent-4 | 互換 API シグネチャ |
+| 5 | Hook スクリプト差異 | 棄却 | Agent-3 | 同一ロジック（smux/zwg 両方登録済み） |
+| 6 | Claude Code 側の検出失敗 | 部分支持 | Agent-5 | PATH 経由で間接的に影響 |
+
+---
+
+## 影響範囲
+
+- ZWG Terminal 内での Claude Code Agent Teams **全般**
+- **smux と ZWG が同一マシンにインストールされている環境でのみ発生**
+- smux 単独 / ZWG 単独では発生しない
+
+---
+
+## テスト計画
+
+1. 修正後、ZWG 内で `echo $PATH | tr ';' '\n' | head -5` → `zwg/bin` が先頭
+2. `which tmux` → `zwg/bin/tmux.exe` に解決
+3. `which claude` → `zwg/bin/claude.cmd` に解決
+4. Claude Code で `TeamCreate` + `Agent team_name=test` → ペイン分割成功
+
+---
+
+## 調査に参加したエージェント
+
+| エージェント | 仮説 | 結果 |
+|------------|------|------|
+| agent-1-env | $TMUX 環境変数 | 棄却（ZWG で設定済み確認） |
+| agent-2-ipc | IPC Named Pipe 互換性 | 棄却（同一構造） |
+| agent-3-tmux-cmd | tmux コマンドエミュレーション | 棄却（同等実装） |
+| agent-4-pane | ペイン分割ロジック | 棄却（互換 API） |
+| agent-5-detection | Claude Code 検出メカニズム | 部分支持（PATH 間接影響） |
+
+---
+
+## リード検証で発見した追加事実
+
+| 発見 | ファイル | 行 |
+|------|---------|-----|
+| smux は PATH から自身を削除→再配置 | smux/pty.rs | 1062-1078 |
+| ZWG は already_present で何もしない | zwg/pty.rs | 941-956 |
+| smux は CLI モードで shim 再作成を回避 | smux/main.rs | 123-128 |
+| 両 shim dir に claude.cmd/tmux.exe 共存 | AppData/Local/{smux,zwg}/bin/ | — |
+| claude.cmd の TMUX 上書きが直接原因 | smux/pty.rs shim content | 613-634 |
