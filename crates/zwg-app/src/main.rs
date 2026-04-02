@@ -337,16 +337,44 @@ fn main() {
         // which has no console by default. Without this, println!/eprintln!
         // output is silently discarded — breaking tmux commands like
         // `split-window -F '#{pane_id}'` that must print to stdout.
+        //
+        // CRITICAL FIX: When Claude Code spawns this process with piped
+        // stdout (child_process.spawn), Windows gives us valid pipe handles.
+        // Calling AttachConsole unconditionally OVERWRITES those pipe handles
+        // with console handles, so Claude Code can never read our output.
+        // We must check if stdout is already a valid pipe before attaching.
         #[cfg(windows)]
         {
             unsafe extern "system" {
                 fn AttachConsole(process_id: u32) -> i32;
+                fn GetStdHandle(std_handle: u32) -> *mut core::ffi::c_void;
+                fn GetFileType(file: *mut core::ffi::c_void) -> u32;
             }
+            const STD_OUTPUT_HANDLE: u32 = 0xFFFFFFF5u32; // -11i32 as u32
+            const INVALID_HANDLE_VALUE: *mut core::ffi::c_void = -1isize as *mut _;
+            const FILE_TYPE_PIPE: u32 = 0x0003;
             const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
-            unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
+
+            let stdout_handle = unsafe { GetStdHandle(STD_OUTPUT_HANDLE) };
+            let stdout_is_pipe = !stdout_handle.is_null()
+                && stdout_handle != INVALID_HANDLE_VALUE
+                && unsafe { GetFileType(stdout_handle) } == FILE_TYPE_PIPE;
+
+            if !stdout_is_pipe {
+                // No valid pipe — we need a console for output
+                unsafe { AttachConsole(ATTACH_PARENT_PROCESS); }
+            }
+            // else: stdout is already a pipe (e.g. Claude Code child_process),
+            // do NOT call AttachConsole to avoid overwriting the pipe handle.
         }
         cli::run_client(cli_command);
         // run_client calls process::exit() — unreachable
+    }
+
+    // Ensure shims are up-to-date in GUI mode only (the long-running server).
+    // CLI-mode exits above before reaching here.
+    if let Err(e) = terminal::pty::create_tmux_shims() {
+        eprintln!("zwg: failed to create tmux shims: {}", e);
     }
 
     log::info!("ZWG Terminal v{} starting", env!("CARGO_PKG_VERSION"));
