@@ -367,7 +367,7 @@ impl TerminalSurface {
         let handle = std::thread::Builder::new()
             .name("zwg-pty-reader".into())
             .spawn(move || {
-                let mut buf = [0u8; 262_144]; // 256KB for high-throughput CLI output
+                let mut buf = [0u8; 1_048_576]; // 1MB read buffer (Alacritty-equivalent)
                 let mut win32_input_tracker = Win32InputModeTracker::default();
                 // Batching buffer: accumulate multiple PTY reads before locking backend.
                 // Only used in sync (non-async) mode to reduce mutex contention.

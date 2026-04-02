@@ -58,6 +58,10 @@ pub(super) struct TerminalSnapshot {
     pub cursor_visible: bool,
     pub content_revision: u64,
     pub damaged_rows: Vec<u16>,
+    /// Alacritty-inspired 2-frame damage double buffer.
+    /// `prev_damaged_rows` holds damage from the previous frame so that
+    /// compositors / partial-redraw paths don't miss stale regions.
+    pub prev_damaged_rows: Vec<u16>,
 }
 
 impl TerminalSnapshot {
@@ -69,6 +73,7 @@ impl TerminalSnapshot {
             cursor_visible: true,
             content_revision: 0,
             damaged_rows: Vec::new(),
+            prev_damaged_rows: Vec::new(),
         }
     }
 
@@ -76,6 +81,26 @@ impl TerminalSnapshot {
         self.rows
             .resize(rows as usize, CachedTerminalRow::default());
         self.damaged_rows.clear();
+        self.prev_damaged_rows.clear();
+    }
+
+    /// Swap damage buffers — call after each frame render.
+    /// Previous frame's damage is preserved for 2-frame compositing.
+    pub fn swap_damage(&mut self) {
+        std::mem::swap(&mut self.prev_damaged_rows, &mut self.damaged_rows);
+        self.damaged_rows.clear();
+    }
+
+    /// Combined damage from current + previous frame (for 2-frame compositing).
+    pub fn combined_damage(&self) -> SmallVec<[u16; 32]> {
+        let mut combined: SmallVec<[u16; 32]> = SmallVec::new();
+        combined.extend_from_slice(&self.damaged_rows);
+        for &row in &self.prev_damaged_rows {
+            if !combined.contains(&row) {
+                combined.push(row);
+            }
+        }
+        combined
     }
 }
 
@@ -655,12 +680,69 @@ fn persist_active_glyph_plans(
     }
 }
 
+/// Maximum glyph cache size — prevents unbounded growth while keeping
+/// recently used glyphs warm.  Inspired by Alacritty's glyph cache which
+/// never evicts (relying on full reset), but we add a soft ceiling to
+/// avoid memory bloat for long-running sessions with many unique glyphs.
+#[cfg(feature = "ghostty_vt")]
+const GLYPH_CACHE_SOFT_MAX: usize = 4096;
+
 #[cfg(feature = "ghostty_vt")]
 fn prune_glyph_cache(
     cache: &mut HashMap<GlyphKey, PreparedGlyphPlan>,
     active_keys: &HashSet<GlyphKey>,
 ) {
-    cache.retain(|key, _| active_keys.contains(key));
+    // Only prune if cache exceeds soft max — avoids thrashing on normal usage.
+    // Alacritty never prunes (grows unbounded), but we add a ceiling.
+    if cache.len() > GLYPH_CACHE_SOFT_MAX {
+        cache.retain(|key, _| active_keys.contains(key));
+    }
+}
+
+/// Pre-warm the glyph cache with ASCII printable characters (32-126).
+/// Inspired by Alacritty's `load_common_glyphs()` which preloads ASCII
+/// across all font variants to eliminate first-frame shaping latency.
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn preload_ascii_glyphs(
+    text_system: &WindowTextSystem,
+    font_desc: &Font,
+    font_size: Pixels,
+    cell_height: f32,
+    cache: &mut HashMap<GlyphKey, PreparedGlyphPlan>,
+) {
+    // ASCII printable range + common box-drawing characters
+    let chars: Vec<char> = (32u8..=126)
+        .map(|b| b as char)
+        .chain(['│', '─', '┌', '┐', '└', '┘', '├', '┤', '┬', '┴', '┼', '█', '▀', '▄'].into_iter())
+        .collect();
+
+    let flag_variants: &[u8] = &[
+        0,                      // regular
+        GHOSTTY_FLAG_BOLD,      // bold
+        GHOSTTY_FLAG_ITALIC,    // italic
+        GHOSTTY_FLAG_BOLD | GHOSTTY_FLAG_ITALIC, // bold+italic
+    ];
+
+    for &ch in &chars {
+        let glyph_str = ch.to_string();
+        let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(1) as u8;
+        for &flags in flag_variants {
+            let key = GlyphKey {
+                glyph: glyph_str.clone(),
+                width,
+                flags,
+                render_path: GlyphRenderPath::AtlasMonochrome,
+            };
+            // Use or_insert_with to avoid reshaping if already cached
+            let _ = glyph_layout_for_key(&key, text_system, font_desc, font_size, cell_height, cache);
+        }
+    }
+    log::info!(
+        "ASCII glyph preload complete: {} entries in cache ({}×{} variants)",
+        cache.len(),
+        chars.len(),
+        flag_variants.len()
+    );
 }
 
 #[cfg(feature = "ghostty_vt")]
@@ -1196,6 +1278,17 @@ pub(super) fn terminal_canvas(
             #[cfg(feature = "ghostty_vt")]
             let mut glyph_layout_cache = {
                 let mut cache = glyph_cache.lock();
+                // Alacritty-inspired: preload ASCII on first paint to eliminate
+                // first-frame shaping latency for common characters.
+                if cache.is_empty() {
+                    preload_ascii_glyphs(
+                        &text_system,
+                        &font_desc,
+                        font_size,
+                        config.cell_height,
+                        &mut cache,
+                    );
+                }
                 prune_glyph_cache(&mut cache, &active_glyph_keys);
                 borrow_active_glyph_plans(&cache, &active_glyph_keys)
             };
@@ -1898,6 +1991,7 @@ mod tests {
             cursor_visible: true,
             content_revision: 0,
             damaged_rows: Vec::new(),
+            prev_damaged_rows: Vec::new(),
         };
 
         let keys = collect_active_glyph_keys(&snapshot);
@@ -1948,6 +2042,7 @@ mod tests {
             cursor_visible: true,
             content_revision: 0,
             damaged_rows: Vec::new(),
+            prev_damaged_rows: Vec::new(),
         };
 
         let keys = collect_damaged_glyph_keys(&snapshot);
