@@ -202,6 +202,10 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
             Some(command_parts.join(" "))
         };
 
+        // Mark panes created via IPC split-window so the shell wrapper
+        // knows to auto-exit when the claude process finishes.
+        env_vars.push(("ZWG_SPLIT_PANE".to_string(), "1".to_string()));
+
         let (resp_tx, resp_rx) = flume::bounded(1);
         let cmd = GpuiCommand::SplitWindow {
             horizontal,

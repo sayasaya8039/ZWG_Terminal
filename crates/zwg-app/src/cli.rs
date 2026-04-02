@@ -452,12 +452,22 @@ fn fmt_default(fmt: &str, pane_id: u32) -> String {
 
 fn run_display_message(print_stdout: bool, format: Option<String>) -> ! {
     let fmt = format.as_deref().unwrap_or("#{session_name}");
-    let pane_id = send_ipc_request(&IpcRequest {
-        id: 1, command: "list-panes".into(), args: vec![],
-    }).ok()
-        .filter(|r| r.success)
-        .and_then(|r| r.data.get("panes")?.as_array()?.first()?.get("pane_id")?.as_u64())
-        .unwrap_or(0) as u32;
+
+    // Use $TMUX_PANE to identify the calling pane (each PTY inherits this).
+    // Falling back to list-panes first entry only when the env var is absent.
+    let caller_pane_id = std::env::var("TMUX_PANE")
+        .ok()
+        .and_then(|s| s.trim_start_matches('%').parse::<u32>().ok());
+
+    let pane_id = caller_pane_id.unwrap_or_else(|| {
+        send_ipc_request(&IpcRequest {
+            id: 1, command: "list-panes".into(), args: vec![],
+        }).ok()
+            .filter(|r| r.success)
+            .and_then(|r| r.data.get("panes")?.as_array()?.first()?.get("pane_id")?.as_u64())
+            .unwrap_or(0) as u32
+    });
+
     if print_stdout { println!("{}", fmt_default(fmt, pane_id)); }
     std::process::exit(0);
 }
