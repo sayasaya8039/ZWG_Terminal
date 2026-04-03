@@ -61,7 +61,7 @@ impl NativeGpuPresenter {
             .cast::<IDXGISwapChain2>()
             .ok()
             .and_then(|sc2| unsafe {
-                let _ = sc2.SetMaximumFrameLatency(1);
+                let _ = sc2.SetMaximumFrameLatency(2);
                 let handle = sc2.GetFrameLatencyWaitableObject();
                 if handle.is_invalid() {
                     None
@@ -131,9 +131,13 @@ impl NativeGpuPresenter {
 
     pub(crate) fn present(&mut self) -> Result<()> {
         // Wait for the previous frame to finish before queuing a new one.
+        // Timeout kept minimal (2ms ≈ 500Hz ceiling) — the waitable object
+        // fires as soon as the GPU finishes the previous present, typically
+        // well under 2ms.  The old value of 1000ms blocked the CPU far too
+        // long and capped throughput to single-digit fps on timeout paths.
         if let Some(handle) = self.frame_latency_waitable {
             unsafe {
-                WaitForSingleObjectEx(handle, 1000, false);
+                WaitForSingleObjectEx(handle, 2, false);
             }
         }
         // Use ALLOW_TEARING for lowest latency when supported (implies vsync off).

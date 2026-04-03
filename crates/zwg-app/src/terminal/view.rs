@@ -36,7 +36,7 @@ const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
 // Claude Code /fast).  The event loop switches automatically based on how many
 // consecutive frames contained changes.
 const FRAME_COALESCE_NORMAL_MICROS: u64 = 1_667; // ~600 Hz
-const FRAME_COALESCE_FAST_MICROS: u64 = 5_000; // ~200 Hz (batches more per frame)
+const FRAME_COALESCE_FAST_MICROS: u64 = 1_667; // ~600 Hz (match normal for sustained throughput)
 const SETTLE_NORMAL_MILLIS: u64 = 2;
 const SETTLE_FAST_MILLIS: u64 = 1;
 const RETRY_LIMIT_NORMAL: usize = 4;
@@ -1429,7 +1429,7 @@ impl TerminalPane {
             self.cell_width = cell_width;
             self.cell_height = cell_height;
             #[cfg(feature = "ghostty_vt")]
-            self.glyph_cache.lock().clear();
+            self.glyph_cache.write().clear();
             self.recreate_gpu_state(cx);
             if self.last_width > 0.0 && self.last_height > 0.0 {
                 let _ = self.handle_resize(self.last_width, self.last_height);
@@ -1484,7 +1484,7 @@ impl TerminalPane {
             self.snapshot.resize(new_rows);
             // Clear glyph cache on resize — grid geometry changed
             #[cfg(feature = "ghostty_vt")]
-            self.glyph_cache.lock().clear();
+            self.glyph_cache.write().clear();
             #[cfg(not(feature = "ghostty_vt"))]
             self.row_generations.resize(new_rows as usize, 0);
             return true;
@@ -2231,7 +2231,7 @@ impl TerminalPane {
             TerminalState::Running => {
                 // Snap to bottom on user input
                 if self.scroll_offset != 0 {
-                    self.surface.scroll_viewport(-(self.scroll_offset as i32));
+                    self.surface.scroll_viewport_bottom();
                     self.scroll_offset = 0;
                 }
                 let _ = self.surface.write_input(data);
@@ -2537,10 +2537,21 @@ impl TerminalPane {
             // Consume IME flag to prevent residual state if replace_text_in_range
             // is not subsequently called by gpui (safety net).
             IME_VK_PROCESSKEY.store(false, Ordering::Release);
-            if self.clear_selection() {
+            // Snap to bottom so the prompt stays visible during IME input.
+            if self.scroll_offset != 0 {
+                self.surface.scroll_viewport_bottom();
+                self.scroll_offset = 0;
+                cx.notify();
+            } else if self.clear_selection() {
                 cx.notify();
             }
             return;
+        }
+
+        // Snap to bottom on any keypress so the user always sees the prompt.
+        if self.scroll_offset != 0 {
+            self.surface.scroll_viewport_bottom();
+            self.scroll_offset = 0;
         }
 
         let bytes = match Self::keystroke_to_bytes_with_win32_mode(
@@ -2557,6 +2568,7 @@ impl TerminalPane {
                     "keystroke_to_bytes:none -> stop propagation",
                 );
                 cx.stop_propagation();
+                cx.notify();
                 return;
             }
         };
@@ -2895,6 +2907,11 @@ impl EntityInputHandler for TerminalPane {
         }
         if self.input_suppressed.load(Ordering::Relaxed) {
             return;
+        }
+        // Snap to bottom during IME preedit so the prompt stays visible.
+        if self.scroll_offset != 0 {
+            self.surface.scroll_viewport_bottom();
+            self.scroll_offset = 0;
         }
         let was_composing = self.ime_composing;
         self.ime_composing = !_new_text.is_empty();

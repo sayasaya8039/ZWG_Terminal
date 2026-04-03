@@ -11,8 +11,9 @@ use super::{DEFAULT_BG, DEFAULT_FG};
 
 /// Cross-frame glyph layout cache type.
 /// Persists shaped glyphs across render frames to avoid redundant text shaping.
+/// RwLock: reads vastly outnumber writes — avoids contention on the hot path.
 #[cfg(feature = "ghostty_vt")]
-pub(super) type GlyphCache = Arc<Mutex<HashMap<GlyphKey, PreparedGlyphPlan>>>;
+pub(super) type GlyphCache = Arc<parking_lot::RwLock<HashMap<GlyphKey, PreparedGlyphPlan>>>;
 
 #[cfg(not(feature = "ghostty_vt"))]
 pub(super) type GlyphCache = ();
@@ -1349,20 +1350,28 @@ pub(super) fn terminal_canvas(
             // instead of rebuilding HashMap every paint (saves ~50-80% shaping work)
             #[cfg(feature = "ghostty_vt")]
             let mut glyph_layout_cache = {
-                let mut cache = glyph_cache.lock();
-                // Alacritty-inspired: preload ASCII on first paint to eliminate
-                // first-frame shaping latency for common characters.
-                if cache.is_empty() {
-                    preload_ascii_glyphs(
-                        &text_system,
-                        &font_desc,
-                        font_size,
-                        config.cell_height,
-                        &mut cache,
-                    );
+                // Fast path: read lock for cache hits (vast majority of frames).
+                let needs_init = glyph_cache.read().is_empty();
+                if needs_init {
+                    let mut cache = glyph_cache.write();
+                    // Alacritty-inspired: preload ASCII on first paint to eliminate
+                    // first-frame shaping latency for common characters.
+                    if cache.is_empty() {
+                        preload_ascii_glyphs(
+                            &text_system,
+                            &font_desc,
+                            font_size,
+                            config.cell_height,
+                            &mut cache,
+                        );
+                    }
+                    prune_glyph_cache(&mut cache, &active_glyph_keys);
+                    borrow_active_glyph_plans(&cache, &active_glyph_keys)
+                } else {
+                    let mut cache = glyph_cache.write();
+                    prune_glyph_cache(&mut cache, &active_glyph_keys);
+                    borrow_active_glyph_plans(&cache, &active_glyph_keys)
                 }
-                prune_glyph_cache(&mut cache, &active_glyph_keys);
-                borrow_active_glyph_plans(&cache, &active_glyph_keys)
             };
             #[cfg(feature = "ghostty_vt")]
             for key in &damaged_glyph_keys {
@@ -1529,7 +1538,7 @@ pub(super) fn terminal_canvas(
 
             #[cfg(feature = "ghostty_vt")]
             {
-                let mut cache = glyph_cache.lock();
+                let mut cache = glyph_cache.write();
                 prune_glyph_cache(&mut cache, &active_glyph_keys);
                 persist_active_glyph_plans(&mut cache, glyph_layout_cache, &active_glyph_keys);
             }

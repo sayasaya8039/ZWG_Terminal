@@ -196,8 +196,11 @@ impl GpuTerminalState {
         let needs_full_copy = matches!(refresh, PackedRefresh::Full)
             || self.frame_cells.len() != self.packed_cells.len();
         if needs_full_copy {
-            self.frame_cells.clear();
-            self.frame_cells.extend_from_slice(&self.packed_cells);
+            // Reuse allocation — resize + copy_from_slice avoids clear+extend overhead.
+            self.frame_cells.resize(self.packed_cells.len(), ghostty_vt::GpuCellData {
+                col: 0, row: 0, codepoint: 0, fg_rgba: 0, bg_rgba: 0, flags: 0, _pad: 0,
+            });
+            self.frame_cells.copy_from_slice(&self.packed_cells);
         } else {
             patch_packed_cells_from_rows(
                 &self.packed_rows,
@@ -354,11 +357,19 @@ impl GpuTerminalState {
 }
 
 pub(super) fn snapshot_can_present_natively(snapshot: &TerminalSnapshot) -> bool {
-    snapshot.rows.iter().all(|row| {
-        row.cells
-            .iter()
-            .all(|cell| !glyph_requires_gpui_overlay(&cell.glyph))
-    })
+    // Fast path: only check damaged rows instead of full O(rows×cols) scan.
+    // If no rows are damaged, the previous result is still valid — assume native.
+    if snapshot.damaged_rows.is_empty() {
+        return true;
+    }
+    for &row_idx in &snapshot.damaged_rows {
+        if let Some(row) = snapshot.rows.get(row_idx as usize) {
+            if row.cells.iter().any(|cell| glyph_requires_gpui_overlay(&cell.glyph)) {
+                return false;
+            }
+        }
+    }
+    true
 }
 
 #[cfg(target_os = "windows")]
@@ -379,13 +390,26 @@ fn row_to_gpu_cells(
     default_bg: u32,
 ) -> Vec<ghostty_vt::GpuCellData> {
     let mut packed = Vec::with_capacity(term_cols as usize);
+    // Cursor-based style lookup: walk style_runs once instead of O(runs) per col.
+    let runs = &row.style_runs;
+    let mut run_idx: usize = 0;
     for col in 0..term_cols {
-        let (fg_rgb, bg_rgb, flags) = super::grid_renderer::grid_cell_style_at(
-            &row.style_runs,
-            col + 1,
-            default_fg,
-            default_bg,
-        );
+        let col1 = col + 1; // style_runs use 1-based columns
+        // Advance cursor past runs that end before this column
+        while run_idx < runs.len() && runs[run_idx].end_col < col1 {
+            run_idx += 1;
+        }
+        let (fg_rgb, bg_rgb, flags) = if run_idx < runs.len()
+            && runs[run_idx].start_col <= col1
+            && col1 <= runs[run_idx].end_col
+        {
+            let run = &runs[run_idx];
+            let fg = ((run.fg.r as u32) << 16) | ((run.fg.g as u32) << 8) | (run.fg.b as u32);
+            let bg = ((run.bg.r as u32) << 16) | ((run.bg.g as u32) << 8) | (run.bg.b as u32);
+            (fg, bg, run.flags)
+        } else {
+            (default_fg, default_bg, 0)
+        };
         packed.push(ghostty_vt::GpuCellData {
             col,
             row: row_idx,
