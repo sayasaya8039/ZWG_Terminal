@@ -889,6 +889,12 @@ pub struct TerminalPane {
     /// Right-click context menu state
     context_menu_visible: bool,
     context_menu_position: Point<Pixels>,
+    /// Scrollbar: current viewport scroll offset (lines above bottom, 0 = at bottom)
+    scroll_offset: i64,
+    /// Scrollbar: whether user is dragging the scrollbar thumb
+    scrollbar_dragging: bool,
+    /// Scrollbar: max scrollback capacity (from settings) for scroll clamping
+    max_scrollback_lines: usize,
 }
 
 impl TerminalPane {
@@ -1294,6 +1300,9 @@ impl TerminalPane {
             _focus_in_sub: None,
             context_menu_visible: false,
             context_menu_position: Point::default(),
+            scroll_offset: 0,
+            scrollbar_dragging: false,
+            max_scrollback_lines: settings.scrollback_lines,
         }
     }
 
@@ -1880,12 +1889,73 @@ impl TerminalPane {
         // pane itself remains the mouse event owner for drag selection/copy.
         pane = pane.child(self.ime_canvas(cx)).child(terminal_element);
 
+        // Scrollbar overlay (right edge, semi-transparent)
+        if self.scroll_offset > 0 {
+            let scrollbar_element = self.render_scrollbar();
+            pane = pane.child(scrollbar_element);
+        }
+
         // Context menu overlay
         if self.context_menu_visible {
             pane = pane.child(self.render_context_menu(cx));
         }
 
         pane
+    }
+
+    /// Render a vertical scrollbar as an absolutely-positioned overlay on the right edge.
+    fn render_scrollbar(&self) -> Div {
+        let visible_rows = self.term_rows as f32;
+        let total_lines = (self.scroll_offset as f32 + visible_rows).max(visible_rows + 1.0);
+        let track_h = self.term_rows as f32 * self.cell_height;
+        let thumb_ratio = (visible_rows / total_lines).clamp(0.05, 1.0);
+        let thumb_h = (thumb_ratio * track_h).max(20.0);
+
+        let scrollable = total_lines - visible_rows;
+        let scroll_ratio = if scrollable > 0.0 {
+            1.0 - (self.scroll_offset as f32 / scrollable)
+        } else {
+            1.0
+        };
+        let thumb_top = scroll_ratio * (track_h - thumb_h);
+
+        div()
+            .absolute()
+            .right_0()
+            .top_0()
+            .bottom_0()
+            .w(px(8.0))
+            .bg(rgba(0x3132444du32))
+            .child(
+                div()
+                    .absolute()
+                    .right_0()
+                    .w(px(8.0))
+                    .top(px(thumb_top))
+                    .h(px(thumb_h))
+                    .rounded(px(4.0))
+                    .bg(rgba(0x585b70ccu32)),
+            )
+    }
+
+    /// Apply scrollbar drag: compute new scroll_offset from mouse Y position
+    fn apply_scrollbar_drag(&mut self, mouse_pos: Point<Pixels>, bounds: Bounds<Pixels>) {
+        let click_y = mouse_pos.y - bounds.top();
+        let track_h: f32 = bounds.size.height.into();
+        if track_h <= 0.0 {
+            return;
+        }
+        let ratio = (f32::from(click_y) / track_h).clamp(0.0, 1.0);
+        // ratio 0.0 = top (oldest = max offset), 1.0 = bottom (newest = 0)
+        let max_offset = self.max_scrollback_lines as i64;
+        let new_offset = ((1.0 - ratio) * max_offset as f32).round() as i64;
+        let new_offset = new_offset.clamp(0, max_offset);
+        if new_offset != self.scroll_offset {
+            let delta = new_offset - self.scroll_offset;
+            self.surface.scroll_viewport(delta as i32);
+            self.scroll_offset = new_offset;
+            self.refresh_snapshot(false);
+        }
     }
 }
 
@@ -2159,6 +2229,11 @@ impl TerminalPane {
     fn write_terminal_bytes(&mut self, data: &[u8]) {
         match self.state {
             TerminalState::Running => {
+                // Snap to bottom on user input
+                if self.scroll_offset != 0 {
+                    self.surface.scroll_viewport(-(self.scroll_offset as i32));
+                    self.scroll_offset = 0;
+                }
                 let _ = self.surface.write_input(data);
             }
             TerminalState::Pending => {
@@ -2524,6 +2599,19 @@ impl TerminalPane {
         if self.input_suppressed.load(Ordering::Relaxed) {
             return;
         }
+        // Check if click is on scrollbar track (right 8px)
+        if self.scroll_offset > 0 {
+            if let Some(bounds) = self.last_bounds {
+                let click_x = event.position.x - bounds.left();
+                let sb_width = px(8.0);
+                if click_x >= bounds.size.width - sb_width {
+                    self.scrollbar_dragging = true;
+                    self.apply_scrollbar_drag(event.position, bounds);
+                    cx.notify();
+                    return;
+                }
+            }
+        }
         if let Some(point) = self.mouse_to_selection_point(event.position) {
             if self.set_selection_state(Some(point), Some(point), true) {
                 cx.notify();
@@ -2559,6 +2647,14 @@ impl TerminalPane {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Scrollbar drag
+        if self.scrollbar_dragging && event.dragging() {
+            if let Some(bounds) = self.last_bounds {
+                self.apply_scrollbar_drag(event.position, bounds);
+                cx.notify();
+            }
+            return;
+        }
         if !self.is_selecting {
             return;
         }
@@ -2571,6 +2667,11 @@ impl TerminalPane {
     }
 
     fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.scrollbar_dragging {
+            self.scrollbar_dragging = false;
+            cx.notify();
+            return;
+        }
         if !self.is_selecting {
             return;
         }
@@ -2631,6 +2732,10 @@ impl TerminalPane {
         }
 
         if self.surface.scroll_viewport(line_delta) {
+            // Track scroll offset for scrollbar (positive = scrolled up into history)
+            self.scroll_offset = (self.scroll_offset + line_delta as i64)
+                .max(0)
+                .min(self.max_scrollback_lines as i64);
             if self.refresh_snapshot(false) {
                 cx.notify();
             }
