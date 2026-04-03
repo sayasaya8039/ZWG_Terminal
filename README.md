@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.2.0-blue" alt="Version">
+  <img src="https://img.shields.io/badge/version-1.3.0-blue" alt="Version">
   <img src="https://img.shields.io/badge/platform-Windows%2011-0078D6" alt="Platform">
   <img src="https://img.shields.io/badge/license-MIT-green" alt="License">
   <img src="https://img.shields.io/badge/rust-2024%20edition-orange" alt="Rust">
@@ -44,19 +44,21 @@ ZWG Terminal は **Ghostty の VT パーサ**（Zig 製）と **Zed エディタ
 ### アーキテクチャ
 
 ```
-┌─────────────────────────────────────────────────┐
-│                   ZWG Terminal                   │
-├───────────┬───────────────┬─────────────────────┤
-│  zwg-app  │  ghostty-vt   │  ghostty-vt-sys     │
-│  Rust     │  Safe Wrapper │  Zig → C ABI → Rust │
-│  GPUI UI  │  (Rust)       │  FFI Bindings       │
-├───────────┴───────────────┴─────────────────────┤
-│  GPUI 0.2 (Zed Editor Framework)                │
-├─────────────────────────────────────────────────┤
-│  ConPTY (Windows Pseudo Console)                │
-├─────────────────────────────────────────────────┤
-│  DX12 / Direct2D / DirectWrite                  │
-└─────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────┐
+│                    ZWG Terminal                      │
+├───────────┬────────────────┬────────────────────────┤
+│  zwg-app  │  ghostty-vt    │  ghostty-vt-sys        │
+│  Rust     │  Safe Wrapper  │  Zig → C ABI → Rust    │
+│  GPUI UI  │  (Rust)        │  FFI Bindings          │
+├───────────┴────────────────┴────────────────────────┤
+│  zwg-intelligence (AI / Rendering Acceleration)     │
+├─────────────────────────────────────────────────────┤
+│  GPUI 0.2 (Zed Editor Framework)                    │
+├─────────────────────────────────────────────────────┤
+│  ConPTY (Windows Pseudo Console)                    │
+├─────────────────────────────────────────────────────┤
+│  DX12 / Direct2D / DirectWrite                      │
+└─────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -67,19 +69,50 @@ ZWG Terminal は **Ghostty の VT パーサ**（Zig 製）と **Zed エディタ
 |------|------|
 | **マルチタブ** | タブの追加・切替・クローズ |
 | **ペイン分割** | 水平・垂直分割、ドラッグリサイズ |
+| **右クリックコンテキストメニュー** | ペイン管理（分割・クローズ・コピー・ペースト） |
+| **tmux 互換 IPC** | Claude Code エージェントチームの可視化・ペイン自動分割 |
 | **GUI 設定パネル** | 7 カテゴリの設定 UI（一般・外観・ターミナル・キーボード・通知・プライバシー・詳細） |
 | **マルチ AI サジェスト** | コマンドパレット入力中に Claude / OpenAI / Gemini API で候補コマンドを即時表示 |
 | **スニペットパレット** | クリップボード履歴 + 定型文管理・検索・新規作成・編集・ターミナルへ直接ペースト（日本語 IME 対応） |
+| **Intelligence モジュール** | Flash Attention、投機的デコーディング、KV 量子化、PagedAttention による Ollama 高速化 |
 | **テーマ** | Catppuccin Mocha / Latte、Tokyo Night、Solarized、Monokai、Dracula、Nord |
 | **背景画像** | カスタム背景画像（透過度調整可能） |
 | **シェル自動検出** | pwsh / PowerShell / CMD / WSL / Git Bash |
 | **ウィンドウ状態保存** | 位置・サイズを自動保存・復元 |
 | **カスタムタイトルバー** | ネイティブ Win32 ドラッグ、トラフィックライトボタン |
 | **GPU レンダリング** | DX12 ネイティブ GPU レンダラー + Ghostty VT バックエンド |
+| **高速レンダリング** | Alacritty 方式 PTY 1MB バッファ、ASCII グリフプリロード、ダメージダブルバッファ |
 | **非同期 I/O** | PTY 読み取り → VT パース を専用 Zig スレッドで実行 |
 | **キーバインドカスタマイズ** | 設定 UI からショートカットキーを変更可能 |
 | **通知設定** | ベル音・ビジュアルベル・プロセス完了通知の個別設定 |
 | **インストーラー** | PyInstaller 製 GUI インストーラー（ショートカット作成・レジストリ登録・アンインストーラー付き） |
+
+---
+
+## v1.3.0 の変更点
+
+### 新機能
+
+- **tmux 互換 IPC レイヤー** — Claude Code の TeamCreate によるエージェントチームをペイン分割で可視化
+- **右クリックコンテキストメニュー** — ペイン分割・クローズ・コピー・ペーストを右クリックから実行
+- **Intelligence モジュール** (`zwg-intelligence` クレート) — Flash Attention、投機的デコーディング、KV 量子化、PagedAttention、NVFP4、スライディングウィンドウ、並列デコーディング
+- **env-shim 自動生成** — PowerShell チームメイトスポーン用の環境変数注入
+
+### パフォーマンス改善
+
+- **Alacritty 方式高速化** — PTY 1MB バッファ、ASCII グリフプリロード、ダメージダブルバッファ
+- **レンダリングパイプライン最適化** — GPU デルタレンダリング、適応フレームペーシング、SIMD 最適化
+- **入力遅延削減** — クリップボード監視のオーバーヘッド削減、キーストローク時のデバッグ I/O 除去
+- **fast_io / input_accel / multi_nic** — I/O アクセラレーション、入力予測、マルチ NIC 最適化
+
+### バグ修正
+
+- IPC メッセージフラグメンテーション修正（Windows Named Pipes）
+- IME 二重入力・テキスト入力バグ 7 件修正（5 エージェント並行調査）
+- AttachConsole がパイプ stdout を上書きする問題を修正
+- PATH 処理を「削除→先頭再配置」に変更しチームスポーン障害を解消
+- スニペットパレットのゴースト選択・重複 ID・スクロール問題を修正
+- tmux ペイン検出失敗を修正
 
 ---
 
@@ -96,6 +129,7 @@ ZWG Terminal は **Ghostty の VT パーサ**（Zig 製）と **Zed エディタ
 | `Ctrl+Shift+Tab` | 前のペインにフォーカス |
 | `Ctrl+Shift+V` | スニペットパレットの表示/非表示 |
 | `Ctrl+Shift+F` | スニペットキュー貼り付け |
+| `Ctrl+E` | スニペット編集 |
 | `Ctrl+,` | 設定を開く |
 | `Ctrl+Shift+Q` | 終了 |
 
@@ -125,7 +159,7 @@ cd ZWG_Terminal
 git submodule update --init --recursive
 
 # 3. リリースビルド
-cargo build --release
+cargo zigbuild --release -p zwg-app
 
 # 4. 実行
 ./target/release/zwg.exe
@@ -137,11 +171,12 @@ cargo build --release
 
 ```toml
 [profile.release]
-opt-level = 2          # 高速最適化
-lto = false            # ビルド速度優先
-codegen-units = 16     # 並列コード生成
+opt-level = 3          # 最大最適化
+lto = "thin"           # Thin LTO（速度と最適化のバランス）
+codegen-units = 1      # 単一コード生成ユニット（最大最適化）
 strip = true           # シンボル除去
 panic = "abort"        # パニック時即座に終了
+overflow-checks = false # オーバーフロー検査無効化
 ```
 
 ---
@@ -179,6 +214,16 @@ ZWG_Terminal/
     │           ├── gpu_view.rs   # DX12 GPU レンダリング
     │           ├── native_gpu_presenter.rs  # DX12 ネイティブプレゼンター
     │           └── vt_parser.rs  # フォールバック VT パーサ
+    ├── zwg-intelligence/         # AI / レンダリング高速化モジュール
+    │   └── src/
+    │       ├── fast_io.rs        # 高速 I/O アクセラレーション
+    │       ├── input_accel.rs    # 入力予測・高速化
+    │       ├── flash_attention.rs # Flash Attention 実装
+    │       ├── speculative_decoder.rs # 投機的デコーディング
+    │       ├── kv_quantizer.rs   # KV キャッシュ量子化
+    │       ├── paged_attention.rs # PagedAttention
+    │       ├── render_accel.rs   # レンダリング高速化
+    │       └── ollama_client.rs  # Ollama クライアント
     ├── ghostty-vt/               # Safe Rust ラッパー
     │   └── src/lib.rs
     └── ghostty-vt-sys/           # Zig FFI バインディング
@@ -186,7 +231,6 @@ ZWG_Terminal/
         ├── src/lib.rs            # C ABI 宣言
         └── zig/
             ├── lib.zig           # Ghostty VT ラッパー
-            ├── build.zig         # Zig ビルド定義
             ├── content_scan.zig  # SIMD コンテンツ検出
             ├── gpu_renderer.zig  # GPU レンダリングパイプライン
             ├── shaders.zig       # HLSL シェーダー定義
@@ -266,6 +310,14 @@ Zed エディタで使用されている GPUI 0.2 を採用。Direct2D/DirectWri
 
 DirectX 12 ネイティブ GPU レンダラーにより、大量テキスト出力時でも高速な描画を実現。HLSL シェーダーによるグリフレンダリングパイプラインを搭載しています。
 
+### Intelligence モジュール
+
+`zwg-intelligence` クレートにより、Flash Attention・投機的デコーディング・KV 量子化・PagedAttention などの AI 高速化技術を統合。Ollama との連携で、ローカル LLM 推論を大幅に高速化します。
+
+### tmux 互換 IPC
+
+Windows Named Pipes ベースの tmux 互換 IPC レイヤーを内蔵。Claude Code の TeamCreate によるエージェントチームを自動的にペイン分割で可視化します。
+
 ### WASM ランタイム
 
 アプリ起動時に埋め込み WASM モジュールを安全に初期化し、`zig-ffi` / `dx12-renderer` / `gpui-host` の各 capability を検証します。ホスト import を持たないため、ファイル・ネットワーク・Windows API への直接アクセスはできません。
@@ -298,7 +350,7 @@ GUI インストーラー (`ZWG_Terminal_Setup.exe`) を使えばビルド不要
 
 ```bash
 # 1. リリースビルド
-cargo build --release
+cargo zigbuild --release -p zwg-app
 
 # 2. インストーラー作成（ステージング + PyInstaller）
 python installer/build_installer.py
@@ -311,14 +363,14 @@ python installer/build_installer.py
 
 ```powershell
 # リリース EXE を先に作成
-cargo build --release
+cargo zigbuild --release -p zwg-app
 
 # 自己署名証明書を作成
 powershell -ExecutionPolicy Bypass -File packaging/windows/New-CodeSigningCert.ps1
 
 # MSIX を生成して署名
 powershell -ExecutionPolicy Bypass -File packaging/windows/Build-MSIX.ps1 `
-  -Version 1.2.0.0 `
+  -Version 1.3.0.0 `
   -Publisher "CN=ZWG Terminal Test" `
   -Architecture x64 `
   -PfxPath packaging/windows/certs/ZWGTerminal-TestCert.pfx `
@@ -329,7 +381,7 @@ powershell -ExecutionPolicy Bypass -File packaging/windows/Build-MSIX.ps1 `
 
 ```powershell
 # ポータブル EXE
-cargo build --release
+cargo zigbuild --release -p zwg-app
 
 # GUI セットアップ EXE
 python installer/build_installer.py
@@ -350,12 +402,12 @@ signtool sign /fd SHA256 /f packaging/windows/certs/ZWGTerminal-TestCert.pfx `
 # 3. MSIX 署名
 signtool sign /fd SHA256 /f packaging/windows/certs/ZWGTerminal-TestCert.pfx `
   /p changeit /tr http://timestamp.digicert.com /td SHA256 `
-  packaging/windows/dist/ZWG_Terminal_1.2.0.0_x64.msix
+  packaging/windows/dist/ZWG_Terminal_1.3.0.0_x64.msix
 ```
 
 ### Winget / Microsoft Store 提出物
 
-- Winget manifest テンプレート: `packaging/winget/manifests/s/sayasaya8039/ZWGTerminal/1.2.0/`
+- Winget manifest テンプレート: `packaging/winget/manifests/s/sayasaya8039/ZWGTerminal/1.3.0/`
 - Microsoft Store / sideload 用 AppxManifest: `packaging/windows/AppxManifest.xml`
 - 本体 EXE の実行レベルは `resources/windows/app.manifest` で `asInvoker` を固定
 
@@ -366,7 +418,7 @@ signtool sign /fd SHA256 /f packaging/windows/certs/ZWGTerminal-TestCert.pfx `
 rustup target add aarch64-pc-windows-msvc
 cargo build --release --target aarch64-pc-windows-msvc
 powershell -ExecutionPolicy Bypass -File packaging/windows/Build-MSIX.ps1 `
-  -Version 1.2.0.0 `
+  -Version 1.3.0.0 `
   -Publisher "CN=ZWG Terminal Test" `
   -Architecture arm64
 ```

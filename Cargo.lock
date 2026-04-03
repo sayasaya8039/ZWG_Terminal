@@ -2389,14 +2389,14 @@ dependencies = [
 
 [[package]]
 name = "ghostty-vt"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "ghostty-vt-sys",
 ]
 
 [[package]]
 name = "ghostty-vt-sys"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "cc",
 ]
@@ -8368,7 +8368,7 @@ dependencies = [
 
 [[package]]
 name = "zwg"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "cc",
@@ -8400,7 +8400,7 @@ dependencies = [
 
 [[package]]
 name = "zwg-intelligence"
-version = "1.2.0"
+version = "1.3.0"
 dependencies = [
  "anyhow",
  "burn",
