@@ -57,6 +57,121 @@ pub struct QuantizedTensor {
     pub group_size: usize,
 }
 
+// --- AVX2 SIMD ヘルパー (量子化用) ---
+
+/// AVX2 max_abs: 8要素ずつ abs → _mm256_max_ps → 水平 max
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn avx2_max_abs(data: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let len = data.len();
+    // 符号ビットクリアマスク
+    let sign_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7FFF_FFFF_u32 as i32));
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0usize;
+
+    while i + 8 <= len {
+        let v = _mm256_loadu_ps(data.as_ptr().add(i));
+        let av = _mm256_and_ps(v, sign_mask); // abs
+        acc = _mm256_max_ps(acc, av);
+        i += 8;
+    }
+
+    // 水平リダクション: 256→128→スカラー
+    let hi = _mm256_extractf128_ps(acc, 1);
+    let lo = _mm256_castps256_ps128(acc);
+    let m128 = _mm_max_ps(lo, hi);
+    // [a,b,c,d] → max(a,b), max(c,d), ...
+    let shuf = _mm_shuffle_ps(m128, m128, 0b_01_00_11_10); // [c,d,a,b]
+    let m2 = _mm_max_ps(m128, shuf);
+    let shuf2 = _mm_shuffle_ps(m2, m2, 0b_00_00_00_01); // [b,a,b,a]
+    let m1 = _mm_max_ps(m2, shuf2);
+    let mut result = _mm_cvtss_f32(m1);
+
+    // 端数処理
+    while i < len {
+        let av = data[i].abs();
+        if av > result {
+            result = av;
+        }
+        i += 1;
+    }
+
+    result
+}
+
+/// AVX2 量子化ループ: v/scale → round → clamp を _mm256 で並列化
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn avx2_quantize_q8_chunk(chunk: &[f32], scale: f32, out: &mut Vec<u8>) {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let len = chunk.len();
+    let inv_scale = _mm256_set1_ps(1.0 / scale);
+    let clamp_min = _mm256_set1_ps(-128.0);
+    let clamp_max = _mm256_set1_ps(127.0);
+    let mut i = 0usize;
+
+    while i + 8 <= len {
+        let v = _mm256_loadu_ps(chunk.as_ptr().add(i));
+        // v / scale
+        let scaled = _mm256_mul_ps(v, inv_scale);
+        // round (最近接偶数丸め)
+        let rounded = _mm256_round_ps(scaled, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
+        // clamp [-128, 127]
+        let clamped = _mm256_min_ps(_mm256_max_ps(rounded, clamp_min), clamp_max);
+
+        // f32 → i8 → u8 に変換（スカラーフォールバック）
+        let mut vals = [0.0f32; 8];
+        _mm256_storeu_ps(vals.as_mut_ptr(), clamped);
+        for j in 0..8 {
+            out.push((vals[j] as i8) as u8);
+        }
+        i += 8;
+    }
+
+    // 端数処理
+    while i < len {
+        let q = (chunk[i] / scale).round().clamp(-128.0, 127.0) as i8;
+        out.push(q as u8);
+        i += 1;
+    }
+}
+
+/// AVX2 逆量子化: i8 * scale を _mm256_mul_ps で並列化
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn avx2_dequantize_q8_chunk(data: &[u8], scale: f32, result: &mut Vec<f32>) {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let len = data.len();
+    let scale_vec = _mm256_set1_ps(scale);
+    let mut i = 0usize;
+
+    while i + 8 <= len {
+        // u8 → i8 → f32 変換
+        let mut fvals = [0.0f32; 8];
+        for j in 0..8 {
+            fvals[j] = data[i + j] as i8 as f32;
+        }
+        let fvec = _mm256_loadu_ps(fvals.as_ptr());
+        let scaled = _mm256_mul_ps(fvec, scale_vec);
+        _mm256_storeu_ps(fvals.as_mut_ptr(), scaled);
+        result.extend_from_slice(&fvals);
+        i += 8;
+    }
+
+    // 端数処理
+    while i < len {
+        result.push(data[i] as i8 as f32 * scale);
+        i += 1;
+    }
+}
+
 impl QuantizedTensor {
     /// Quantize f32 data to Q8_0 format.
     pub fn quantize_q8(data: &[f32], group_size: usize) -> Self {
@@ -66,11 +181,33 @@ impl QuantizedTensor {
         let mut zero_points = Vec::with_capacity(num_groups);
 
         for chunk in data.chunks(group_size) {
-            let max_abs = chunk.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            // x86_64 では AVX2 で max_abs 検出 + 量子化
+            #[cfg(target_arch = "x86_64")]
+            let (max_abs, use_avx2) = {
+                if is_x86_feature_detected!("avx2") {
+                    (unsafe { avx2_max_abs(chunk) }, true)
+                } else {
+                    (chunk.iter().map(|v| v.abs()).fold(0.0f32, f32::max), false)
+                }
+            };
+            #[cfg(not(target_arch = "x86_64"))]
+            let (max_abs, use_avx2) = (
+                chunk.iter().map(|v| v.abs()).fold(0.0f32, f32::max),
+                false,
+            );
+
             let scale = if max_abs > 0.0 { max_abs / 127.0 } else { 1.0 };
             scales.push(scale);
             zero_points.push(0.0);
 
+            #[cfg(target_arch = "x86_64")]
+            if use_avx2 {
+                // AVX2 量子化ループ (_mm256_div_ps + _mm256_round_ps + clamp)
+                unsafe { avx2_quantize_q8_chunk(chunk, scale, &mut quantized) };
+                continue;
+            }
+
+            // フォールバック: スカラー量子化
             for &v in chunk {
                 let q = (v / scale).round().clamp(-128.0, 127.0) as i8;
                 quantized.push(q as u8);
@@ -96,7 +233,16 @@ impl QuantizedTensor {
         let mut zero_points = Vec::with_capacity(num_groups);
 
         for chunk in data.chunks(group_size) {
+            // AVX2 max_abs 検出
+            #[cfg(target_arch = "x86_64")]
+            let max_abs = if is_x86_feature_detected!("avx2") {
+                unsafe { avx2_max_abs(chunk) }
+            } else {
+                chunk.iter().map(|v| v.abs()).fold(0.0f32, f32::max)
+            };
+            #[cfg(not(target_arch = "x86_64"))]
             let max_abs = chunk.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+
             let scale = if max_abs > 0.0 { max_abs / 7.0 } else { 1.0 };
             scales.push(scale);
             zero_points.push(8.0); // offset for unsigned 4-bit
@@ -134,7 +280,14 @@ impl QuantizedTensor {
         let mut zero_points = Vec::with_capacity(num_groups);
 
         for chunk in data.chunks(group_size) {
-            // PolarQuant: separate magnitude and sign
+            // PolarQuant: AVX2 max_abs で大きさの最大値検出
+            #[cfg(target_arch = "x86_64")]
+            let max_mag = if is_x86_feature_detected!("avx2") {
+                unsafe { avx2_max_abs(chunk) }
+            } else {
+                chunk.iter().map(|v| v.abs()).fold(0.0f32, f32::max)
+            };
+            #[cfg(not(target_arch = "x86_64"))]
             let max_mag = chunk.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
             let scale = if max_mag > 0.0 { max_mag / 15.0 } else { 1.0 };
             scales.push(scale);
@@ -196,6 +349,17 @@ impl QuantizedTensor {
                 let mut result = Vec::with_capacity(self.num_elements);
                 for (gi, chunk) in self.data.chunks(self.group_size).enumerate() {
                     let scale = self.scales.get(gi).copied().unwrap_or(1.0);
+
+                    // AVX2 SIMD 逆量子化 (_mm256_mul_ps)
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        if is_x86_feature_detected!("avx2") {
+                            unsafe { avx2_dequantize_q8_chunk(chunk, scale, &mut result) };
+                            continue;
+                        }
+                    }
+
+                    // フォールバック: スカラー
                     for &byte in chunk {
                         result.push(byte as i8 as f32 * scale);
                     }
@@ -207,25 +371,70 @@ impl QuantizedTensor {
                 let mut result = Vec::with_capacity(self.num_elements);
                 let mut gi = 0;
                 let mut in_group = 0;
+
+                // バッチ逆量子化: グループ内をバッファに展開 → AVX2 スケール乗算
+                let mut group_buf = Vec::with_capacity(self.group_size);
+
                 for &byte in &self.data {
-                    let scale = self.scales.get(gi).copied().unwrap_or(1.0);
                     let zp = self.zero_points.get(gi).copied().unwrap_or(8.0);
 
                     let q0 = (byte & 0x0F) as f32 - zp;
-                    result.push(q0 * scale);
+                    group_buf.push(q0);
                     in_group += 1;
 
-                    if result.len() < self.num_elements {
+                    if result.len() + group_buf.len() < self.num_elements {
                         let q1 = ((byte >> 4) & 0x0F) as f32 - zp;
-                        result.push(q1 * scale);
+                        group_buf.push(q1);
                         in_group += 1;
                     }
 
-                    if in_group >= self.group_size {
+                    if in_group >= self.group_size || result.len() + group_buf.len() >= self.num_elements {
+                        let scale = self.scales.get(gi).copied().unwrap_or(1.0);
+
+                        // AVX2 スケール乗算
+                        #[cfg(target_arch = "x86_64")]
+                        if is_x86_feature_detected!("avx2") {
+                            unsafe {
+                                use std::arch::x86_64::*;
+                                let scale_vec = _mm256_set1_ps(scale);
+                                let mut j = 0usize;
+                                while j + 8 <= group_buf.len() {
+                                    let v = _mm256_loadu_ps(group_buf.as_ptr().add(j));
+                                    let sv = _mm256_mul_ps(v, scale_vec);
+                                    _mm256_storeu_ps(group_buf.as_mut_ptr().add(j), sv);
+                                    j += 8;
+                                }
+                                while j < group_buf.len() {
+                                    group_buf[j] *= scale;
+                                    j += 1;
+                                }
+                            }
+                        } else {
+                            for v in group_buf.iter_mut() {
+                                *v *= scale;
+                            }
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        for v in group_buf.iter_mut() {
+                            *v *= scale;
+                        }
+
+                        result.extend_from_slice(&group_buf);
+                        group_buf.clear();
                         gi += 1;
                         in_group = 0;
                     }
                 }
+
+                // 残りのバッファをフラッシュ
+                if !group_buf.is_empty() {
+                    let scale = self.scales.get(gi).copied().unwrap_or(1.0);
+                    for v in group_buf.iter_mut() {
+                        *v *= scale;
+                    }
+                    result.extend_from_slice(&group_buf);
+                }
+
                 result.truncate(self.num_elements);
                 result
             }
@@ -233,28 +442,70 @@ impl QuantizedTensor {
                 let mut result = Vec::with_capacity(self.num_elements);
                 let mut gi = 0;
                 let mut in_group = 0;
-                for &byte in &self.data {
-                    let scale = self.scales.get(gi).copied().unwrap_or(1.0);
+                let mut group_buf = Vec::with_capacity(self.group_size);
 
+                for &byte in &self.data {
                     let lo = byte & 0x0F;
                     let sign0 = if lo & 0x08 != 0 { -1.0f32 } else { 1.0 };
                     let mag0 = (lo & 0x07) as f32;
-                    result.push(sign0 * mag0 * scale);
+                    group_buf.push(sign0 * mag0);
                     in_group += 1;
 
-                    if result.len() < self.num_elements {
+                    if result.len() + group_buf.len() < self.num_elements {
                         let hi = (byte >> 4) & 0x0F;
                         let sign1 = if hi & 0x08 != 0 { -1.0f32 } else { 1.0 };
                         let mag1 = (hi & 0x07) as f32;
-                        result.push(sign1 * mag1 * scale);
+                        group_buf.push(sign1 * mag1);
                         in_group += 1;
                     }
 
-                    if in_group >= self.group_size {
+                    if in_group >= self.group_size || result.len() + group_buf.len() >= self.num_elements {
+                        let scale = self.scales.get(gi).copied().unwrap_or(1.0);
+
+                        // AVX2 スケール乗算 (_mm256_mul_ps)
+                        #[cfg(target_arch = "x86_64")]
+                        if is_x86_feature_detected!("avx2") {
+                            unsafe {
+                                use std::arch::x86_64::*;
+                                let scale_vec = _mm256_set1_ps(scale);
+                                let mut j = 0usize;
+                                while j + 8 <= group_buf.len() {
+                                    let v = _mm256_loadu_ps(group_buf.as_ptr().add(j));
+                                    let sv = _mm256_mul_ps(v, scale_vec);
+                                    _mm256_storeu_ps(group_buf.as_mut_ptr().add(j), sv);
+                                    j += 8;
+                                }
+                                while j < group_buf.len() {
+                                    group_buf[j] *= scale;
+                                    j += 1;
+                                }
+                            }
+                        } else {
+                            for v in group_buf.iter_mut() {
+                                *v *= scale;
+                            }
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
+                        for v in group_buf.iter_mut() {
+                            *v *= scale;
+                        }
+
+                        result.extend_from_slice(&group_buf);
+                        group_buf.clear();
                         gi += 1;
                         in_group = 0;
                     }
                 }
+
+                // 残りバッファフラッシュ
+                if !group_buf.is_empty() {
+                    let scale = self.scales.get(gi).copied().unwrap_or(1.0);
+                    for v in group_buf.iter_mut() {
+                        *v *= scale;
+                    }
+                    result.extend_from_slice(&group_buf);
+                }
+
                 result.truncate(self.num_elements);
                 result
             }

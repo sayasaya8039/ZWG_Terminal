@@ -16,6 +16,80 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+// ─── SIMD ヘルパー（AVX2 対応環境で自動適用） ───
+
+/// ページデータの SIMD ゼロ初期化。
+/// ページサイズが head_dim の倍数（=32byte アラインメント保証）の場合、
+/// AVX2 の 256bit 一括ゼロ書き込みを使用する。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn simd_zero_fill_f32(ptr: *mut f32, count: usize) {
+    #[cfg(target_feature = "avx2")]
+    {
+        use std::arch::x86_64::{_mm256_setzero_ps, _mm256_store_ps};
+        let zero = _mm256_setzero_ps();
+        let chunks = count / 8;
+        for i in 0..chunks {
+            _mm256_store_ps(ptr.add(i * 8), zero);
+        }
+        // 端数はスカラー処理
+        for i in (chunks * 8)..count {
+            *ptr.add(i) = 0.0;
+        }
+        return;
+    }
+    // AVX2 非対応フォールバック
+    #[allow(unreachable_code)]
+    {
+        std::ptr::write_bytes(ptr, 0, count);
+    }
+}
+
+/// KV データの SIMD コピー。
+/// アラインメント保証が可能な場合 AVX2 を使用し、
+/// そうでなければ ptr::copy_nonoverlapping にフォールバック。
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn simd_copy_f32(dst: *mut f32, src: *const f32, count: usize) {
+    #[cfg(target_feature = "avx2")]
+    {
+        use std::arch::x86_64::{_mm256_loadu_ps, _mm256_storeu_ps};
+        let chunks = count / 8;
+        for i in 0..chunks {
+            let vec = _mm256_loadu_ps(src.add(i * 8));
+            _mm256_storeu_ps(dst.add(i * 8), vec);
+        }
+        // 端数
+        let remainder_start = chunks * 8;
+        if remainder_start < count {
+            std::ptr::copy_nonoverlapping(
+                src.add(remainder_start),
+                dst.add(remainder_start),
+                count - remainder_start,
+            );
+        }
+        return;
+    }
+    // AVX2 非対応フォールバック
+    #[allow(unreachable_code)]
+    {
+        std::ptr::copy_nonoverlapping(src, dst, count);
+    }
+}
+
+// x86_64 以外のアーキテクチャ向けフォールバック
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+unsafe fn simd_zero_fill_f32(ptr: *mut f32, count: usize) {
+    std::ptr::write_bytes(ptr, 0, count);
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+unsafe fn simd_copy_f32(dst: *mut f32, src: *const f32, count: usize) {
+    std::ptr::copy_nonoverlapping(src, dst, count);
+}
+
 /// Number of KV entries per page. Typical: 16 tokens × head_dim values.
 const DEFAULT_PAGE_SIZE: usize = 16;
 
@@ -99,12 +173,15 @@ impl PagedKvCache {
     /// Allocate a fresh page (or recycle from free pool).
     fn alloc_page(&mut self) -> Option<u32> {
         if let Some(page_id) = self.free_pages.pop() {
-            // Recycle: reset the page
+            // Recycle: SIMD ゼロ初期化でページをリセット
             if let Some(page) = self.pages.get_mut(&page_id) {
                 page.used = 0;
                 page.ref_count = 1;
-                for v in page.keys.iter_mut().chain(page.values.iter_mut()) {
-                    *v = 0.0;
+                let key_len = page.keys.len();
+                let val_len = page.values.len();
+                unsafe {
+                    simd_zero_fill_f32(page.keys.as_mut_ptr(), key_len);
+                    simd_zero_fill_f32(page.values.as_mut_ptr(), val_len);
                 }
             }
             return Some(page_id);
@@ -180,11 +257,22 @@ impl PagedKvCache {
                 }
             };
 
-            // Write KV data to the page
+            // Write KV data to the page（SIMD memcpy 最適化）
             if let Some(page) = self.pages.get_mut(&page_id) {
                 let offset = page.used * self.head_dim;
-                page.keys[offset..offset + self.head_dim].copy_from_slice(k_slice);
-                page.values[offset..offset + self.head_dim].copy_from_slice(v_slice);
+                let hd = self.head_dim;
+                unsafe {
+                    simd_copy_f32(
+                        page.keys.as_mut_ptr().add(offset),
+                        k_slice.as_ptr(),
+                        hd,
+                    );
+                    simd_copy_f32(
+                        page.values.as_mut_ptr().add(offset),
+                        v_slice.as_ptr(),
+                        hd,
+                    );
+                }
                 page.used += 1;
             }
 
@@ -238,11 +326,30 @@ impl PagedKvCache {
         let mut keys = Vec::with_capacity(total * self.head_dim);
         let mut values = Vec::with_capacity(total * self.head_dim);
 
+        // SIMD バルクコピーで KV データを結合
+        let mut k_offset = 0usize;
+        let mut v_offset = 0usize;
+        // 事前に正確なサイズを確保（resize で初期化済み領域を作る）
+        keys.resize(total * self.head_dim, 0.0);
+        values.resize(total * self.head_dim, 0.0);
+
         for &page_id in &seq.page_ids {
             if let Some(page) = self.pages.get(&page_id) {
-                let end = page.used * self.head_dim;
-                keys.extend_from_slice(&page.keys[..end]);
-                values.extend_from_slice(&page.values[..end]);
+                let count = page.used * self.head_dim;
+                unsafe {
+                    simd_copy_f32(
+                        keys.as_mut_ptr().add(k_offset),
+                        page.keys.as_ptr(),
+                        count,
+                    );
+                    simd_copy_f32(
+                        values.as_mut_ptr().add(v_offset),
+                        page.values.as_ptr(),
+                        count,
+                    );
+                }
+                k_offset += count;
+                v_offset += count;
             }
         }
 

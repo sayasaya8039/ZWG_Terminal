@@ -345,6 +345,13 @@ fn spans_overlap(start: u16, end: u16, span: DamageSpan) -> bool {
 fn cell_overlaps_damage(cell: &GridCell, spans: &[DamageSpan]) -> bool {
     let start = cell.col;
     let end = cell.col.saturating_add(cell.width as u16);
+    // SIMD fast path: 8スパン以上の場合 AVX2 で一括判定
+    #[cfg(target_arch = "x86_64")]
+    {
+        if spans.len() >= 8 && is_x86_feature_detected!("avx2") {
+            return unsafe { simd_check_damage_overlap(spans, start, end) };
+        }
+    }
     spans
         .iter()
         .copied()
@@ -355,10 +362,75 @@ fn cell_overlaps_damage(cell: &GridCell, spans: &[DamageSpan]) -> bool {
 fn instance_overlaps_damage(instance: &GlyphInstance, spans: &[DamageSpan]) -> bool {
     let start = instance.col;
     let end = instance.col.saturating_add(instance.key.width as u16);
+    // SIMD fast path: 8スパン以上の場合 AVX2 で一括判定
+    #[cfg(target_arch = "x86_64")]
+    {
+        if spans.len() >= 8 && is_x86_feature_detected!("avx2") {
+            return unsafe { simd_check_damage_overlap(spans, start, end) };
+        }
+    }
     spans
         .iter()
         .copied()
         .any(|span| spans_overlap(start, end, span))
+}
+
+/// SIMD (AVX2) によるダメージスパン重複一括判定
+/// 8個の DamageSpan を 128bit (start_col × 8 = 128bit) ずつロードし、
+/// 比較を並列実行する。
+#[cfg(all(feature = "ghostty_vt", target_arch = "x86_64"))]
+#[target_feature(enable = "avx2")]
+unsafe fn simd_check_damage_overlap(spans: &[DamageSpan], query_start: u16, query_end: u16) -> bool {
+    use std::arch::x86_64::*;
+
+    // DamageSpan は (start_col: u16, end_col: u16) = 4バイト
+    // SSE2 で 8スパン = 32バイトを一括処理
+    let len = spans.len();
+    let mut i = 0;
+
+    let q_start = _mm256_set1_epi16(query_start as i16);
+    let q_end = _mm256_set1_epi16(query_end as i16);
+
+    // 16個のu16 = 8 DamageSpan (start, end が交互)
+    while i + 8 <= len {
+        // DamageSpan の配列を u16 としてロード
+        // メモリレイアウト: [s0, e0, s1, e1, s2, e2, s3, e3, s4, e4, s5, e5, s6, e6, s7, e7]
+        let raw_ptr = spans.as_ptr().add(i) as *const __m256i;
+        let raw = _mm256_loadu_si256(raw_ptr);
+
+        // start_col を偶数位置、end_col を奇数位置から抽出
+        // シャッフルで start と end を分離
+        // 偶数インデックス (0,2,4,6,8,10,12,14) → starts
+        // 奇数インデックス (1,3,5,7,9,11,13,15) → ends
+        let starts = _mm256_and_si256(raw, _mm256_set1_epi32(0x0000FFFF));
+        let ends = _mm256_srli_epi32(raw, 16);
+
+        // 16bit として比較するため pack
+        let starts_16 = _mm256_packs_epi32(starts, _mm256_setzero_si256());
+        let ends_16 = _mm256_packs_epi32(ends, _mm256_setzero_si256());
+
+        // 重複条件: query_start < end AND start < query_end
+        // _mm256_cmpgt_epi16 は signed 比較なので u16 範囲内は安全
+        let cond1 = _mm256_cmpgt_epi16(ends_16, q_start);   // end > query_start
+        let cond2 = _mm256_cmpgt_epi16(q_end, starts_16);   // query_end > start
+        let overlap = _mm256_and_si256(cond1, cond2);
+
+        if _mm256_movemask_epi8(overlap) != 0 {
+            return true;
+        }
+
+        i += 8;
+    }
+
+    // 残りスパンのスカラー処理
+    while i < len {
+        if spans_overlap(query_start, query_end, spans[i]) {
+            return true;
+        }
+        i += 1;
+    }
+
+    false
 }
 
 #[cfg(feature = "ghostty_vt")]

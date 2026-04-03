@@ -398,6 +398,12 @@ impl TerminalSurface {
                         // Sync path: batch multiple reads to reduce backend lock acquisitions.
                         // Accumulate data and only lock+feed when no more data is immediately
                         // available or when the batch buffer is full.
+                        // SIMD 最適化: 大きなチャンクの場合 SIMD memcpy でコピー
+                        #[cfg(target_arch = "x86_64")]
+                        {
+                            simd_extend_buffer(&mut batch_buf, &buf[..n]);
+                        }
+                        #[cfg(not(target_arch = "x86_64"))]
                         batch_buf.extend_from_slice(&buf[..n]);
                         if batch_buf.len() < BATCH_MAX {
                             // Try a non-blocking peek: attempt another read before locking
@@ -549,5 +555,52 @@ impl Drop for TerminalSurface {
                 })
                 .ok();
         }
+    }
+}
+
+// ── SIMD バッファコピー最適化 (x86_64) ───────────────────────────
+// PTY バッチバッファへのデータ追加を AVX2 で高速化。
+// 256bit (32バイト) ずつ一括コピーし、memcpy のオーバーヘッドを削減。
+
+#[cfg(target_arch = "x86_64")]
+fn simd_extend_buffer(buf: &mut Vec<u8>, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    // 64KB 未満は標準の extend_from_slice が十分高速
+    if data.len() < 65536 || !is_x86_feature_detected!("avx2") {
+        buf.extend_from_slice(data);
+        return;
+    }
+    // Safety: AVX2 対応確認済み、バッファを事前確保
+    unsafe { simd_extend_buffer_avx2(buf, data) }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn simd_extend_buffer_avx2(buf: &mut Vec<u8>, data: &[u8]) {
+    use std::arch::x86_64::*;
+
+    let len = data.len();
+    let old_len = buf.len();
+    buf.reserve(len);
+
+    let src = data.as_ptr();
+    let dst = unsafe { buf.as_mut_ptr().add(old_len) };
+    let mut pos = 0usize;
+
+    // 32バイトずつ AVX2 ストリーミングストア
+    while pos + 32 <= len {
+        unsafe {
+            let chunk = _mm256_loadu_si256(src.add(pos) as *const __m256i);
+            _mm256_storeu_si256(dst.add(pos) as *mut __m256i, chunk);
+        }
+        pos += 32;
+    }
+
+    // 残りバイトをスカラーコピー
+    unsafe {
+        std::ptr::copy_nonoverlapping(src.add(pos), dst.add(pos), len - pos);
+        buf.set_len(old_len + len);
     }
 }

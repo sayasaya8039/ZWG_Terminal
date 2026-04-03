@@ -24,7 +24,7 @@ rayon = { version = "1", optional = true }
 burn = { version = "0.16", default-features = false, features = ["ndarray"], optional = true }
 
 [features]
-default = []
+default = ["parallel"]
 ollama = []
 parallel = ["dep:rayon"]
 burn_backend = ["dep:burn"]

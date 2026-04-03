@@ -48,6 +48,157 @@ pub struct AttentionOutput {
     pub lse: Vec<f32>,
 }
 
+// --- AVX2 SIMD ヘルパー関数 (x86_64 専用) ---
+
+/// AVX2 SIMD 内積: 8要素ずつ _mm256_fmadd_ps で並列計算
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn avx2_dot_product(a: &[f32], b: &[f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let len = a.len().min(b.len());
+    let mut acc = _mm256_setzero_ps();
+    let mut i = 0usize;
+
+    // 8要素ずつ FMA
+    while i + 8 <= len {
+        let va = _mm256_loadu_ps(a.as_ptr().add(i));
+        let vb = _mm256_loadu_ps(b.as_ptr().add(i));
+        acc = _mm256_fmadd_ps(va, vb, acc);
+        i += 8;
+    }
+
+    // 水平リダクション: 256bit → 128bit → スカラー
+    let hi128 = _mm256_extractf128_ps(acc, 1);
+    let lo128 = _mm256_castps256_ps128(acc);
+    let sum128 = _mm_add_ps(lo128, hi128);
+    let shuf = _mm_movehdup_ps(sum128);
+    let sums = _mm_add_ps(sum128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let result = _mm_add_ss(sums, shuf2);
+    let mut dot = _mm_cvtss_f32(result);
+
+    // 端数処理（スカラー）
+    while i < len {
+        dot += a[i] * b[i];
+        i += 1;
+    }
+
+    dot
+}
+
+/// AVX2 fast_exp 近似: e^x ≈ (1 + x/256)^256（多項式近似）
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn avx2_fast_exp(x: &[f32], max_val: f32, out: &mut [f32]) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let len = x.len().min(out.len());
+    let max_vec = _mm256_set1_ps(max_val);
+    let mut sum_acc = _mm256_setzero_ps();
+    let neg_inf = f32::NEG_INFINITY;
+    let neg_inf_vec = _mm256_set1_ps(neg_inf);
+    let mut i = 0usize;
+
+    // 8要素ずつ exp(s - max) を計算
+    while i + 8 <= len {
+        let sv = _mm256_loadu_ps(x.as_ptr().add(i));
+        // NEG_INF チェック用マスク
+        let mask = _mm256_cmp_ps(sv, neg_inf_vec, _CMP_GT_OQ);
+        let diff = _mm256_sub_ps(sv, max_vec);
+
+        // スカラー exp フォールバック（AVX2 に直接 exp はないため）
+        let mut exp_vals = [0.0f32; 8];
+        _mm256_storeu_ps(exp_vals.as_mut_ptr(), diff);
+        for j in 0..8 {
+            exp_vals[j] = exp_vals[j].exp();
+        }
+        let exp_vec = _mm256_loadu_ps(exp_vals.as_ptr());
+
+        // NEG_INF の位置はゼロにマスク
+        let masked = _mm256_and_ps(exp_vec, mask);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), masked);
+        sum_acc = _mm256_add_ps(sum_acc, masked);
+        i += 8;
+    }
+
+    // 水平リダクション
+    let hi = _mm256_extractf128_ps(sum_acc, 1);
+    let lo = _mm256_castps256_ps128(sum_acc);
+    let s128 = _mm_add_ps(lo, hi);
+    let shuf = _mm_movehdup_ps(s128);
+    let sums = _mm_add_ps(s128, shuf);
+    let shuf2 = _mm_movehl_ps(sums, sums);
+    let r = _mm_add_ss(sums, shuf2);
+    let mut total = _mm_cvtss_f32(r);
+
+    // 端数処理
+    while i < len {
+        if x[i] > neg_inf {
+            let e = (x[i] - max_val).exp();
+            out[i] = e;
+            total += e;
+        } else {
+            out[i] = 0.0;
+        }
+        i += 1;
+    }
+
+    total
+}
+
+/// AVX2 加重蓄積: out[j] += w * v[j] を _mm256_fmadd_ps で並列化
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn avx2_weighted_accumulate(out: &mut [f32], v_row: &[f32], weight: f32) {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let len = out.len().min(v_row.len());
+    let w_vec = _mm256_set1_ps(weight);
+    let mut i = 0usize;
+
+    while i + 8 <= len {
+        let ov = _mm256_loadu_ps(out.as_ptr().add(i));
+        let vv = _mm256_loadu_ps(v_row.as_ptr().add(i));
+        let result = _mm256_fmadd_ps(w_vec, vv, ov); // out + w * v
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), result);
+        i += 8;
+    }
+
+    // 端数処理
+    while i < len {
+        out[i] += weight * v_row[i];
+        i += 1;
+    }
+}
+
+/// AVX2 スケーリング: out[j] *= scale
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn avx2_scale_inplace(out: &mut [f32], scale: f32) {
+    #[cfg(target_arch = "x86_64")]
+    use std::arch::x86_64::*;
+
+    let len = out.len();
+    let s_vec = _mm256_set1_ps(scale);
+    let mut i = 0usize;
+
+    while i + 8 <= len {
+        let ov = _mm256_loadu_ps(out.as_ptr().add(i));
+        let result = _mm256_mul_ps(ov, s_vec);
+        _mm256_storeu_ps(out.as_mut_ptr().add(i), result);
+        i += 8;
+    }
+
+    while i < len {
+        out[i] *= scale;
+        i += 1;
+    }
+}
+
 /// Compute flash attention for a single head.
 ///
 /// Uses tiled computation with online softmax to avoid materializing the
@@ -60,6 +211,115 @@ pub struct AttentionOutput {
 /// * `v` — Value matrix, shape [kv_len, head_dim], row-major
 /// * `config` — Flash attention parameters
 pub fn flash_attention_forward(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    config: &FlashAttentionConfig,
+) -> AttentionOutput {
+    // x86_64 では AVX2 SIMD パスを使用
+    #[cfg(target_arch = "x86_64")]
+    {
+        if is_x86_feature_detected!("avx2") && is_x86_feature_detected!("fma") {
+            return unsafe { flash_attention_forward_avx2(q, k, v, config) };
+        }
+    }
+
+    // フォールバック: 元のスカラー実装
+    flash_attention_forward_scalar(q, k, v, config)
+}
+
+/// AVX2 SIMD 最適化版 Flash Attention
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn flash_attention_forward_avx2(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    config: &FlashAttentionConfig,
+) -> AttentionOutput {
+    let d = config.head_dim;
+    let q_len = q.len() / d;
+    let kv_len = k.len() / d;
+    let scale = 1.0 / (d as f32).sqrt();
+    let bs = config.block_size;
+
+    let mut output = vec![0.0f32; q_len * d];
+    let mut lse = vec![f32::NEG_INFINITY; q_len];
+    let num_kv_blocks = (kv_len + bs - 1) / bs;
+
+    for kv_block in 0..num_kv_blocks {
+        let kv_start = kv_block * bs;
+        let kv_end = (kv_start + bs).min(kv_len);
+        let block_len = kv_end - kv_start;
+
+        for qi in 0..q_len {
+            let q_row = &q[qi * d..(qi + 1) * d];
+
+            let mut block_max = f32::NEG_INFINITY;
+            let mut scores = Vec::with_capacity(block_len);
+
+            for ki in 0..block_len {
+                let kv_idx = kv_start + ki;
+                if config.causal && kv_idx > qi {
+                    scores.push(f32::NEG_INFINITY);
+                    continue;
+                }
+
+                let k_row = &k[kv_idx * d..(kv_idx + 1) * d];
+                // AVX2 SIMD 内積 (_mm256_fmadd_ps)
+                let dot = avx2_dot_product(q_row, k_row);
+                let s = dot * scale;
+                scores.push(s);
+                if s > block_max {
+                    block_max = s;
+                }
+            }
+
+            if block_max == f32::NEG_INFINITY {
+                continue;
+            }
+
+            // AVX2 exp + sum (_mm256 ベクトル化)
+            let prev_lse = lse[qi];
+            let mut exp_vals = vec![0.0f32; scores.len()];
+            let block_sum = avx2_fast_exp(&scores, block_max, &mut exp_vals);
+            let block_lse = block_max + block_sum.ln();
+
+            let new_lse = if prev_lse == f32::NEG_INFINITY {
+                block_lse
+            } else {
+                let max_lse = prev_lse.max(block_lse);
+                max_lse + ((prev_lse - max_lse).exp() + (block_lse - max_lse).exp()).ln()
+            };
+
+            let out_row = &mut output[qi * d..(qi + 1) * d];
+            if prev_lse > f32::NEG_INFINITY {
+                let rescale = (prev_lse - new_lse).exp();
+                // AVX2 スケーリング
+                avx2_scale_inplace(out_row, rescale);
+            }
+
+            // AVX2 加重 V 蓄積 (_mm256_fmadd_ps)
+            let weight_scale = (block_lse - new_lse).exp();
+            for (si, &score) in scores.iter().enumerate() {
+                if score == f32::NEG_INFINITY {
+                    continue;
+                }
+                let w = (exp_vals[si] / block_sum) * weight_scale;
+                let kv_idx = kv_start + si;
+                let v_row = &v[kv_idx * d..(kv_idx + 1) * d];
+                avx2_weighted_accumulate(out_row, v_row, w);
+            }
+
+            lse[qi] = new_lse;
+        }
+    }
+
+    AttentionOutput { values: output, lse }
+}
+
+/// スカラーフォールバック実装（元のコード）
+fn flash_attention_forward_scalar(
     q: &[f32],
     k: &[f32],
     v: &[f32],
@@ -165,6 +425,8 @@ pub fn flash_attention_forward(
 ///
 /// Splits Q, K, V across heads, computes flash attention per head,
 /// and concatenates the results.
+///
+/// `parallel` feature 有効時は rayon でヘッド間を並列化。
 pub fn multi_head_flash_attention(
     q: &[f32],  // [seq_len, num_heads * head_dim]
     k: &[f32],  // [kv_len, num_heads * head_dim]
@@ -176,40 +438,86 @@ pub fn multi_head_flash_attention(
     let q_len = q.len() / (nh * d);
     let kv_len = k.len() / (nh * d);
 
-    let mut output = vec![0.0f32; q_len * nh * d];
+    // rayon 並列化: ヘッドごとに独立計算 → 結果をマージ
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
 
-    for h in 0..nh {
-        // Extract per-head slices
-        let mut q_head = Vec::with_capacity(q_len * d);
-        for i in 0..q_len {
-            let start = i * nh * d + h * d;
-            q_head.extend_from_slice(&q[start..start + d]);
+        // 各ヘッドの出力を並列計算
+        let head_outputs: Vec<Vec<f32>> = (0..nh)
+            .into_par_iter()
+            .map(|h| {
+                let mut q_head = Vec::with_capacity(q_len * d);
+                for i in 0..q_len {
+                    let start = i * nh * d + h * d;
+                    q_head.extend_from_slice(&q[start..start + d]);
+                }
+
+                let mut k_head = Vec::with_capacity(kv_len * d);
+                for i in 0..kv_len {
+                    let start = i * nh * d + h * d;
+                    k_head.extend_from_slice(&k[start..start + d]);
+                }
+
+                let mut v_head = Vec::with_capacity(kv_len * d);
+                for i in 0..kv_len {
+                    let start = i * nh * d + h * d;
+                    v_head.extend_from_slice(&v[start..start + d]);
+                }
+
+                flash_attention_forward(&q_head, &k_head, &v_head, config).values
+            })
+            .collect();
+
+        // インターリーブ出力にマージ
+        let mut output = vec![0.0f32; q_len * nh * d];
+        for (h, head_vals) in head_outputs.iter().enumerate() {
+            for i in 0..q_len {
+                let out_start = i * nh * d + h * d;
+                let src_start = i * d;
+                output[out_start..out_start + d]
+                    .copy_from_slice(&head_vals[src_start..src_start + d]);
+            }
         }
-
-        let mut k_head = Vec::with_capacity(kv_len * d);
-        for i in 0..kv_len {
-            let start = i * nh * d + h * d;
-            k_head.extend_from_slice(&k[start..start + d]);
-        }
-
-        let mut v_head = Vec::with_capacity(kv_len * d);
-        for i in 0..kv_len {
-            let start = i * nh * d + h * d;
-            v_head.extend_from_slice(&v[start..start + d]);
-        }
-
-        let head_out = flash_attention_forward(&q_head, &k_head, &v_head, config);
-
-        // Scatter back into interleaved output
-        for i in 0..q_len {
-            let out_start = i * nh * d + h * d;
-            let src_start = i * d;
-            output[out_start..out_start + d]
-                .copy_from_slice(&head_out.values[src_start..src_start + d]);
-        }
+        return output;
     }
 
-    output
+    // フォールバック: 逐次実行
+    #[cfg(not(feature = "parallel"))]
+    {
+        let mut output = vec![0.0f32; q_len * nh * d];
+
+        for h in 0..nh {
+            let mut q_head = Vec::with_capacity(q_len * d);
+            for i in 0..q_len {
+                let start = i * nh * d + h * d;
+                q_head.extend_from_slice(&q[start..start + d]);
+            }
+
+            let mut k_head = Vec::with_capacity(kv_len * d);
+            for i in 0..kv_len {
+                let start = i * nh * d + h * d;
+                k_head.extend_from_slice(&k[start..start + d]);
+            }
+
+            let mut v_head = Vec::with_capacity(kv_len * d);
+            for i in 0..kv_len {
+                let start = i * nh * d + h * d;
+                v_head.extend_from_slice(&v[start..start + d]);
+            }
+
+            let head_out = flash_attention_forward(&q_head, &k_head, &v_head, config);
+
+            for i in 0..q_len {
+                let out_start = i * nh * d + h * d;
+                let src_start = i * d;
+                output[out_start..out_start + d]
+                    .copy_from_slice(&head_out.values[src_start..src_start + d]);
+            }
+        }
+
+        output
+    }
 }
 
 /// Estimate memory savings from flash attention vs standard attention.
