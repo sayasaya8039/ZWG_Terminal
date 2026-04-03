@@ -6,7 +6,7 @@
 use std::time::{Duration, Instant};
 
 /// Timeout for distinguishing a standalone ESC press from an escape sequence.
-const ESC_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(50);
+const ESC_SEQUENCE_TIMEOUT: Duration = Duration::from_millis(20);
 
 /// Default threshold for collapsing large pastes.
 const PASTE_COLLAPSE_THRESHOLD: usize = 5000;

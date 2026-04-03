@@ -618,6 +618,10 @@ pub(crate) fn damage_spans_from_terminal_row(
     default_fg: u32,
     default_bg: u32,
 ) -> Vec<DamageSpan> {
+    // Fast path: if both cells and styles are identical references or equal, skip scan.
+    if previous_cells == next_cells && previous_styles == next_styles {
+        return Vec::new();
+    }
     merge_damage_spans(
         damage_spans_from_cells(previous_cells, next_cells, term_cols)
             .into_iter()
