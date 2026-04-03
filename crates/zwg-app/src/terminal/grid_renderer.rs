@@ -134,14 +134,14 @@ pub(crate) struct GridCell {
     pub kind: GridCellKind,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) enum GlyphRenderPath {
     AtlasMonochrome,
     AtlasPolychrome,
     Geometry,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub(crate) struct GlyphKey {
     pub glyph: String,
     pub width: u8,
@@ -822,6 +822,102 @@ pub(crate) fn preload_ascii_glyphs(
     );
 }
 
+// ── RAMdisk glyph key cache ─────────────────────────────────────────
+
+const GLYPH_KEYS_CACHE_FILE: &str = "glyph_keys.json";
+
+/// Save the current glyph cache keys to RAMdisk for fast startup next time.
+/// Only GlyphKey is saved (not PreparedGlyphPlan) because PreparedGlyphPlan
+/// contains GPUI types (FontId, GlyphId, Pixels) that are non-serializable
+/// and session-specific. The keys serve as a "prewarm list" on next boot.
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn save_glyph_keys_to_ramdisk(cache: &HashMap<GlyphKey, PreparedGlyphPlan>) {
+    let cache_dir = match std::env::var("ZWG_RAMDISK_CACHE") {
+        Ok(dir) if !dir.is_empty() => std::path::PathBuf::from(dir),
+        _ => return, // No RAMdisk — silently skip
+    };
+
+    let keys: Vec<&GlyphKey> = cache.keys().collect();
+    if keys.is_empty() {
+        return;
+    }
+
+    let path = cache_dir.join(GLYPH_KEYS_CACHE_FILE);
+    match serde_json::to_vec(&keys) {
+        Ok(data) => {
+            if let Err(e) = std::fs::write(&path, &data) {
+                log::warn!("Failed to save glyph keys to RAMdisk: {e}");
+            } else {
+                log::info!(
+                    "Saved {} glyph keys to RAMdisk ({})",
+                    keys.len(),
+                    path.display()
+                );
+            }
+        }
+        Err(e) => log::warn!("Failed to serialize glyph keys: {e}"),
+    }
+}
+
+/// Load glyph keys from RAMdisk. Returns None if RAMdisk is unavailable
+/// or no cached keys exist yet.
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn load_glyph_keys_from_ramdisk() -> Option<Vec<GlyphKey>> {
+    let cache_dir = std::env::var("ZWG_RAMDISK_CACHE").ok()?;
+    if cache_dir.is_empty() {
+        return None;
+    }
+
+    let path = std::path::PathBuf::from(&cache_dir).join(GLYPH_KEYS_CACHE_FILE);
+    let data = std::fs::read(&path).ok()?;
+    match serde_json::from_slice::<Vec<GlyphKey>>(&data) {
+        Ok(keys) => {
+            log::info!(
+                "Loaded {} cached glyph keys from RAMdisk ({})",
+                keys.len(),
+                path.display()
+            );
+            Some(keys)
+        }
+        Err(e) => {
+            log::warn!("Failed to deserialize glyph keys from RAMdisk: {e}");
+            None
+        }
+    }
+}
+
+/// Prewarm cache with previously-seen glyph keys loaded from RAMdisk.
+/// Called after preload_ascii_glyphs() to cover non-ASCII characters
+/// (CJK, box-drawing, emoji, etc.) that were used in previous sessions.
+#[cfg(feature = "ghostty_vt")]
+pub(crate) fn prewarm_from_ramdisk_keys(
+    text_system: &WindowTextSystem,
+    font_desc: &Font,
+    font_size: Pixels,
+    cell_height: f32,
+    cache: &mut HashMap<GlyphKey, PreparedGlyphPlan>,
+) {
+    let keys = match load_glyph_keys_from_ramdisk() {
+        Some(k) => k,
+        None => return,
+    };
+
+    let before = cache.len();
+    for key in &keys {
+        if !cache.contains_key(key) {
+            let _ = glyph_layout_for_key(key, text_system, font_desc, font_size, cell_height, cache);
+        }
+    }
+    let added = cache.len() - before;
+    if added > 0 {
+        log::info!(
+            "RAMdisk prewarm: shaped {} new glyphs ({} total in cache)",
+            added,
+            cache.len()
+        );
+    }
+}
+
 #[cfg(feature = "ghostty_vt")]
 pub(crate) fn resolve_cursor_cell(
     cursor_col: u16,
@@ -1362,6 +1458,14 @@ pub(super) fn terminal_canvas(
                     // first-frame shaping latency for common characters.
                     if cache.is_empty() {
                         preload_ascii_glyphs(
+                            &text_system,
+                            &font_desc,
+                            font_size,
+                            config.cell_height,
+                            &mut cache,
+                        );
+                        // Prewarm with previously-used glyphs from RAMdisk
+                        prewarm_from_ramdisk_keys(
                             &text_system,
                             &font_desc,
                             font_size,

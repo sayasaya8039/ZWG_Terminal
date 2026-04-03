@@ -118,6 +118,10 @@ mod backend {
             self.terminal.scroll_viewport(delta_lines).is_ok()
         }
 
+        pub fn scroll_viewport_bottom(&mut self) -> bool {
+            self.terminal.scroll_viewport_bottom().is_ok()
+        }
+
         pub fn clear_history(&mut self) {
             let mut terminal = ghostty_vt::Terminal::new_with_scrollback(
                 self.cols,
@@ -225,6 +229,15 @@ mod backend {
 
         pub fn scroll_viewport(&mut self, delta_lines: i32) -> bool {
             self.screen.scroll_viewport(delta_lines);
+            true
+        }
+
+        pub fn scroll_viewport_bottom(&mut self) -> bool {
+            self.screen.scroll_offset = 0;
+            self.screen.generation = self.screen.generation.wrapping_add(1);
+            for rg in &mut self.screen.row_generations {
+                *rg = self.screen.generation;
+            }
             true
         }
 
@@ -479,6 +492,10 @@ impl TerminalSurface {
         }
 
         self.backend.lock().scroll_viewport(delta_lines)
+    }
+
+    pub fn scroll_viewport_bottom(&self) -> bool {
+        self.backend.lock().scroll_viewport_bottom()
     }
 
     pub fn set_default_colors(&self, fg_rgb: u32, bg_rgb: u32) {

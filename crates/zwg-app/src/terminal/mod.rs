@@ -135,6 +135,10 @@ pub struct ScreenBuffer {
     pub title: Option<String>,
     pub generation: u64,
     pub row_generations: Vec<u64>,
+    /// Path to RAM disk scrollback file for this terminal (if available)
+    ramdisk_scrollback_path: Option<std::path::PathBuf>,
+    /// Number of lines spilled to RAM disk
+    ramdisk_spilled_lines: usize,
 }
 
 #[cfg(not(feature = "ghostty_vt"))]
@@ -158,6 +162,14 @@ impl ScreenBuffer {
             title: None,
             generation: 1,
             row_generations: vec![1u64; rows as usize],
+            ramdisk_scrollback_path: std::env::var("ZWG_RAMDISK")
+                .ok()
+                .map(|rd| {
+                    let dir = std::path::PathBuf::from(&rd).join("scrollback");
+                    let _ = std::fs::create_dir_all(&dir);
+                    dir.join(format!("{}.scrollback", uuid::Uuid::new_v4()))
+                }),
+            ramdisk_spilled_lines: 0,
         }
     }
 
@@ -216,7 +228,22 @@ impl ScreenBuffer {
         if let Some(line) = self.viewport.pop_front() {
             self.scrollback.push_back(line);
             if self.scrollback.len() > self.max_scrollback {
-                self.scrollback.pop_front();
+                if let Some(evicted) = self.scrollback.pop_front() {
+                    if let Some(ref path) = self.ramdisk_scrollback_path {
+                        use std::io::Write;
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                        {
+                            let bytes = evicted.text.as_bytes();
+                            let len = bytes.len() as u32;
+                            let _ = file.write_all(&len.to_le_bytes());
+                            let _ = file.write_all(bytes);
+                            self.ramdisk_spilled_lines += 1;
+                        }
+                    }
+                }
             }
             if self.scroll_offset > 0 {
                 self.scroll_offset = self
@@ -243,9 +270,24 @@ impl ScreenBuffer {
         while self.viewport.len() < rows as usize {
             self.viewport.push_back(TerminalLine::new());
         }
-        // M5: trim scrollback to max_scrollback after resize
+        // M5: trim scrollback to max_scrollback after resize, spilling to RAM disk
         while self.scrollback.len() > self.max_scrollback {
-            self.scrollback.pop_front();
+            if let Some(evicted) = self.scrollback.pop_front() {
+                if let Some(ref path) = self.ramdisk_scrollback_path {
+                    use std::io::Write;
+                    if let Ok(mut file) = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                    {
+                        let bytes = evicted.text.as_bytes();
+                        let len = bytes.len() as u32;
+                        let _ = file.write_all(&len.to_le_bytes());
+                        let _ = file.write_all(bytes);
+                        self.ramdisk_spilled_lines += 1;
+                    }
+                }
+            }
         }
         if self.scroll_offset > self.scrollback.len() {
             self.scroll_offset = self.scrollback.len();
@@ -313,6 +355,64 @@ impl ScreenBuffer {
         self.generation = self.generation.wrapping_add(1);
         for rg in &mut self.row_generations {
             *rg = self.generation;
+        }
+    }
+
+    /// Load spilled scrollback lines from RAM disk.
+    /// Returns lines in chronological order (oldest first).
+    pub fn load_spilled_scrollback(&self, offset: usize, count: usize) -> Vec<String> {
+        let path = match &self.ramdisk_scrollback_path {
+            Some(p) if p.exists() => p,
+            _ => return Vec::new(),
+        };
+
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => return Vec::new(),
+        };
+
+        let mut lines = Vec::new();
+        let mut pos = 0usize;
+        let mut line_idx = 0usize;
+
+        while pos + 4 <= data.len() {
+            let len = u32::from_le_bytes(
+                data[pos..pos + 4].try_into().unwrap_or([0; 4]),
+            ) as usize;
+            pos += 4;
+
+            if pos + len > data.len() {
+                break;
+            }
+
+            if line_idx >= offset && lines.len() < count {
+                if let Ok(text) = std::str::from_utf8(&data[pos..pos + len]) {
+                    lines.push(text.to_string());
+                }
+            }
+
+            pos += len;
+            line_idx += 1;
+
+            if lines.len() >= count {
+                break;
+            }
+        }
+
+        lines
+    }
+
+    /// Total scrollback lines including spilled ones on RAM disk.
+    pub fn total_scrollback_lines(&self) -> usize {
+        self.scrollback.len() + self.ramdisk_spilled_lines
+    }
+}
+
+#[cfg(not(feature = "ghostty_vt"))]
+impl Drop for ScreenBuffer {
+    fn drop(&mut self) {
+        if let Some(ref path) = self.ramdisk_scrollback_path {
+            let _ = std::fs::remove_file(path);
         }
     }
 }

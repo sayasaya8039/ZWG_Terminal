@@ -9,6 +9,8 @@ use std::sync::{
 };
 use std::time::{Duration, Instant};
 
+use serde::{Deserialize, Serialize};
+
 use gpui::ElementInputHandler;
 use gpui::*;
 
@@ -49,6 +51,19 @@ const FAST_PACING_ENTER: u32 = 2;
 const FAST_PACING_EXIT: u32 = 4;
 const CROSS_ROUTE_DUPLICATE_WINDOW_MS: u64 = 250;
 const SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS: u64 = 100;
+
+/// Interval between periodic session saves to RAMdisk (30 seconds at ~60fps ≈ 1800 frames).
+const SESSION_SAVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Session state snapshot persisted to RAMdisk for fast save/restore.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionSnapshot {
+    pub cwd: String,
+    pub cols: u16,
+    pub rows: u16,
+    pub scroll_offset: i64,
+    pub timestamp: u64,
+}
 /// Fallback values — replaced at runtime by measured font metrics
 const CELL_WIDTH_FALLBACK: f32 = 8.4;
 const CELL_HEIGHT_FALLBACK: f32 = 19.5;
@@ -895,6 +910,10 @@ pub struct TerminalPane {
     scrollbar_dragging: bool,
     /// Scrollbar: max scrollback capacity (from settings) for scroll clamping
     max_scrollback_lines: usize,
+    /// Working directory this pane was started with (for session snapshot)
+    initial_working_directory: Option<String>,
+    /// Last time session was saved to RAMdisk (for periodic 30s saves)
+    last_session_save: Instant,
 }
 
 impl TerminalPane {
@@ -944,6 +963,15 @@ impl TerminalPane {
         surface.set_default_colors(settings.fg_color, settings.bg_color);
         let event_rx = surface.take_event_rx();
 
+        // Try to restore session from RAMdisk (CWD override)
+        let restored_session = SessionSnapshot::load_from_ramdisk();
+        let effective_working_directory = match (&working_directory, &restored_session) {
+            (Some(wd), _) => Some(wd.clone()),
+            (None, Some(snap)) if !snap.cwd.is_empty() => Some(snap.cwd.clone()),
+            _ => None,
+        };
+        let saved_working_directory = effective_working_directory.clone();
+
         // Phase A: Return immediately with Pending state (<1ms)
         // Phase B: Spawn PTY in background thread
         let shell_owned = shell.to_string();
@@ -964,7 +992,7 @@ impl TerminalPane {
                     .spawn(async move {
                         let config = ConPtyConfig {
                             shell: shell_for_spawn,
-                            working_directory,
+                            working_directory: effective_working_directory,
                             cols: initial_cols,
                             rows: initial_rows,
                             env,
@@ -1303,6 +1331,8 @@ impl TerminalPane {
             scroll_offset: 0,
             scrollbar_dragging: false,
             max_scrollback_lines: settings.scrollback_lines,
+            initial_working_directory: saved_working_directory,
+            last_session_save: Instant::now(),
         }
     }
 
@@ -1367,6 +1397,13 @@ impl TerminalPane {
         self.pending_process_exit_status = None;
     }
 
+    /// Persist glyph cache keys to RAMdisk for fast startup next time.
+    /// Call on app shutdown or periodically.
+    #[cfg(feature = "ghostty_vt")]
+    pub fn save_glyph_cache(&self) {
+        super::grid_renderer::save_glyph_keys_to_ramdisk(&self.glyph_cache.read());
+    }
+
     // ── IPC helpers ────────────────────────────────────────────────
 
     /// Write raw bytes to the PTY (used by send-keys IPC command)
@@ -1429,7 +1466,10 @@ impl TerminalPane {
             self.cell_width = cell_width;
             self.cell_height = cell_height;
             #[cfg(feature = "ghostty_vt")]
-            self.glyph_cache.write().clear();
+            {
+                super::grid_renderer::save_glyph_keys_to_ramdisk(&self.glyph_cache.read());
+                self.glyph_cache.write().clear();
+            }
             self.recreate_gpu_state(cx);
             if self.last_width > 0.0 && self.last_height > 0.0 {
                 let _ = self.handle_resize(self.last_width, self.last_height);
@@ -1482,9 +1522,12 @@ impl TerminalPane {
             self.term_rows = new_rows;
             self.surface.resize(new_cols, new_rows);
             self.snapshot.resize(new_rows);
-            // Clear glyph cache on resize — grid geometry changed
+            // Save glyph keys before clearing on resize
             #[cfg(feature = "ghostty_vt")]
-            self.glyph_cache.write().clear();
+            {
+                super::grid_renderer::save_glyph_keys_to_ramdisk(&self.glyph_cache.read());
+                self.glyph_cache.write().clear();
+            }
             #[cfg(not(feature = "ghostty_vt"))]
             self.row_generations.resize(new_rows as usize, 0);
             return true;
