@@ -52,8 +52,11 @@ const FAST_PACING_EXIT: u32 = 4;
 const CROSS_ROUTE_DUPLICATE_WINDOW_MS: u64 = 250;
 const SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS: u64 = 100;
 
-/// Interval between periodic session saves to RAMdisk (30 seconds at ~60fps ≈ 1800 frames).
+/// Interval between periodic session saves to RAMdisk (30 seconds).
 const SESSION_SAVE_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Session state file name on RAMdisk.
+const SESSION_SNAPSHOT_FILE: &str = "session_snapshot.json";
 
 /// Session state snapshot persisted to RAMdisk for fast save/restore.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,6 +66,52 @@ pub struct SessionSnapshot {
     pub rows: u16,
     pub scroll_offset: i64,
     pub timestamp: u64,
+}
+
+impl SessionSnapshot {
+    /// Save snapshot to RAMdisk tmp/ directory.
+    /// No-op if ZWG_RAMDISK is not set.
+    fn save_to_ramdisk(&self) {
+        let Some(ramdisk) = std::env::var("ZWG_RAMDISK").ok() else {
+            return;
+        };
+        let path = PathBuf::from(&ramdisk)
+            .join("tmp")
+            .join(SESSION_SNAPSHOT_FILE);
+        match serde_json::to_string(self) {
+            Ok(json) => {
+                if let Err(e) = std::fs::write(&path, json) {
+                    log::warn!("Failed to save session snapshot to {}: {e}", path.display());
+                } else {
+                    log::debug!("Session snapshot saved to {}", path.display());
+                }
+            }
+            Err(e) => log::warn!("Failed to serialize session snapshot: {e}"),
+        }
+    }
+
+    /// Load snapshot from RAMdisk tmp/ directory.
+    /// Returns None if ZWG_RAMDISK is not set or file doesn't exist.
+    pub fn load_from_ramdisk() -> Option<Self> {
+        let ramdisk = std::env::var("ZWG_RAMDISK").ok()?;
+        let path = PathBuf::from(&ramdisk)
+            .join("tmp")
+            .join(SESSION_SNAPSHOT_FILE);
+        let content = std::fs::read_to_string(&path).ok()?;
+        match serde_json::from_str::<Self>(&content) {
+            Ok(snap) => {
+                log::info!(
+                    "Restored session snapshot from RAMdisk: cwd={}, {}x{}, scroll={}",
+                    snap.cwd, snap.cols, snap.rows, snap.scroll_offset
+                );
+                Some(snap)
+            }
+            Err(e) => {
+                log::warn!("Invalid session snapshot at {}: {e}", path.display());
+                None
+            }
+        }
+    }
 }
 /// Fallback values — replaced at runtime by measured font metrics
 const CELL_WIDTH_FALLBACK: f32 = 8.4;
@@ -1089,6 +1138,8 @@ impl TerminalPane {
                     if process_exit_status.is_some()
                         && this
                             .update(cx, |pane: &mut TerminalPane, _cx| {
+                                // Save session to RAMdisk before exit
+                                pane.save_session_to_ramdisk();
                                 pane.pending_process_exit_status = process_exit_status;
                                 if pane.auto_close {
                                     if let Some(pane_id) = pane.auto_close_pane_id {
@@ -1333,6 +1384,30 @@ impl TerminalPane {
             max_scrollback_lines: settings.scrollback_lines,
             initial_working_directory: saved_working_directory,
             last_session_save: Instant::now(),
+        }
+    }
+
+    /// Save current session state to RAMdisk for fast persistence.
+    /// No-op if ZWG_RAMDISK is not set.
+    fn save_session_to_ramdisk(&self) {
+        let snapshot = SessionSnapshot {
+            cwd: self.initial_working_directory.clone().unwrap_or_default(),
+            cols: self.term_cols,
+            rows: self.term_rows,
+            scroll_offset: self.scroll_offset,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
+        };
+        snapshot.save_to_ramdisk();
+    }
+
+    /// Periodic session save: called from render(), saves at most once per SESSION_SAVE_INTERVAL.
+    fn maybe_save_session(&mut self) {
+        if self.last_session_save.elapsed() >= SESSION_SAVE_INTERVAL {
+            self.save_session_to_ramdisk();
+            self.last_session_save = Instant::now();
         }
     }
 
@@ -1800,6 +1875,9 @@ impl TerminalPane {
 
     /// Render the running terminal using canvas paint API for pixel-perfect grid.
     fn render_running(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Periodic session save to RAMdisk (every 30s, driven by frame loop)
+        self.maybe_save_session();
+
         self.flush_ime_endcomposition_queue();
 
         let (layout_width, layout_height) =
