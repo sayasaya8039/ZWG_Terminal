@@ -185,10 +185,10 @@ impl IpcServer {
                     *PIPE_NAME,
                     PIPE_ACCESS_DUPLEX,
                     PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                    10, // max instances
+                    64, // max instances — supports 8+ concurrent teammate agents
                     BUFFER_SIZE,
                     BUFFER_SIZE,
-                    5000, // default timeout ms
+                    3000, // default timeout ms
                     None,
                 )
             };
@@ -279,7 +279,16 @@ impl IpcServer {
         mut writer: W,
         handlers: &Arc<Mutex<HashMap<String, CommandHandler>>>,
     ) {
+        let connection_start = std::time::Instant::now();
+        // Max connection lifetime: 10 minutes (prevents leaked/zombie connections)
+        const MAX_CONNECTION_LIFETIME: std::time::Duration = std::time::Duration::from_secs(600);
+
         for line in reader.lines() {
+            // Prevent zombie connections from blocking pipe instances
+            if connection_start.elapsed() > MAX_CONNECTION_LIFETIME {
+                log::warn!("[IPC] connection exceeded max lifetime (10min), closing");
+                break;
+            }
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {

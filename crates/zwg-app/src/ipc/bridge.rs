@@ -246,7 +246,7 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
                 return super::IpcResponse::err(req.id, "GPUI bridge disconnected");
             }
 
-            return match resp_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            return match resp_rx.recv_timeout(std::time::Duration::from_secs(5)) {
                 Ok(GpuiResponse::SendKeysAllOk { count }) => {
                     super::IpcResponse::ok(req.id, serde_json::json!({ "count": count }))
                 }
@@ -267,7 +267,7 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
             return super::IpcResponse::err(req.id, "GPUI bridge disconnected");
         }
 
-        match resp_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+        match resp_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(GpuiResponse::SendKeysOk) => {
                 super::IpcResponse::ok(req.id, serde_json::json!({}))
             }
@@ -287,7 +287,7 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
             return super::IpcResponse::err(req.id, "GPUI bridge disconnected");
         }
 
-        match resp_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+        match resp_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(GpuiResponse::PaneList(panes)) => {
                 super::IpcResponse::ok(req.id, serde_json::json!({ "panes": panes }))
             }
@@ -309,7 +309,7 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
             return super::IpcResponse::err(req.id, "GPUI bridge disconnected");
         }
 
-        match resp_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+        match resp_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(GpuiResponse::SelectPaneOk) => {
                 super::IpcResponse::ok(req.id, serde_json::json!({}))
             }
@@ -331,7 +331,7 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
             return super::IpcResponse::err(req.id, "GPUI bridge disconnected");
         }
 
-        match resp_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+        match resp_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(GpuiResponse::PaneContent(content)) => {
                 super::IpcResponse::ok(req.id, serde_json::json!({ "content": content }))
             }
@@ -356,7 +356,7 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
                 return super::IpcResponse::err(req.id, "GPUI bridge disconnected");
             }
 
-            return match resp_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+            return match resp_rx.recv_timeout(std::time::Duration::from_secs(10)) {
                 Ok(GpuiResponse::KillAllPanesOk { count }) => {
                     log::info!("[IPC] kill-pane -a OK: killed {} panes", count);
                     super::IpcResponse::ok(req.id, serde_json::json!({ "killed": count }))
@@ -374,7 +374,7 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
             return super::IpcResponse::err(req.id, "GPUI bridge disconnected");
         }
 
-        match resp_rx.recv_timeout(std::time::Duration::from_secs(15)) {
+        match resp_rx.recv_timeout(std::time::Duration::from_secs(5)) {
             Ok(GpuiResponse::KillPaneOk) => {
                 super::IpcResponse::ok(req.id, serde_json::json!({}))
             }

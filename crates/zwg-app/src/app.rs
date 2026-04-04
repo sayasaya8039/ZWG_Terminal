@@ -1183,50 +1183,47 @@ impl RootView {
             }
 
             GpuiCommand::KillPane { pane_id, resp_tx } => {
-                let split = {
+                // Search all tabs, not just active tab
+                let splits: Vec<_> = {
                     let state = self.state.read(cx);
-                    let Some(s) = state.active_split().cloned() else {
-                        let _ = resp_tx.send(GpuiResponse::Error("no active tab".into()));
-                        return;
-                    };
-                    s
+                    state.tabs.iter().map(|t| t.split.clone()).collect()
                 };
-                split.update(cx, |sc, cx| {
-                    if sc.kill_pane_by_id(pane_id, cx) {
-                        let _ = resp_tx.send(GpuiResponse::KillPaneOk);
-                    } else {
-                        let _ = resp_tx.send(GpuiResponse::Error(
-                            format!("pane %{} not found or last pane", pane_id),
-                        ));
+                let mut killed = false;
+                for split in splits {
+                    if split.update(cx, |sc, cx| sc.kill_pane_by_id(pane_id, cx)) {
+                        killed = true;
+                        break;
                     }
-                });
+                }
+                if killed {
+                    let _ = resp_tx.send(GpuiResponse::KillPaneOk);
+                } else {
+                    let _ = resp_tx.send(GpuiResponse::Error(
+                        format!("pane %{} not found or last pane", pane_id),
+                    ));
+                }
             }
 
             GpuiCommand::KillAllPanes { resp_tx } => {
-                let split = {
+                // Collect all splits across all tabs
+                let splits: Vec<_> = {
                     let state = self.state.read(cx);
-                    let Some(s) = state.active_split().cloned() else {
-                        let _ = resp_tx.send(GpuiResponse::KillAllPanesOk { count: 0 });
-                        return;
-                    };
-                    s
+                    state.tabs.iter().map(|t| t.split.clone()).collect()
                 };
-                let panes = split.read(cx).list_panes();
-                if panes.len() <= 1 {
-                    let _ = resp_tx.send(GpuiResponse::KillAllPanesOk { count: 0 });
-                    return;
-                }
-                // Keep the first pane (primary), kill the rest
-                let to_kill: Vec<u32> = panes.iter().skip(1).map(|(pid, _, _)| *pid).collect();
                 let mut killed = 0usize;
-                for pid in to_kill {
-                    split.update(cx, |sc, cx| {
-                        if sc.kill_pane_by_id(pid, cx) {
-                            killed += 1;
-                        }
-                    });
+                for split in &splits {
+                    let panes = split.read(cx).list_panes();
+                    // Keep the first pane (primary) in each tab, kill the rest
+                    let to_kill: Vec<u32> = panes.iter().skip(1).map(|(pid, _, _)| *pid).collect();
+                    for pid in to_kill {
+                        split.update(cx, |sc, cx| {
+                            if sc.kill_pane_by_id(pid, cx) {
+                                killed += 1;
+                            }
+                        });
+                    }
                 }
-                log::info!("[APP] kill_all_panes: killed {} split panes", killed);
+                log::info!("[APP] kill_all_panes: killed {} split panes across {} tabs", killed, splits.len());
                 let _ = resp_tx.send(GpuiResponse::KillAllPanesOk { count: killed });
             }
 
