@@ -283,7 +283,7 @@ pub struct TerminalSurface {
 impl TerminalSurface {
     pub fn new(cols: u16, rows: u16, scrollback_lines: usize) -> Self {
         // Perf: bounded(8) — enough headroom for burst; reader coalesces anyway
-        let (event_tx, event_rx) = flume::bounded(8);
+        let (event_tx, event_rx) = flume::bounded(256);
         Self {
             backend: Arc::new(Mutex::new(TerminalBackend::new(
                 cols,

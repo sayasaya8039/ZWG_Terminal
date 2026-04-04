@@ -38,17 +38,17 @@ const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
 // Claude Code /fast).  The event loop switches automatically based on how many
 // consecutive frames contained changes.
 const FRAME_COALESCE_NORMAL_MICROS: u64 = 1_667; // ~600 Hz
-const FRAME_COALESCE_FAST_MICROS: u64 = 1_667; // ~600 Hz (match normal for sustained throughput)
-const SETTLE_NORMAL_MILLIS: u64 = 1;
-const SETTLE_FAST_MILLIS: u64 = 0;
+const FRAME_COALESCE_FAST_MICROS: u64 = 5_000;   // ~200 Hz (batches more per frame, prevents missed wakeups)
+const SETTLE_NORMAL_MILLIS: u64 = 2;
+const SETTLE_FAST_MILLIS: u64 = 1;
 const RETRY_LIMIT_NORMAL: usize = 4;
 const RETRY_LIMIT_FAST: usize = 2;
 const SWEEPS_NORMAL: usize = 6;
 const SWEEPS_FAST: usize = 10;
 /// Consecutive changed-frames before entering fast pacing mode.
-const FAST_PACING_ENTER: u32 = 2;
+const FAST_PACING_ENTER: u32 = 4;
 /// Consecutive idle frames before reverting to normal pacing mode.
-const FAST_PACING_EXIT: u32 = 4;
+const FAST_PACING_EXIT: u32 = 8;
 const CROSS_ROUTE_DUPLICATE_WINDOW_MS: u64 = 250;
 const SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS: u64 = 100;
 
