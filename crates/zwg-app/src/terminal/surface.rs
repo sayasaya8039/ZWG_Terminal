@@ -160,6 +160,12 @@ mod backend {
         pub fn has_new_data(&self) -> bool {
             self.terminal.has_new_data()
         }
+
+        /// Return actual scrollback history length.
+        /// ghostty_vt doesn't expose this, so we use max_scrollback as upper bound.
+        pub fn total_scrollback_lines(&self) -> usize {
+            self.max_scrollback
+        }
     }
 }
 
@@ -243,6 +249,11 @@ mod backend {
 
         pub fn clear_history(&mut self) {
             self.screen.clear_history();
+        }
+
+        /// Return actual scrollback history length (scrollback buffer + RAMdisk spilled).
+        pub fn total_scrollback_lines(&self) -> usize {
+            self.screen.total_scrollback_lines()
         }
     }
 }
@@ -500,6 +511,11 @@ impl TerminalSurface {
 
     pub fn set_default_colors(&self, fg_rgb: u32, bg_rgb: u32) {
         self.backend.lock().set_default_colors(fg_rgb, bg_rgb);
+    }
+
+    /// Return the total number of scrollback history lines.
+    pub fn total_scrollback_lines(&self) -> usize {
+        self.backend.lock().total_scrollback_lines()
     }
 }
 

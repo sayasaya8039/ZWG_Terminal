@@ -2657,6 +2657,31 @@ impl RootView {
             return;
         }
 
+        // Close any open overlay on Escape
+        if event.keystroke.key == "escape" {
+            let mut handled = false;
+            if self.show_settings {
+                self.close_settings_panel(window, cx);
+                handled = true;
+            }
+            if self.show_shell_menu {
+                self.show_shell_menu = false;
+                cx.notify();
+                handled = true;
+            }
+            if self.show_close_confirm {
+                self.show_close_confirm = false;
+                cx.notify();
+                handled = true;
+            }
+            if handled {
+                self.sync_terminal_input_suppression(cx);
+                self.focus_active_terminal(window, cx);
+                cx.stop_propagation();
+                return;
+            }
+        }
+
         if self.handle_global_shortcut_key(event, window, cx) {
             cx.stop_propagation();
             return;

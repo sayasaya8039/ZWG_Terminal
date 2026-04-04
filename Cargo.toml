@@ -9,7 +9,7 @@ members = [
 exclude = ["conpty_test"]
 
 [workspace.package]
-version = "1.3.1"
+version = "1.3.2"
 edition = "2024"
 authors = ["ZWG Terminal contributors"]
 license = "MIT"
