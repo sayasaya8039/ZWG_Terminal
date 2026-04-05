@@ -196,15 +196,32 @@ pub(super) fn char_cell_width(ch: char) -> usize {
     UnicodeWidthChar::width(ch).unwrap_or(0)
 }
 
+/// SIMD-accelerated column-to-character-index conversion.
+/// O(1) for ASCII-only text; falls back to scalar for CJK/emoji.
 pub(super) fn col_to_char_index(text: &str, target_col: usize) -> usize {
-    let mut col = 0;
-    for (i, ch) in text.chars().enumerate() {
+    let bytes = text.as_bytes();
+    let ascii_len = super::simd_ops::ascii_prefix_len(bytes);
+
+    // Fast path: entire text is ASCII → byte == char == cell col
+    if ascii_len >= bytes.len() {
+        return target_col.min(bytes.len());
+    }
+
+    // Fast path: ASCII prefix covers the target column
+    if target_col < ascii_len {
+        return target_col;
+    }
+
+    // Scalar path: continue from ASCII prefix boundary
+    let mut col = ascii_len;
+    let suffix = &text[ascii_len..];
+    for (i, ch) in suffix.chars().enumerate() {
         if col >= target_col {
-            return i;
+            return ascii_len + i;
         }
         col += char_cell_width(ch);
     }
-    text.chars().count()
+    ascii_len + suffix.chars().count()
 }
 
 pub(crate) fn is_geometric_block_char(ch: char) -> bool {

@@ -6,6 +6,7 @@ mod grid_renderer;
 #[cfg(all(feature = "ghostty_vt", target_os = "windows"))]
 mod native_gpu_presenter;
 pub mod pty;
+pub(crate) mod simd_ops;
 pub mod surface;
 pub mod view;
 #[cfg(not(feature = "ghostty_vt"))]
@@ -419,17 +420,10 @@ impl Drop for ScreenBuffer {
 
 /// Convert a cell column position to a character index in the string.
 /// Accounts for wide (CJK) characters occupying 2 cells.
+/// SIMD-accelerated: O(1) for ASCII-only text (the common case).
 #[cfg(not(feature = "ghostty_vt"))]
 fn cell_to_char_index(text: &str, cell_col: usize) -> usize {
-    let mut col = 0usize;
-    for (i, ch) in text.chars().enumerate() {
-        if col >= cell_col {
-            return i;
-        }
-        col += ch.width().unwrap_or(1);
-    }
-    // Past the end of text — return char count + remaining cells
-    text.chars().count() + cell_col.saturating_sub(col)
+    simd_ops::fast_cell_to_char_index(text, cell_col)
 }
 
 // Re-export main types

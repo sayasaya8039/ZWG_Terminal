@@ -389,13 +389,58 @@ fn row_to_gpu_cells(
     default_fg: u32,
     default_bg: u32,
 ) -> Vec<ghostty_vt::GpuCellData> {
+    // SIMD: bulk-initialize row with default colors (single memset + col fixup)
     let mut packed = Vec::with_capacity(term_cols as usize);
-    // Cursor-based style lookup: walk style_runs once instead of O(runs) per col.
+    super::simd_ops::init_default_row(&mut packed, row_idx, term_cols, default_fg, default_bg);
+
+    // SIMD: batch-apply style run colors (fg/bg/flags per run range)
+    if !row.style_runs.is_empty() {
+        super::simd_ops::apply_style_run_colors(&mut packed, &row.style_runs);
+    }
+
+    // Apply cell overrides (codepoint, per-cell colors)
+    for cell in &row.cells {
+        let start = cell.col as usize;
+        if start >= packed.len() {
+            continue;
+        }
+        packed[start].codepoint = if glyph_requires_gpui_overlay(&cell.glyph) {
+            0
+        } else {
+            cell.glyph.chars().next().unwrap_or(' ') as u32
+        };
+        packed[start].fg_rgba = 0xFF00_0000 | cell.fg_rgb;
+        packed[start].bg_rgba = 0xFF00_0000 | cell.bg_rgb;
+        packed[start].flags = cell.flags as u16;
+
+        for offset in 1..cell.width as usize {
+            let col = start + offset;
+            if col >= packed.len() {
+                break;
+            }
+            packed[col].fg_rgba = 0xFF00_0000 | cell.fg_rgb;
+            packed[col].bg_rgba = 0xFF00_0000 | cell.bg_rgb;
+            packed[col].flags = cell.flags as u16;
+        }
+    }
+
+    packed
+}
+
+// Legacy row_to_gpu_cells inner loop preserved for reference:
+#[allow(dead_code)]
+fn row_to_gpu_cells_scalar(
+    row: &super::grid_renderer::CachedTerminalRow,
+    row_idx: u16,
+    term_cols: u16,
+    default_fg: u32,
+    default_bg: u32,
+) -> Vec<ghostty_vt::GpuCellData> {
+    let mut packed = Vec::with_capacity(term_cols as usize);
     let runs = &row.style_runs;
     let mut run_idx: usize = 0;
     for col in 0..term_cols {
-        let col1 = col + 1; // style_runs use 1-based columns
-        // Advance cursor past runs that end before this column
+        let col1 = col + 1;
         while run_idx < runs.len() && runs[run_idx].end_col < col1 {
             run_idx += 1;
         }
@@ -739,6 +784,9 @@ fn compute_damage_rects(
     merge_damage_rects(rects, term_cols)
 }
 
+/// Compute sorted, deduplicated dirty cell indices from damage rects.
+/// SIMD-optimized: uses bitmap approach (fits in L1 cache) instead of sort+dedup.
+/// For a 200×50 grid, bitmap = 1.5 KB vs sort+dedup on potentially 10K entries.
 fn compute_dirty_cells_from_rects(
     rects: &[ghostty_vt::GpuDamageRect],
     term_cols: u16,
@@ -746,27 +794,13 @@ fn compute_dirty_cells_from_rects(
     if term_cols == 0 || rects.is_empty() {
         return Vec::new();
     }
-
-    let term_cols_u32 = term_cols as u32;
-    let mut cells = Vec::new();
-    for rect in rects {
-        if rect.col_count == 0 || rect.row_count == 0 || rect.start_col >= term_cols_u32 {
-            continue;
-        }
-        let col_end = (rect.start_col + rect.col_count).min(term_cols_u32);
-        for row in rect.row_start..rect.row_start + rect.row_count {
-            let row_base = row * term_cols_u32;
-            for col in rect.start_col..col_end {
-                cells.push(ghostty_vt::GpuDirtyCell {
-                    instance_index: row_base + col,
-                });
-            }
-        }
-    }
-
-    cells.sort_unstable_by_key(|cell| cell.instance_index);
-    cells.dedup_by_key(|cell| cell.instance_index);
-    cells
+    // Determine max row from rects to size the bitmap
+    let max_row = rects
+        .iter()
+        .map(|r| r.row_start + r.row_count)
+        .max()
+        .unwrap_or(0);
+    super::simd_ops::dirty_cells_from_bitmap(rects, term_cols, max_row)
 }
 
 fn overlay_damage_rects(

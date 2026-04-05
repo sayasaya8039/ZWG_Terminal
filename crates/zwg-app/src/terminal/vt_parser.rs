@@ -79,24 +79,26 @@ impl VtParser {
         }
     }
 
-    /// Process a chunk of bytes through the VT parser
+    /// Process a chunk of bytes through the VT parser.
+    ///
+    /// SIMD acceleration (AVX2):
+    /// - `scan_printable_ascii`: find contiguous printable ASCII runs (0x20-0x7E)
+    /// - `find_escape`: skip non-escape bytes to partition normal text vs sequences
+    /// Both bypass the per-byte state machine for the common case.
     pub fn process(&mut self, data: &[u8], screen: &mut ScreenBuffer) {
         let mut i = 0;
         while i < data.len() {
             // SIMD fast path: Ground 状態で ASCII printable 連続ランを一括処理
-            #[cfg(target_arch = "x86_64")]
-            {
-                if self.state == ParserState::Ground && self.utf8_expected == 0 {
-                    let remaining = &data[i..];
-                    let ascii_run = simd_scan_ascii_run(remaining);
-                    if ascii_run > 0 {
-                        // ASCII printable 文字を一括出力（状態遷移スキップ）
-                        for &byte in &remaining[..ascii_run] {
-                            screen.write_char(byte as char);
-                        }
-                        i += ascii_run;
-                        continue;
+            if self.state == ParserState::Ground && self.utf8_expected == 0 {
+                let remaining = &data[i..];
+                let ascii_run = super::simd_ops::scan_printable_ascii(remaining);
+                if ascii_run > 0 {
+                    // ASCII printable 文字を一括出力（状態遷移スキップ）
+                    for &byte in &remaining[..ascii_run] {
+                        screen.write_char(byte as char);
                     }
+                    i += ascii_run;
+                    continue;
                 }
             }
             self.process_byte(data[i], screen);
@@ -670,79 +672,7 @@ impl VtParser {
     }
 }
 
-// ── SIMD 高速パス (x86_64 AVX2) ─────────────────────────────────
-// ASCII printable 文字 (0x20-0x7E) の連続ランを AVX2 で一括検出。
-// 32バイトずつ処理し、全て ASCII printable なら一括出力可能。
-// non-ASCII または制御文字が見つかったらスカラーパスにフォールバック。
-
-/// ASCII printable (0x20-0x7E) の連続バイト数を SIMD で高速スキャン
-#[cfg(target_arch = "x86_64")]
-fn simd_scan_ascii_run(data: &[u8]) -> usize {
-    // ランタイム AVX2 チェック — 非対応 CPU ではスカラーフォールバック
-    if is_x86_feature_detected!("avx2") {
-        // Safety: AVX2 対応を確認済み
-        unsafe { simd_scan_ascii_run_avx2(data) }
-    } else {
-        scalar_scan_ascii_run(data)
-    }
-}
-
-/// AVX2 実装: 32バイトずつ printable ASCII 範囲をチェック
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn simd_scan_ascii_run_avx2(data: &[u8]) -> usize {
-    #[cfg(target_arch = "x86_64")]
-    use std::arch::x86_64::*;
-
-    let len = data.len();
-    let ptr = data.as_ptr();
-    let mut pos = 0usize;
-
-    // 0x1F = printable 下限 - 1 (signed 比較用)
-    // 0x7E = printable 上限
-    // signed 比較のため 0x80 を減算してから比較する手法を使用
-    let bias = _mm256_set1_epi8(-128i8); // 0x80
-    // (0x20 - 0x80) as i8 = -96, (0x7E - 0x80) as i8 = -2
-    let low_biased = _mm256_set1_epi8((0x20u8 as i8).wrapping_sub(-128i8));  // -96
-    let high_biased = _mm256_set1_epi8((0x7Eu8 as i8).wrapping_sub(-128i8)); // -2
-
-    // 32バイトアライン処理
-    while pos + 32 <= len {
-        let chunk = _mm256_loadu_si256(ptr.add(pos) as *const __m256i);
-        // bias 適用 (unsigned → signed 変換)
-        let biased = _mm256_add_epi8(chunk, bias);
-        // biased >= low_biased && biased <= high_biased
-        let ge_low = _mm256_cmpgt_epi8(biased, _mm256_sub_epi8(low_biased, _mm256_set1_epi8(1)));
-        let le_high = _mm256_cmpgt_epi8(_mm256_add_epi8(high_biased, _mm256_set1_epi8(1)), biased);
-        let in_range = _mm256_and_si256(ge_low, le_high);
-
-        // 全レーンが 0xFF なら全て printable
-        let mask = _mm256_movemask_epi8(in_range) as u32;
-        if mask == 0xFFFF_FFFF {
-            pos += 32;
-        } else {
-            // 最初の非 printable バイトの位置
-            let first_non_printable = (!mask).trailing_zeros() as usize;
-            return pos + first_non_printable;
-        }
-    }
-
-    // 残りバイトはスカラー処理
-    while pos < len {
-        let byte = *ptr.add(pos);
-        if byte < 0x20 || byte > 0x7E {
-            break;
-        }
-        pos += 1;
-    }
-
-    pos
-}
-
-/// スカラーフォールバック: AVX2 非対応時
-#[cfg(target_arch = "x86_64")]
-fn scalar_scan_ascii_run(data: &[u8]) -> usize {
-    data.iter()
-        .position(|&b| b < 0x20 || b > 0x7E)
-        .unwrap_or(data.len())
-}
+// SIMD 高速パスは simd_ops モジュールに統合:
+// - scan_printable_ascii(): ASCII printable (0x20-0x7E) 連続ラン検出
+// - find_escape(): ESC (0x1B) バイト高速スキャン
+// 詳細: terminal/simd_ops.rs
