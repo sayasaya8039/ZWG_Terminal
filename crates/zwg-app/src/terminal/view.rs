@@ -33,18 +33,23 @@ use super::win32_input::encode_win32_input_text;
 use parking_lot::Mutex;
 
 const HORIZONTAL_TEXT_PADDING: f32 = 4.0;
-// --- Adaptive frame pacing ---------------------------------------------------
+// --- Adaptive batched frame pacing --------------------------------------------
 // Two modes: NORMAL (interactive / PSReadLine) and FAST (sustained output like
 // Claude Code /fast).  The event loop switches automatically based on how many
 // consecutive frames contained changes.
-const FRAME_COALESCE_NORMAL_MICROS: u64 = 1_667; // ~600 Hz
-const FRAME_COALESCE_FAST_MICROS: u64 = 5_000;   // ~200 Hz (batches more per frame, prevents missed wakeups)
-const SETTLE_NORMAL_MILLIS: u64 = 2;
-const SETTLE_FAST_MILLIS: u64 = 1;
-const RETRY_LIMIT_NORMAL: usize = 4;
-const RETRY_LIMIT_FAST: usize = 2;
-const SWEEPS_NORMAL: usize = 6;
-const SWEEPS_FAST: usize = 10;
+//
+// Architecture: 3-phase pipeline per frame:
+//   Phase 1: Batch window — accumulate PTY events for BATCH_*_MICROS
+//   Phase 2: Async settle — wait for Zig parser ring buffer to drain (ghostty_vt)
+//   Phase 3: Single refresh — one backend lock, one snapshot build, one cx.notify()
+//
+// This replaces the previous retry+sweep loop which acquired the backend lock
+// up to (RETRY_LIMIT + SWEEPS) = 10+ times per frame.
+const BATCH_NORMAL_MICROS: u64 = 4_000;  // 4ms batch window — captures PSReadLine multi-chunk bursts
+const BATCH_FAST_MICROS: u64 = 2_000;    // 2ms batch window — drain sustained output quickly
+const FRAME_MIN_INTERVAL_MICROS: u64 = 1_667; // ~600 Hz max frame rate (interactive responsiveness)
+/// Rounds of 1ms waits for async parser to finish processing ring buffer data.
+const ASYNC_SETTLE_MAX_ROUNDS: usize = 3;
 /// Consecutive changed-frames before entering fast pacing mode.
 const FAST_PACING_ENTER: u32 = 4;
 /// Consecutive idle frames before reverting to normal pacing mode.
@@ -1080,67 +1085,99 @@ impl TerminalPane {
         )
         .detach();
 
-        // Wait for PTY output, then coalesce updates with an upper bound matching
-        // a 600Hz frame budget. This keeps bursty PTY output from flooding the UI
-        // while still allowing high refresh-rate panels to update promptly.
+        // ── Batched async event loop ─────────────────────────────────────
+        // 3-phase pipeline per frame:
+        //   Phase 1: Batch — accumulate PTY events for 4ms (normal) / 2ms (fast)
+        //   Phase 2: Settle — wait for async parser ring buffer to drain (ghostty_vt)
+        //   Phase 3: Refresh — single backend lock → snapshot → cx.notify()
+        //
+        // Previous approach acquired backend lock up to 10+ times per frame
+        // (retry loop + sweep loop). This pipeline acquires it exactly once,
+        // reducing lock contention with the PTY reader/parser threads.
         cx.spawn(
             async move |this: WeakEntity<TerminalPane>, cx: &mut AsyncApp| {
-                let mut last_presented: Option<std::time::Instant> = None;
-                // Adaptive pacing state
+                let mut last_presented: Option<Instant> = None;
                 let mut consecutive_busy: u32 = 0;
                 let mut consecutive_idle: u32 = 0;
 
                 loop {
-                    let Ok(event) = event_rx.recv_async().await else {
+                    // ── Wait for first event (blocking async) ────────────
+                    let Ok(first_event) = event_rx.recv_async().await else {
                         break;
                     };
 
-                    let mut process_exit_status = match event {
+                    let mut process_exit_status = match first_event {
                         super::surface::TerminalEvent::ProcessExited(code) => Some(code),
                         _ => None,
                     };
-                    while let Ok(event) = event_rx.try_recv() {
-                        if let super::surface::TerminalEvent::ProcessExited(code) = event {
+
+                    // Drain already-buffered events (non-blocking)
+                    while let Ok(ev) = event_rx.try_recv() {
+                        if let super::surface::TerminalEvent::ProcessExited(code) = ev {
                             process_exit_status = Some(code);
                         }
                     }
 
-                    // --- Select pacing parameters based on current mode ------
+                    // ── Phase 1: Batch window ────────────────────────────
+                    // Accumulate events for BATCH_*_MICROS to capture
+                    // PSReadLine multi-chunk VT bursts in a single frame.
                     let fast_mode = consecutive_busy >= FAST_PACING_ENTER;
-                    let frame_budget = Duration::from_micros(if fast_mode {
-                        FRAME_COALESCE_FAST_MICROS
+                    let batch_us = if fast_mode {
+                        BATCH_FAST_MICROS
                     } else {
-                        FRAME_COALESCE_NORMAL_MICROS
-                    });
-                    let settle_ms = if fast_mode {
-                        SETTLE_FAST_MILLIS
-                    } else {
-                        SETTLE_NORMAL_MILLIS
+                        BATCH_NORMAL_MICROS
                     };
-                    let retry_limit = if fast_mode {
-                        RETRY_LIMIT_FAST
-                    } else {
-                        RETRY_LIMIT_NORMAL
-                    };
-                    let sweep_limit = if fast_mode {
-                        SWEEPS_FAST
-                    } else {
-                        SWEEPS_NORMAL
-                    };
+                    let batch_end = Instant::now() + Duration::from_micros(batch_us);
 
-                    if let Some(last_presented_at) = last_presented {
-                        let elapsed = last_presented_at.elapsed();
-                        if elapsed < frame_budget {
-                            cx.background_executor().timer(frame_budget - elapsed).await;
+                    // Sleep for batch window
+                    let remaining = batch_end.saturating_duration_since(Instant::now());
+                    if !remaining.is_zero() {
+                        cx.background_executor().timer(remaining).await;
+                    }
+
+                    // Drain events that arrived during batch sleep
+                    while let Ok(ev) = event_rx.try_recv() {
+                        if let super::surface::TerminalEvent::ProcessExited(code) = ev {
+                            process_exit_status = Some(code);
                         }
                     }
 
-                    if process_exit_status.is_some()
-                        && this
+                    // ── Phase 2: Async parser settle ─────────────────────
+                    // For ghostty_vt: the Zig parser thread may still be
+                    // processing data in its ring buffer. Wait briefly for
+                    // it to finish so we get a complete snapshot.
+                    for _round in 0..ASYNC_SETTLE_MAX_ROUNDS {
+                        let still_pending = this
                             .update(cx, |pane: &mut TerminalPane, _cx| {
-                                // Save session to RAMdisk before exit
+                                pane.surface.has_pending_data()
+                            })
+                            .unwrap_or(false);
+                        if !still_pending {
+                            break;
+                        }
+                        cx.background_executor()
+                            .timer(Duration::from_millis(1))
+                            .await;
+                    }
+
+                    // ── Frame rate limiter ────────────────────────────────
+                    // Enforce minimum interval between frames (~600 Hz cap).
+                    let frame_min = Duration::from_micros(FRAME_MIN_INTERVAL_MICROS);
+                    if let Some(last) = last_presented {
+                        let since_last = last.elapsed();
+                        if since_last < frame_min {
+                            cx.background_executor()
+                                .timer(frame_min - since_last)
+                                .await;
+                        }
+                    }
+
+                    // ── Handle process exit ──────────────────────────────
+                    if let Some(code) = process_exit_status {
+                        if this
+                            .update(cx, |pane: &mut TerminalPane, _cx| {
                                 pane.save_session_to_ramdisk();
-                                pane.pending_process_exit_status = process_exit_status;
+                                pane.pending_process_exit_status = Some(code);
                                 if pane.auto_close {
                                     if let Some(pane_id) = pane.auto_close_pane_id {
                                         if let Some(tx) = crate::app::pane_auto_close_sender() {
@@ -1150,68 +1187,22 @@ impl TerminalPane {
                                 }
                             })
                             .is_err()
-                    {
-                        break;
+                        {
+                            break;
+                        }
                     }
 
-                    let mut should_notify = false;
-                    let mut settled = false;
-
-                    // Phase 1: Poll until the first change is detected (or we
-                    // exhaust the retry budget).
-                    for attempt in 0..retry_limit {
-                        let changed = match this.update(cx, |pane: &mut TerminalPane, _cx| {
+                    // ── Phase 3: Single snapshot refresh ──────────────────
+                    // One backend lock acquisition → read all dirty rows →
+                    // build grid cells + damage spans → update snapshot.
+                    // Previous approach did this up to 10+ times per frame.
+                    let changed = this
+                        .update(cx, |pane: &mut TerminalPane, _cx| {
                             pane.refresh_snapshot(false)
-                        }) {
-                            Ok(changed) => changed,
-                            Err(_) => {
-                                settled = true;
-                                break;
-                            }
-                        };
-                        should_notify |= changed;
+                        })
+                        .unwrap_or(false);
 
-                        if attempt + 1 == retry_limit {
-                            settled = true;
-                            break;
-                        }
-
-                        if should_notify {
-                            break;
-                        }
-
-                        cx.background_executor()
-                            .timer(Duration::from_millis(settle_ms))
-                            .await;
-                    }
-
-                    // Phase 2: After the first change, do additional sweeps to
-                    // capture the full VT burst.  In fast mode we do more sweeps
-                    // with shorter gaps to drain sustained output quickly.
-                    if should_notify && !settled {
-                        for _sweep in 0..sweep_limit {
-                            cx.background_executor()
-                                .timer(Duration::from_millis(settle_ms))
-                                .await;
-
-                            let sweep_changed = this
-                                .update(cx, |pane: &mut TerminalPane, _cx| {
-                                    pane.refresh_snapshot(false)
-                                })
-                                .unwrap_or(false);
-                            should_notify |= sweep_changed;
-
-                            let still_pending = this
-                                .update(cx, |pane: &mut TerminalPane, _cx| {
-                                    pane.surface.has_pending_data()
-                                })
-                                .unwrap_or(false);
-                            if !still_pending && !sweep_changed {
-                                break;
-                            }
-                        }
-                    }
-
+                    // Clear output event flag (allows next OutputReceived)
                     if this
                         .update(cx, |pane: &mut TerminalPane, _cx| {
                             pane.surface.finish_output_event();
@@ -1221,32 +1212,24 @@ impl TerminalPane {
                         break;
                     }
 
-                    // --- Update adaptive pacing counters ----------------------
-                    if should_notify {
+                    // ── Adaptive pacing + UI notification ─────────────────
+                    if changed {
                         consecutive_busy = consecutive_busy.saturating_add(1);
                         consecutive_idle = 0;
+                        if this
+                            .update(cx, |_pane: &mut TerminalPane, cx| {
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                        last_presented = Some(Instant::now());
                     } else {
                         consecutive_idle = consecutive_idle.saturating_add(1);
                         if consecutive_idle >= FAST_PACING_EXIT {
                             consecutive_busy = 0;
                         }
-                    }
-
-                    if settled && !should_notify {
-                        continue;
-                    }
-
-                    if should_notify
-                        && this
-                            .update(cx, |_pane: &mut TerminalPane, cx| {
-                                cx.notify();
-                            })
-                            .is_err()
-                    {
-                        break;
-                    }
-                    if should_notify {
-                        last_presented = Some(Instant::now());
                     }
                 }
             },
@@ -1614,6 +1597,11 @@ impl TerminalPane {
         // Content refresh invalidates cursor-blink-only state
         self.cursor_blink_pending = false;
         self.snapshot.damaged_rows.clear();
+
+        // ── Backend data grab (minimized lock hold time) ─────────────
+        // Lock the backend, extract all needed data, then release.
+        // Grid cell construction and damage detection happen AFTER unlock
+        // to avoid blocking the PTY reader/parser threads.
         #[cfg(feature = "ghostty_vt")]
         let (rows, cursor_x, cursor_y, cursor_visible, row_updates, scrolled) = {
             let mut backend = self.surface.backend.lock();
@@ -1646,6 +1634,7 @@ impl TerminalPane {
                     style_runs: backend.row_style_runs(row),
                 })
                 .collect::<Vec<_>>();
+            // backend lock released here — all heavy processing below is lock-free
             (
                 rows,
                 pos.0.saturating_sub(1),
@@ -1695,6 +1684,7 @@ impl TerminalPane {
                     }
                 })
                 .collect::<Vec<_>>();
+            // backend lock released here
             (rows, cursor_x, cursor_y, cursor_visible, row_updates)
         };
 
