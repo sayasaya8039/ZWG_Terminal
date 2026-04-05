@@ -13,12 +13,21 @@
 const std = @import("std");
 const vk = @import("vk.zig");
 const gpu = @import("gpu_renderer.zig"); // reuse GpuCellData type
+const dx = @import("dx12.zig"); // GDI/DirectWrite types
 
 const Allocator = std.mem.Allocator;
 const log = std.log.scoped(.vulkan_renderer);
 
 const ATLAS_SIZE: u32 = 2048;
 const MAX_CELLS: u32 = 400 * 120;
+const GLYPH_PAD: u32 = 1;
+const GLYPH_MAP_CAP: usize = 4096;
+
+const GlyphSlot = struct {
+    key: u32, // codepoint
+    atlas_index: u32,
+    occupied: bool,
+};
 
 // ================================================================
 // VulkanRenderer
@@ -76,14 +85,35 @@ pub const VulkanRenderer = struct {
     glyph_cell_w: u32,
     glyph_cell_h: u32,
 
+    // Atlas GPU resources
+    atlas_image: vk.VkImage,
+    atlas_mem: vk.VkDeviceMemory,
+    atlas_view: vk.VkImageView,
+    atlas_sampler: vk.VkSampler,
+    atlas_upload_buf: vk.VkBuffer,
+    atlas_upload_mem: vk.VkDeviceMemory,
+    atlas_upload_mapped: ?[*]u8,
+
+    // GDI/DirectWrite (same as gpu_renderer.zig)
+    gdi_dc: ?*anyopaque, // HDC
+    gdi_font: ?*anyopaque, // HFONT
+    dwrite_factory: ?*dx.IDWriteFactory,
+    dwrite_gdi_interop: ?*dx.IDWriteGdiInterop,
+    dwrite_font_face: ?*dx.IDWriteFontFace,
+    glyph_baseline: f32,
+    atlas_cols: u32,
+    atlas_rows: u32,
+    atlas_slot_count: u32,
+    atlas_dirty_words: []u64,
+    glyph_map: []GlyphSlot,
+
     // State flags
     initialized: bool,
 
     // ---- Initialization ----
 
     pub fn init(alloc: Allocator, width: u32, height: u32, font_size: f32) ?*VulkanRenderer {
-        _ = font_size; // TODO: use for glyph rasterization
-        log.info("initializing Vulkan GPU renderer {}x{}", .{ width, height });
+        log.info("initializing Vulkan GPU renderer {}x{} font_size={d:.1}", .{ width, height, font_size });
 
         // Load Vulkan loader
         const gipa = vk.loadLoader() orelse {
@@ -106,6 +136,30 @@ pub const VulkanRenderer = struct {
         self.atlas_dirty = false;
         self.cell_mapped = null;
         self.readback_mapped = null;
+
+        // Atlas GPU resources init
+        self.atlas_image = 0;
+        self.atlas_mem = 0;
+        self.atlas_view = 0;
+        self.atlas_sampler = 0;
+        self.atlas_upload_buf = 0;
+        self.atlas_upload_mem = 0;
+        self.atlas_upload_mapped = null;
+
+        // GDI/DirectWrite init
+        self.gdi_dc = null;
+        self.gdi_font = null;
+        self.dwrite_factory = null;
+        self.dwrite_gdi_interop = null;
+        self.dwrite_font_face = null;
+        self.glyph_baseline = 0;
+        self.atlas_cols = 0;
+        self.atlas_rows = 0;
+        self.atlas_slot_count = 0;
+        self.atlas_dirty_words = &.{};
+        self.glyph_map = &.{};
+        self.glyph_cell_w = 0;
+        self.glyph_cell_h = 0;
 
         // Atlas bitmap (CPU)
         self.atlas_bitmap = alloc.alloc(u8, ATLAS_SIZE * ATLAS_SIZE) catch {
@@ -272,6 +326,18 @@ pub const VulkanRenderer = struct {
             alloc.free(self.atlas_bitmap);
             alloc.destroy(self);
             return null;
+        }
+
+        // Create atlas GPU resources
+        if (!self.createAtlasImage()) {
+            log.warn("atlas image creation failed — text rendering disabled", .{});
+        } else {
+            self.updateAtlasDescriptor();
+        }
+
+        // Initialize GDI/DirectWrite for glyph rasterization
+        if (!self.initGdi(font_size)) {
+            log.warn("GDI/DirectWrite init failed — text rendering disabled", .{});
         }
 
         self.initialized = true;
@@ -512,16 +578,14 @@ pub const VulkanRenderer = struct {
         }
         self.framebuffer = fb;
 
-        // Descriptor set layout (binding 0 = cell storage buffer)
-        const binding = vk.VkDescriptorSetLayoutBinding{
-            .binding = 0,
-            .descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 1,
-            .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT,
+        // Descriptor set layout (binding 0 = cell storage, binding 1 = atlas sampler)
+        const bindings = [_]vk.VkDescriptorSetLayoutBinding{
+            .{ .binding = 0, .descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1, .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT },
+            .{ .binding = 1, .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = vk.VK_SHADER_STAGE_FRAGMENT_BIT },
         };
         const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
-            .bindingCount = 1,
-            .pBindings = @ptrCast(&binding),
+            .bindingCount = 2,
+            .pBindings = &bindings,
         };
         var dsl: vk.VkDescriptorSetLayout = 0;
         if (self.funcs.createDescriptorSetLayout(self.device, &dsl_ci, null, &dsl) != vk.VK_SUCCESS) {
@@ -533,7 +597,7 @@ pub const VulkanRenderer = struct {
 
         // Push constant range (48 bytes: viewport/cell/atlas params)
         const pc_range = vk.VkPushConstantRange{
-            .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT,
+            .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
             .offset = 0,
             .size = 48,
         };
@@ -626,14 +690,14 @@ pub const VulkanRenderer = struct {
         self.funcs.destroyShaderModule(self.device, frag_mod, null);
 
         // Descriptor pool + set
-        const pool_size = vk.VkDescriptorPoolSize{
-            .type_ = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-            .descriptorCount = 1,
+        const pool_sizes = [_]vk.VkDescriptorPoolSize{
+            .{ .type_ = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, .descriptorCount = 1 },
+            .{ .type_ = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1 },
         };
         const dp_ci = vk.VkDescriptorPoolCreateInfo{
             .maxSets = 1,
-            .poolSizeCount = 1,
-            .pPoolSizes = @ptrCast(&pool_size),
+            .poolSizeCount = 2,
+            .pPoolSizes = &pool_sizes,
         };
         var dp: vk.VkDescriptorPool = 0;
         if (self.funcs.createDescriptorPool(self.device, &dp_ci, null, &dp) != vk.VK_SUCCESS) {
@@ -680,6 +744,363 @@ pub const VulkanRenderer = struct {
         if (self.render_pass != 0) self.funcs.destroyRenderPass(self.device, self.render_pass, null);
     }
 
+    // ---- Atlas GPU resources ----
+
+    fn createAtlasImage(self: *VulkanRenderer) bool {
+        // R8_UNORM 2048x2048 image (SAMPLED + TRANSFER_DST)
+        const img_ci = vk.VkImageCreateInfo{
+            .extent = .{ .width = ATLAS_SIZE, .height = ATLAS_SIZE, .depth = 1 },
+            .format = vk.VK_FORMAT_R8_UNORM,
+            .usage = vk.VK_IMAGE_USAGE_SAMPLED_BIT | vk.VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+        };
+        var image: vk.VkImage = 0;
+        if (self.funcs.createImage(self.device, &img_ci, null, &image) != vk.VK_SUCCESS) {
+            log.err("failed to create atlas image", .{});
+            return false;
+        }
+        self.atlas_image = image;
+
+        var reqs: vk.VkMemoryRequirements = .{};
+        self.funcs.getImageMemoryRequirements(self.device, image, &reqs);
+        const type_idx = vk.findMemoryType(&self.mem_props, reqs.memoryTypeBits, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) orelse return false;
+        const alloc_info = vk.VkMemoryAllocateInfo{ .allocationSize = reqs.size, .memoryTypeIndex = type_idx };
+        var mem: vk.VkDeviceMemory = 0;
+        if (self.funcs.allocateMemory(self.device, &alloc_info, null, &mem) != vk.VK_SUCCESS) return false;
+        self.atlas_mem = mem;
+        if (self.funcs.bindImageMemory(self.device, image, mem, 0) != vk.VK_SUCCESS) return false;
+
+        // Image view
+        const view_ci = vk.VkImageViewCreateInfo{
+            .image = image,
+            .format = vk.VK_FORMAT_R8_UNORM,
+        };
+        var view: vk.VkImageView = 0;
+        if (self.funcs.createImageView(self.device, &view_ci, null, &view) != vk.VK_SUCCESS) return false;
+        self.atlas_view = view;
+
+        // Sampler (NEAREST, CLAMP_TO_EDGE)
+        const sampler_ci = vk.VkSamplerCreateInfo{};
+        var sampler: vk.VkSampler = 0;
+        if (self.funcs.createSampler(self.device, &sampler_ci, null, &sampler) != vk.VK_SUCCESS) return false;
+        self.atlas_sampler = sampler;
+
+        // Staging buffer (4MB = ATLAS_SIZE * ATLAS_SIZE)
+        const staging_size: vk.VkDeviceSize = ATLAS_SIZE * ATLAS_SIZE;
+        var sbuf: vk.VkBuffer = 0;
+        var smem: vk.VkDeviceMemory = 0;
+        if (!self.createBuffer(staging_size, vk.VK_BUFFER_USAGE_TRANSFER_SRC_BIT, vk.VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | vk.VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, &sbuf, &smem)) return false;
+        self.atlas_upload_buf = sbuf;
+        self.atlas_upload_mem = smem;
+        var mapped: ?*anyopaque = null;
+        if (self.funcs.mapMemory(self.device, smem, 0, staging_size, 0, &mapped) != vk.VK_SUCCESS) return false;
+        self.atlas_upload_mapped = @ptrCast(mapped);
+
+        log.info("atlas image created {}x{} R8_UNORM + staging buffer", .{ ATLAS_SIZE, ATLAS_SIZE });
+        return true;
+    }
+
+    fn destroyAtlasImage(self: *VulkanRenderer) void {
+        if (self.atlas_sampler != 0) self.funcs.destroySampler(self.device, self.atlas_sampler, null);
+        if (self.atlas_view != 0) self.funcs.destroyImageView(self.device, self.atlas_view, null);
+        if (self.atlas_image != 0) self.funcs.destroyImage(self.device, self.atlas_image, null);
+        if (self.atlas_mem != 0) self.funcs.freeMemory(self.device, self.atlas_mem, null);
+        if (self.atlas_upload_buf != 0) self.funcs.destroyBuffer(self.device, self.atlas_upload_buf, null);
+        if (self.atlas_upload_mem != 0) self.funcs.freeMemory(self.device, self.atlas_upload_mem, null);
+    }
+
+    fn updateAtlasDescriptor(self: *VulkanRenderer) void {
+        const img_info = vk.VkDescriptorImageInfo{
+            .sampler = self.atlas_sampler,
+            .imageView = self.atlas_view,
+            .imageLayout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+        };
+        const write = [_]vk.VkWriteDescriptorSet{.{
+            .dstSet = self.desc_set,
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk.VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+            .pImageInfo = &img_info,
+        }};
+        self.funcs.updateDescriptorSets(self.device, 1, &write, 0, null);
+    }
+
+    // ---- DirectWrite glyph rasterization ----
+
+    fn initGdi(self: *VulkanRenderer, font_size: f32) bool {
+        self.gdi_dc = dx.CreateCompatibleDC(null);
+        if (self.gdi_dc == null) {
+            log.err("initGdi: CreateCompatibleDC failed", .{});
+            return false;
+        }
+
+        // Create font
+        const font_name = std.unicode.utf8ToUtf16LeStringLiteral("Consolas");
+        self.gdi_font = dx.CreateFontW(
+            -@as(i32, @intFromFloat(font_size)),
+            0, 0, 0,
+            400, // FW_NORMAL
+            0, 0, 0,
+            0, // DEFAULT_CHARSET
+            0, 0,
+            5, // CLEARTYPE_QUALITY
+            0x31, // FIXED_PITCH | FF_MODERN
+            font_name,
+        );
+        if (self.gdi_font == null) {
+            log.err("initGdi: CreateFontW failed font_size={d:.2}", .{font_size});
+            _ = dx.DeleteDC(self.gdi_dc);
+            return false;
+        }
+        _ = dx.SelectObject(self.gdi_dc, self.gdi_font);
+
+        // Measure cell dimensions
+        var sz: dx.SIZE = .{};
+        const sample = [_]u16{'M'};
+        _ = dx.GetTextExtentPoint32W(self.gdi_dc, &sample, 1, &sz);
+        self.glyph_cell_w = @intCast(@max(sz.cx, 1));
+        self.glyph_cell_h = @intCast(@max(sz.cy, 1));
+        const slot_pitch_w = self.glyph_cell_w + GLYPH_PAD;
+        if (slot_pitch_w == 0 or slot_pitch_w > ATLAS_SIZE) {
+            log.err("initGdi: glyph cell width {} invalid for atlas {}", .{ self.glyph_cell_w, ATLAS_SIZE });
+            _ = dx.DeleteObject(self.gdi_font);
+            _ = dx.DeleteDC(self.gdi_dc);
+            return false;
+        }
+
+        var factory_raw: ?*anyopaque = null;
+        const factory_hr = dx.DWriteCreateFactory(.SHARED, &dx.IID_IDWriteFactory, &factory_raw);
+        if (!dx.SUCCEEDED(factory_hr) or factory_raw == null) {
+            log.err("initGdi: DWriteCreateFactory failed hr=0x{x}", .{@as(u32, @bitCast(factory_hr))});
+            _ = dx.DeleteObject(self.gdi_font);
+            _ = dx.DeleteDC(self.gdi_dc);
+            return false;
+        }
+        self.dwrite_factory = @ptrCast(@alignCast(factory_raw.?));
+
+        var interop_raw: ?*anyopaque = null;
+        const interop_hr = self.dwrite_factory.?.GetGdiInterop(&interop_raw);
+        if (!dx.SUCCEEDED(interop_hr) or interop_raw == null) {
+            log.err("initGdi: GetGdiInterop failed hr=0x{x}", .{@as(u32, @bitCast(interop_hr))});
+            _ = self.dwrite_factory.?.Release();
+            self.dwrite_factory = null;
+            _ = dx.DeleteObject(self.gdi_font);
+            _ = dx.DeleteDC(self.gdi_dc);
+            return false;
+        }
+        self.dwrite_gdi_interop = @ptrCast(@alignCast(interop_raw.?));
+
+        var font_face_raw: ?*anyopaque = null;
+        const font_face_hr = self.dwrite_gdi_interop.?.CreateFontFaceFromHdc(self.gdi_dc, &font_face_raw);
+        if (!dx.SUCCEEDED(font_face_hr) or font_face_raw == null) {
+            log.err("initGdi: CreateFontFaceFromHdc failed hr=0x{x}", .{@as(u32, @bitCast(font_face_hr))});
+            _ = self.dwrite_gdi_interop.?.Release();
+            _ = self.dwrite_factory.?.Release();
+            self.dwrite_gdi_interop = null;
+            self.dwrite_factory = null;
+            _ = dx.DeleteObject(self.gdi_font);
+            _ = dx.DeleteDC(self.gdi_dc);
+            return false;
+        }
+        self.dwrite_font_face = @ptrCast(@alignCast(font_face_raw.?));
+
+        var metrics: dx.DWRITE_FONT_METRICS = .{};
+        const metrics_hr = self.dwrite_font_face.?.GetGdiCompatibleMetrics(font_size, 1.0, null, &metrics);
+        if (!dx.SUCCEEDED(metrics_hr)) {
+            log.err("initGdi: GetGdiCompatibleMetrics failed hr=0x{x}", .{@as(u32, @bitCast(metrics_hr))});
+            self.deinitGdi();
+            return false;
+        }
+
+        const metrics_height = @as(u32, metrics.ascent) + @as(u32, metrics.descent);
+        self.glyph_cell_h = @max(self.glyph_cell_h, @max(metrics_height, 1));
+        self.glyph_baseline = @as(f32, @floatFromInt(@min(metrics.ascent, @as(u16, @intCast(self.glyph_cell_h)))));
+
+        const slot_pitch_h = self.glyph_cell_h + GLYPH_PAD;
+        if (slot_pitch_h == 0 or slot_pitch_h > ATLAS_SIZE) {
+            log.err("initGdi: glyph cell height {} invalid for atlas {}", .{ self.glyph_cell_h, ATLAS_SIZE });
+            self.deinitGdi();
+            return false;
+        }
+        self.atlas_cols = ATLAS_SIZE / slot_pitch_w;
+        self.atlas_rows = ATLAS_SIZE / slot_pitch_h;
+        if (self.atlas_cols == 0 or self.atlas_rows == 0) {
+            log.err("initGdi: atlas packing invalid for pitch {}x{}", .{ slot_pitch_w, slot_pitch_h });
+            self.deinitGdi();
+            return false;
+        }
+        self.atlas_slot_count = self.atlas_cols * self.atlas_rows;
+        const atlas_dirty_word_count = @as(usize, @intCast((self.atlas_slot_count + 63) / 64));
+        self.atlas_dirty_words = self.alloc.alloc(u64, atlas_dirty_word_count) catch {
+            log.err("initGdi: failed to allocate atlas dirty bitset", .{});
+            self.deinitGdi();
+            return false;
+        };
+        @memset(self.atlas_dirty_words, 0);
+
+        // Allocate glyph map
+        self.glyph_map = self.alloc.alloc(GlyphSlot, GLYPH_MAP_CAP) catch {
+            log.err("initGdi: failed to allocate glyph map", .{});
+            self.deinitGdi();
+            return false;
+        };
+        for (self.glyph_map) |*s| s.* = .{ .key = 0, .atlas_index = 0, .occupied = false };
+
+        log.info(
+            "DirectWrite glyph rasterizer ready glyph_cell={}x{} baseline={d:.2} atlas_cols={} atlas_rows={}",
+            .{ self.glyph_cell_w, self.glyph_cell_h, self.glyph_baseline, self.atlas_cols, self.atlas_rows },
+        );
+        return true;
+    }
+
+    fn deinitGdi(self: *VulkanRenderer) void {
+        if (self.atlas_dirty_words.len != 0) self.alloc.free(self.atlas_dirty_words);
+        self.atlas_dirty_words = &.{};
+        if (self.dwrite_font_face) |font_face| _ = font_face.Release();
+        if (self.dwrite_gdi_interop) |interop| _ = interop.Release();
+        if (self.dwrite_factory) |factory| _ = factory.Release();
+        if (self.gdi_font != null) _ = dx.DeleteObject(self.gdi_font);
+        if (self.gdi_dc != null) _ = dx.DeleteDC(self.gdi_dc);
+        self.dwrite_font_face = null;
+        self.dwrite_gdi_interop = null;
+        self.dwrite_factory = null;
+        self.gdi_font = null;
+        self.gdi_dc = null;
+    }
+
+    /// Rasterise a single codepoint and upload to atlas. Returns atlas index + 1.
+    /// Index 0 is reserved for "no glyph".
+    fn rasterizeGlyph(self: *VulkanRenderer, codepoint: u32) ?u32 {
+        // Check cache first
+        if (self.lookupGlyph(codepoint)) |idx| return idx;
+
+        const w = self.glyph_cell_w;
+        const h = self.glyph_cell_h;
+        const rast_slot_pitch_w = w + GLYPH_PAD;
+        const rast_slot_pitch_h = h + GLYPH_PAD;
+        if (self.atlas_cols == 0) return null;
+        const total_slots = self.atlas_cols * self.atlas_rows;
+        if (self.glyph_count >= total_slots) return null;
+        const atlas_index = self.glyph_count;
+        const dst_x = (atlas_index % self.atlas_cols) * rast_slot_pitch_w;
+        const dst_y = (atlas_index / self.atlas_cols) * rast_slot_pitch_h;
+
+        const font_face = self.dwrite_font_face orelse return null;
+        const factory = self.dwrite_factory orelse return null;
+        const codepoints = [_]u32{codepoint};
+        var glyph_indices = [_]u16{0};
+        if (!dx.SUCCEEDED(font_face.GetGlyphIndices(&codepoints, 1, &glyph_indices))) return null;
+
+        const advances = [_]f32{0};
+        const offsets = [_]dx.DWRITE_GLYPH_OFFSET{.{}};
+        const glyph_run: dx.DWRITE_GLYPH_RUN = .{
+            .fontFace = font_face,
+            .fontEmSize = @as(f32, @floatFromInt(h)),
+            .glyphCount = 1,
+            .glyphIndices = &glyph_indices,
+            .glyphAdvances = &advances,
+            .glyphOffsets = &offsets,
+            .isSideways = dx.FALSE,
+            .bidiLevel = 0,
+        };
+
+        var analysis_raw: ?*anyopaque = null;
+        const analysis_hr = factory.CreateGlyphRunAnalysis(
+            &glyph_run,
+            1.0,
+            null,
+            .NATURAL_SYMMETRIC,
+            .NATURAL,
+            0,
+            self.glyph_baseline,
+            &analysis_raw,
+        );
+        if (!dx.SUCCEEDED(analysis_hr) or analysis_raw == null) return null;
+        const analysis: *dx.IDWriteGlyphRunAnalysis = @ptrCast(@alignCast(analysis_raw.?));
+        defer _ = analysis.Release();
+
+        var bounds: dx.RECT = .{ .left = 0, .top = 0, .right = 0, .bottom = 0 };
+        const bounds_hr = analysis.GetAlphaTextureBounds(.ALIASED_1x1, &bounds);
+        if (!dx.SUCCEEDED(bounds_hr)) return null;
+
+        if (bounds.right > bounds.left and bounds.bottom > bounds.top) {
+            const tex_w: u32 = @intCast(bounds.right - bounds.left);
+            const tex_h: u32 = @intCast(bounds.bottom - bounds.top);
+            const alpha_len = tex_w * tex_h;
+            const alpha_buf = self.alloc.alloc(u8, alpha_len) catch return null;
+            defer self.alloc.free(alpha_buf);
+
+            const alpha_hr = analysis.CreateAlphaTexture(.ALIASED_1x1, &bounds, alpha_buf.ptr, @intCast(alpha_buf.len));
+            if (!dx.SUCCEEDED(alpha_hr)) return null;
+
+            var row: u32 = 0;
+            while (row < tex_h) : (row += 1) {
+                var col: u32 = 0;
+                while (col < tex_w) : (col += 1) {
+                    const atlas_px_x = @as(i32, @intCast(dst_x)) + bounds.left + @as(i32, @intCast(col));
+                    const atlas_px_y = @as(i32, @intCast(dst_y)) + bounds.top + @as(i32, @intCast(row));
+                    if (atlas_px_x < 0 or atlas_px_y < 0) continue;
+                    if (atlas_px_x >= @as(i32, @intCast(ATLAS_SIZE)) or atlas_px_y >= @as(i32, @intCast(ATLAS_SIZE))) continue;
+                    const dst_idx = @as(usize, @intCast(atlas_px_y)) * ATLAS_SIZE + @as(usize, @intCast(atlas_px_x));
+                    self.atlas_bitmap[dst_idx] = alpha_buf[row * tex_w + col];
+                }
+            }
+            self.markAtlasDirty(atlas_index);
+        }
+
+        self.insertGlyph(codepoint, atlas_index);
+        if (!self.hasAtlasDirtySlot(atlas_index)) self.markAtlasDirty(atlas_index);
+        return atlas_index + 1;
+    }
+
+    fn markAtlasDirty(self: *VulkanRenderer, atlas_index: u32) void {
+        if (atlas_index >= self.atlas_slot_count) return;
+        if (!self.atlas_dirty) {
+            self.atlas_dirty = true;
+        }
+        const word_index = atlas_index / 64;
+        const bit_index = @as(u6, @intCast(atlas_index % 64));
+        self.atlas_dirty_words[word_index] |= (@as(u64, 1) << bit_index);
+    }
+
+    fn hasAtlasDirtySlot(self: *const VulkanRenderer, atlas_index: u32) bool {
+        if (!self.atlas_dirty or atlas_index >= self.atlas_slot_count) return false;
+        const word_index = atlas_index / 64;
+        const bit_index = @as(u6, @intCast(atlas_index % 64));
+        return (self.atlas_dirty_words[word_index] & (@as(u64, 1) << bit_index)) != 0;
+    }
+
+    fn lookupGlyph(self: *const VulkanRenderer, cp: u32) ?u32 {
+        if (self.glyph_map.len == 0) return null;
+        var idx = @as(usize, cp % GLYPH_MAP_CAP);
+        var probes: usize = 0;
+        while (probes < GLYPH_MAP_CAP) : (probes += 1) {
+            const s = &self.glyph_map[idx];
+            if (!s.occupied) return null;
+            if (s.key == cp) return s.atlas_index + 1;
+            idx = (idx + 1) % GLYPH_MAP_CAP;
+        }
+        return null;
+    }
+
+    fn insertGlyph(self: *VulkanRenderer, cp: u32, atlas_index: u32) void {
+        if (self.glyph_map.len == 0) return;
+        var idx = @as(usize, cp % GLYPH_MAP_CAP);
+        var probes: usize = 0;
+        while (probes < GLYPH_MAP_CAP) : (probes += 1) {
+            const s = &self.glyph_map[idx];
+            if (!s.occupied) {
+                self.glyph_map[idx] = .{ .key = cp, .atlas_index = atlas_index, .occupied = true };
+                self.glyph_count += 1;
+                return;
+            }
+            if (s.key == cp) {
+                self.glyph_map[idx].atlas_index = atlas_index;
+                return;
+            }
+            idx = (idx + 1) % GLYPH_MAP_CAP;
+        }
+    }
+
     fn destroyReadbackBuffer(self: *VulkanRenderer) void {
         if (self.readback_buf != 0) self.funcs.destroyBuffer(self.device, self.readback_buf, null);
         if (self.readback_mem != 0) self.funcs.freeMemory(self.device, self.readback_mem, null);
@@ -718,6 +1139,14 @@ pub const VulkanRenderer = struct {
             @memcpy(dst[0..count], cells[0..count]);
         }
 
+        // Rasterize any new glyphs
+        for (0..count) |i| {
+            const cell = cells[i];
+            if (cell.codepoint != 0) {
+                _ = self.rasterizeGlyph(cell.codepoint);
+            }
+        }
+
         // Wait for previous frame's fence
         _ = self.funcs.waitForFences(self.device, 1, @ptrCast(&self.fence), vk.VK_TRUE, 1_000_000_000);
         _ = self.funcs.resetFences(self.device, 1, @ptrCast(&self.fence));
@@ -726,6 +1155,39 @@ pub const VulkanRenderer = struct {
         _ = self.funcs.resetCommandBuffer(self.cmd_buf, 0);
         const begin_info = vk.VkCommandBufferBeginInfo{};
         _ = self.funcs.beginCommandBuffer(self.cmd_buf, &begin_info);
+
+        // Upload atlas if dirty
+        if (self.atlas_dirty and self.atlas_image != 0) {
+            if (self.atlas_upload_mapped) |upload_ptr| {
+                @memcpy(upload_ptr[0 .. ATLAS_SIZE * ATLAS_SIZE], self.atlas_bitmap);
+            }
+            // Transition atlas image UNDEFINED → TRANSFER_DST
+            const atlas_barrier_dst = [_]vk.VkImageMemoryBarrier{.{
+                .dstAccessMask = vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                .oldLayout = vk.VK_IMAGE_LAYOUT_UNDEFINED,
+                .newLayout = vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .image = self.atlas_image,
+            }};
+            self.funcs.cmdPipelineBarrier(self.cmd_buf, vk.VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, vk.VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, null, 0, null, 1, &atlas_barrier_dst);
+
+            const copy = [_]vk.VkBufferImageCopy{.{
+                .bufferRowLength = ATLAS_SIZE,
+                .bufferImageHeight = ATLAS_SIZE,
+                .imageExtent = .{ .width = ATLAS_SIZE, .height = ATLAS_SIZE, .depth = 1 },
+            }};
+            self.funcs.cmdCopyBufferToImage(self.cmd_buf, self.atlas_upload_buf, self.atlas_image, vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+
+            // Transition atlas TRANSFER_DST → SHADER_READ_ONLY
+            const atlas_barrier_read = [_]vk.VkImageMemoryBarrier{.{
+                .srcAccessMask = vk.VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = vk.VK_ACCESS_SHADER_READ_BIT,
+                .oldLayout = vk.VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                .newLayout = vk.VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                .image = self.atlas_image,
+            }};
+            self.funcs.cmdPipelineBarrier(self.cmd_buf, vk.VK_PIPELINE_STAGE_TRANSFER_BIT, vk.VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0, null, 0, null, 1, &atlas_barrier_read);
+            self.atlas_dirty = false;
+        }
 
         // Begin render pass (clear to bg color)
         const bg = cells[0].bg_rgba;
@@ -758,19 +1220,27 @@ pub const VulkanRenderer = struct {
         );
 
         // Push constants
+        const slot_pitch_w = self.glyph_cell_w + GLYPH_PAD;
+        const slot_pitch_h = self.glyph_cell_h + GLYPH_PAD;
         const pc = PushConstants{
             .viewport_size = .{ @floatFromInt(self.width), @floatFromInt(self.height) },
             .cell_size = .{ cell_width, cell_height },
-            .atlas_pitch_inv = .{ 0, 0 }, // TODO: atlas wiring
-            .atlas_glyph_inv = .{ 0, 0 },
+            .atlas_pitch_inv = .{
+                if (self.atlas_cols > 0) @as(f32, @floatFromInt(slot_pitch_w)) / @as(f32, @floatFromInt(ATLAS_SIZE)) else 0,
+                if (self.atlas_rows > 0) @as(f32, @floatFromInt(slot_pitch_h)) / @as(f32, @floatFromInt(ATLAS_SIZE)) else 0,
+            },
+            .atlas_glyph_inv = .{
+                if (self.glyph_cell_w > 0) @as(f32, @floatFromInt(self.glyph_cell_w)) / @as(f32, @floatFromInt(ATLAS_SIZE)) else 0,
+                if (self.glyph_cell_h > 0) @as(f32, @floatFromInt(self.glyph_cell_h)) / @as(f32, @floatFromInt(ATLAS_SIZE)) else 0,
+            },
             .term_cols = @floatFromInt(term_cols),
-            .atlas_grid_cols = 0,
+            .atlas_grid_cols = @floatFromInt(self.atlas_cols),
             ._pad = .{ 0, 0 },
         };
         self.funcs.cmdPushConstants(
             self.cmd_buf,
             self.pipeline_layout,
-            vk.VK_SHADER_STAGE_VERTEX_BIT,
+            vk.VK_SHADER_STAGE_VERTEX_BIT | vk.VK_SHADER_STAGE_FRAGMENT_BIT,
             0,
             @sizeOf(PushConstants),
             @ptrCast(&pc),
@@ -859,6 +1329,8 @@ pub const VulkanRenderer = struct {
             _ = self.funcs.deviceWaitIdle(self.device);
         }
         self.destroyPipeline();
+        self.destroyAtlasImage();
+        self.deinitGdi();
         self.destroyRenderTarget();
         self.destroyReadbackBuffer();
         self.destroyCellBuffer();
@@ -866,6 +1338,7 @@ pub const VulkanRenderer = struct {
         if (self.device != null) self.funcs.destroyDevice(self.device, null);
         if (self.instance != null) self.funcs.destroyInstance(self.instance, null);
         self.alloc.free(self.atlas_bitmap);
+        if (self.glyph_map.len != 0) self.alloc.free(self.glyph_map);
         self.alloc.destroy(self);
     }
 };

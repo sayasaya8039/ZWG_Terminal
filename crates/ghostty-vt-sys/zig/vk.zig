@@ -44,6 +44,7 @@ pub const VK_ATTACHMENT_STORE_OP_STORE: i32 = 0;
 pub const VK_SUBPASS_EXTERNAL: u32 = 0xFFFFFFFF;
 pub const VK_PIPELINE_BIND_POINT_GRAPHICS: i32 = 0;
 pub const VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT: u32 = 0x400;
+pub const VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT: u32 = 0x80;
 pub const VK_PIPELINE_STAGE_TRANSFER_BIT: u32 = 0x1000;
 pub const VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT: u32 = 0x01;
 pub const VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT: u32 = 0x2000;
@@ -598,7 +599,7 @@ pub const VkWriteDescriptorSet = extern struct {
     dstArrayElement: u32 = 0,
     descriptorCount: u32 = 0,
     descriptorType: i32 = 0,
-    pImageInfo: ?*const anyopaque = null,
+    pImageInfo: ?*const VkDescriptorImageInfo = null,
     pBufferInfo: ?*const VkDescriptorBufferInfo = null,
     pTexelBufferView: ?*const anyopaque = null,
 };
@@ -640,6 +641,33 @@ pub const VkImageSubresourceLayers = extern struct {
     mipLevel: u32 = 0,
     baseArrayLayer: u32 = 0,
     layerCount: u32 = 1,
+};
+
+pub const VkSamplerCreateInfo = extern struct {
+    sType: i32 = 31, // VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO
+    pNext: ?*const anyopaque = null,
+    flags: u32 = 0,
+    magFilter: i32 = VK_FILTER_NEAREST,
+    minFilter: i32 = VK_FILTER_NEAREST,
+    mipmapMode: i32 = 0, // VK_SAMPLER_MIPMAP_MODE_NEAREST
+    addressModeU: i32 = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    addressModeV: i32 = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    addressModeW: i32 = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    mipLodBias: f32 = 0,
+    anisotropyEnable: VkBool32 = VK_FALSE,
+    maxAnisotropy: f32 = 1.0,
+    compareEnable: VkBool32 = VK_FALSE,
+    compareOp: i32 = 0,
+    minLod: f32 = 0,
+    maxLod: f32 = 0,
+    borderColor: i32 = VK_BORDER_COLOR_FLOAT_OPAQUE_BLACK,
+    unnormalizedCoordinates: VkBool32 = VK_FALSE,
+};
+
+pub const VkDescriptorImageInfo = extern struct {
+    sampler: VkSampler = 0,
+    imageView: VkImageView = 0,
+    imageLayout: i32 = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
 };
 
 // ================================================================
@@ -727,7 +755,11 @@ pub const VkFuncs = struct {
     cmdSetScissor: *const fn (VkCommandBuffer, u32, u32, [*]const VkRect2D) callconv(.c) void = undefined,
     cmdPipelineBarrier: *const fn (VkCommandBuffer, u32, u32, u32, u32, ?*const anyopaque, u32, ?*const anyopaque, u32, ?[*]const VkImageMemoryBarrier) callconv(.c) void = undefined,
     cmdCopyImageToBuffer: *const fn (VkCommandBuffer, VkImage, i32, VkBuffer, u32, [*]const VkBufferImageCopy) callconv(.c) void = undefined,
+    cmdCopyBufferToImage: *const fn (VkCommandBuffer, VkBuffer, VkImage, i32, u32, [*]const VkBufferImageCopy) callconv(.c) void = undefined,
     cmdPushConstants: *const fn (VkCommandBuffer, VkPipelineLayout, u32, u32, u32, *const anyopaque) callconv(.c) void = undefined,
+    // Sampler
+    createSampler: *const fn (VkDevice, *const VkSamplerCreateInfo, ?*const anyopaque, *VkSampler) callconv(.c) VkResult = undefined,
+    destroySampler: *const fn (VkDevice, VkSampler, ?*const anyopaque) callconv(.c) void = undefined,
 
     pub fn loadInstance(gipa: PFN_vkGetInstanceProcAddr, instance: VkInstance) VkFuncs {
         var self: VkFuncs = .{};

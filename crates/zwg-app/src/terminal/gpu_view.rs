@@ -36,9 +36,15 @@ enum PackedRefresh {
     Partial,
 }
 
-/// Wraps the DX12 GpuRenderer with frame-to-frame image caching.
+/// GPU rendering backend — Vulkan preferred, DX12 fallback.
+enum GpuBackend {
+    Vulkan(ghostty_vt::VulkanRenderer),
+    Dx12(ghostty_vt::GpuRenderer),
+}
+
+/// Wraps the GPU renderer with frame-to-frame image caching.
 pub(super) struct GpuTerminalState {
-    renderer: ghostty_vt::GpuRenderer,
+    backend: GpuBackend,
     /// Cached per-row GPU cell payload.
     packed_rows: Vec<Vec<ghostty_vt::GpuCellData>>,
     /// Flattened payload passed to the renderer.
@@ -56,18 +62,27 @@ pub(super) struct GpuTerminalState {
 }
 
 impl GpuTerminalState {
-    /// Try to create a DX12 GPU renderer. Returns None if DX12 init fails
-    /// (e.g., no compatible GPU, driver issues).
+    /// Try to create a GPU renderer. Tries Vulkan first, then DX12.
+    /// Returns None if both fail.
     pub fn new(width: u32, height: u32, font_size: f32) -> Option<Self> {
-        let renderer = ghostty_vt::GpuRenderer::new(width, height, font_size).ok()?;
-        log::info!(
-            "DX12 GPU renderer initialized: {}x{} font_size={:.1}",
-            width,
-            height,
-            font_size
-        );
+        let backend = if let Ok(vk) = ghostty_vt::VulkanRenderer::new(width, height, font_size) {
+            log::info!(
+                "Vulkan GPU renderer initialized: {}x{} font_size={:.1}",
+                width, height, font_size
+            );
+            GpuBackend::Vulkan(vk)
+        } else if let Ok(dx) = ghostty_vt::GpuRenderer::new(width, height, font_size) {
+            log::info!(
+                "DX12 GPU renderer initialized (Vulkan unavailable): {}x{} font_size={:.1}",
+                width, height, font_size
+            );
+            GpuBackend::Dx12(dx)
+        } else {
+            log::warn!("No GPU renderer available (Vulkan and DX12 both failed)");
+            return None;
+        };
         Some(Self {
-            renderer,
+            backend,
             packed_rows: Vec::new(),
             packed_cells: Vec::new(),
             packed_row_offsets: Vec::new(),
@@ -81,7 +96,10 @@ impl GpuTerminalState {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> bool {
-        let ok = self.renderer.resize(width, height);
+        let ok = match &mut self.backend {
+            GpuBackend::Vulkan(vk) => vk.resize(width, height),
+            GpuBackend::Dx12(dx) => dx.resize(width, height),
+        };
         if ok {
             #[cfg(target_os = "windows")]
             if let Some(presenter) = self.native_presenter.as_ref() {
@@ -260,7 +278,11 @@ impl GpuTerminalState {
         let target_h: f32 = bounds.size.height.into();
         let target_w = target_w.max(1.0).ceil() as u32;
         let target_h = target_h.max(1.0).ceil() as u32;
-        if self.renderer.width() != target_w || self.renderer.height() != target_h {
+        let (cur_w, cur_h) = match &self.backend {
+            GpuBackend::Vulkan(vk) => (vk.width(), vk.height()),
+            GpuBackend::Dx12(dx) => (dx.width(), dx.height()),
+        };
+        if cur_w != target_w || cur_h != target_h {
             if !self.resize(target_w, target_h) {
                 return false;
             }
@@ -298,14 +320,17 @@ impl GpuTerminalState {
             compute_dirty_cells_from_rects(&damage_rects, config.term_cols)
         };
 
+        // Native presentation requires DX12 (Vulkan swapchain not yet implemented)
         if self.native_presenter.is_none() {
-            self.native_presenter = NativeGpuPresenter::new(
-                parent_hwnd,
-                bounds,
-                self.renderer.device_ptr(),
-                self.renderer.command_queue_ptr(),
-            )
-            .ok();
+            if let GpuBackend::Dx12(ref dx) = self.backend {
+                self.native_presenter = NativeGpuPresenter::new(
+                    parent_hwnd,
+                    bounds,
+                    dx.device_ptr(),
+                    dx.command_queue_ptr(),
+                )
+                .ok();
+            }
         }
 
         let Some(presenter) = self.native_presenter.as_mut() else {
@@ -328,24 +353,32 @@ impl GpuTerminalState {
         let Some(back_buffer_ptr) = presenter.current_back_buffer_ptr() else {
             return false;
         };
-        let rendered = if matches!(refresh, PackedRefresh::Full) {
-            self.renderer.render_to_surface(
-                back_buffer_ptr,
-                cells,
-                config.term_cols as u32,
-                config.cell_width,
-                config.cell_height,
-            )
-        } else {
-            self.renderer.render_to_surface_delta_cells(
-                back_buffer_ptr,
-                cells,
-                &dirty_cells,
-                &damage_rects,
-                config.term_cols as u32,
-                config.cell_width,
-                config.cell_height,
-            )
+        let rendered = match &mut self.backend {
+            GpuBackend::Dx12(dx) => {
+                if matches!(refresh, PackedRefresh::Full) {
+                    dx.render_to_surface(
+                        back_buffer_ptr,
+                        cells,
+                        config.term_cols as u32,
+                        config.cell_width,
+                        config.cell_height,
+                    )
+                } else {
+                    dx.render_to_surface_delta_cells(
+                        back_buffer_ptr,
+                        cells,
+                        &dirty_cells,
+                        &damage_rects,
+                        config.term_cols as u32,
+                        config.cell_width,
+                        config.cell_height,
+                    )
+                }
+            }
+            GpuBackend::Vulkan(_) => {
+                // Vulkan swapchain (P1-C) not yet implemented — fall back
+                return false;
+            }
         };
         if !rendered {
             return false;
