@@ -697,6 +697,84 @@ impl Drop for GpuRenderer {
     }
 }
 
+// ── Vulkan GPU Renderer ──────────────────────────────────────────────
+
+pub struct VulkanRenderer {
+    ptr: NonNull<c_void>,
+}
+
+unsafe impl Send for VulkanRenderer {}
+
+impl VulkanRenderer {
+    /// Create a new Vulkan GPU renderer. Returns Err if Vulkan is unavailable.
+    pub fn new(width: u32, height: u32, font_size: f32) -> Result<Self, Error> {
+        let ptr =
+            unsafe { ghostty_vt_sys::ghostty_vulkan_renderer_new(width, height, font_size) };
+        let ptr = NonNull::new(ptr).ok_or(Error::CreateFailed)?;
+        Ok(Self { ptr })
+    }
+
+    pub fn resize(&mut self, width: u32, height: u32) -> bool {
+        unsafe {
+            ghostty_vt_sys::ghostty_vulkan_renderer_resize(self.ptr.as_ptr(), width, height) != 0
+        }
+    }
+
+    pub fn render(
+        &mut self,
+        cells: &[GpuCellData],
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> Option<&[u8]> {
+        let ptr = unsafe {
+            ghostty_vt_sys::ghostty_vulkan_renderer_render(
+                self.ptr.as_ptr(),
+                cells.as_ptr(),
+                cells.len() as u32,
+                term_cols,
+                cell_width,
+                cell_height,
+            )
+        };
+        if ptr.is_null() {
+            return None;
+        }
+        let stride = self.pixel_stride();
+        let height = self.height();
+        let len = (stride * height) as usize;
+        Some(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+
+    pub fn width(&self) -> u32 {
+        unsafe { ghostty_vt_sys::ghostty_vulkan_renderer_width(self.ptr.as_ptr()) }
+    }
+
+    pub fn height(&self) -> u32 {
+        unsafe { ghostty_vt_sys::ghostty_vulkan_renderer_height(self.ptr.as_ptr()) }
+    }
+
+    pub fn pixel_stride(&self) -> u32 {
+        unsafe { ghostty_vt_sys::ghostty_vulkan_renderer_pixel_stride(self.ptr.as_ptr()) }
+    }
+}
+
+impl Drop for VulkanRenderer {
+    fn drop(&mut self) {
+        unsafe { ghostty_vt_sys::ghostty_vulkan_renderer_free(self.ptr.as_ptr()) }
+    }
+}
+
+/// Retrieve the last Vulkan renderer init error.
+pub fn vulkan_renderer_last_init_error() -> (u32, i32) {
+    let mut stage: u32 = 0;
+    let mut hr: i32 = 0;
+    unsafe {
+        ghostty_vt_sys::ghostty_vulkan_renderer_last_init_error(&mut stage, &mut hr);
+    }
+    (stage, hr)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ContentKind, Terminal, classify_content};

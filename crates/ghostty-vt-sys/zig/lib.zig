@@ -9,6 +9,11 @@ comptime {
     _ = @import("gpu_renderer.zig");
 }
 
+// Vulkan GPU renderer — parallel backend to DX12
+comptime {
+    _ = @import("vulkan_renderer.zig");
+}
+
 const Allocator = std.mem.Allocator;
 
 const TerminalHandle = struct {

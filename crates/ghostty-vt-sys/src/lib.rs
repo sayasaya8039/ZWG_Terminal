@@ -234,6 +234,31 @@ unsafe extern "C" {
     /// Retrieve the last GPU renderer init error (stage code + HRESULT).
     /// stage=0 means no error. See GpuInitStage enum in gpu_renderer.zig.
     pub fn ghostty_gpu_renderer_last_init_error(stage_out: *mut u32, hr_out: *mut i32);
+
+    // ── Vulkan GPU renderer ──────────────────────────────────────
+    pub fn ghostty_vulkan_renderer_new(
+        width: u32,
+        height: u32,
+        font_size: f32,
+    ) -> *mut core::ffi::c_void;
+    pub fn ghostty_vulkan_renderer_free(renderer: *mut core::ffi::c_void);
+    pub fn ghostty_vulkan_renderer_resize(
+        renderer: *mut core::ffi::c_void,
+        width: u32,
+        height: u32,
+    ) -> u8;
+    pub fn ghostty_vulkan_renderer_render(
+        renderer: *mut core::ffi::c_void,
+        cells: *const GpuCellData,
+        cell_count: u32,
+        term_cols: u32,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> *const u8;
+    pub fn ghostty_vulkan_renderer_width(renderer: *const core::ffi::c_void) -> u32;
+    pub fn ghostty_vulkan_renderer_height(renderer: *const core::ffi::c_void) -> u32;
+    pub fn ghostty_vulkan_renderer_pixel_stride(renderer: *const core::ffi::c_void) -> u32;
+    pub fn ghostty_vulkan_renderer_last_init_error(stage_out: *mut u32, hr_out: *mut i32);
 }
 
 /// Cell data passed to the GPU renderer (20 bytes, C-compatible).

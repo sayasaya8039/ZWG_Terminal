@@ -13,6 +13,8 @@ fn main() {
     println!("cargo:rerun-if-changed=zig/shaders.zig");
     println!("cargo:rerun-if-changed=zig/async_io.zig");
     println!("cargo:rerun-if-changed=zig/content_scan.zig");
+    println!("cargo:rerun-if-changed=zig/vk.zig");
+    println!("cargo:rerun-if-changed=zig/vulkan_renderer.zig");
     println!("cargo:rerun-if-changed=include/ghostty_vt.h");
 
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
