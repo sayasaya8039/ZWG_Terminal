@@ -49,8 +49,18 @@ pub const VulkanRenderer = struct {
     // Offscreen render target (RGBA8)
     rt_image: vk.VkImage,
     rt_mem: vk.VkDeviceMemory,
+    rt_view: vk.VkImageView,
     width: u32,
     height: u32,
+
+    // Pipeline objects
+    render_pass: vk.VkRenderPass,
+    framebuffer: vk.VkFramebuffer,
+    desc_set_layout: vk.VkDescriptorSetLayout,
+    desc_pool: vk.VkDescriptorPool,
+    desc_set: vk.VkDescriptorSet,
+    pipeline_layout: vk.VkPipelineLayout,
+    pipeline: vk.VkPipeline,
 
     // Readback buffer
     readback_buf: vk.VkBuffer,
@@ -239,6 +249,31 @@ pub const VulkanRenderer = struct {
             return null;
         }
 
+        // Create render target image + view
+        if (!self.createRenderTarget()) {
+            self.destroyReadbackBuffer();
+            self.destroyCellBuffer();
+            self.destroyCommandResources();
+            self.funcs.destroyDevice(device, null);
+            self.funcs.destroyInstance(instance, null);
+            alloc.free(self.atlas_bitmap);
+            alloc.destroy(self);
+            return null;
+        }
+
+        // Create render pass + pipeline + descriptors
+        if (!self.createPipeline()) {
+            self.destroyRenderTarget();
+            self.destroyReadbackBuffer();
+            self.destroyCellBuffer();
+            self.destroyCommandResources();
+            self.funcs.destroyDevice(device, null);
+            self.funcs.destroyInstance(instance, null);
+            alloc.free(self.atlas_bitmap);
+            alloc.destroy(self);
+            return null;
+        }
+
         self.initialized = true;
         log.info("Vulkan GPU renderer initialized successfully", .{});
         return self;
@@ -376,6 +411,275 @@ pub const VulkanRenderer = struct {
         return true;
     }
 
+    // ---- Render target image ----
+
+    fn createRenderTarget(self: *VulkanRenderer) bool {
+        const img_ci = vk.VkImageCreateInfo{
+            .extent = .{ .width = self.width, .height = self.height, .depth = 1 },
+            .format = vk.VK_FORMAT_R8G8B8A8_UNORM,
+            .usage = vk.VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | vk.VK_IMAGE_USAGE_TRANSFER_SRC_BIT,
+        };
+        var image: vk.VkImage = 0;
+        if (self.funcs.createImage(self.device, &img_ci, null, &image) != vk.VK_SUCCESS) {
+            log.err("vkCreateImage failed for render target", .{});
+            setVkInitError(20, -1);
+            return false;
+        }
+        self.rt_image = image;
+
+        var reqs: vk.VkMemoryRequirements = .{};
+        self.funcs.getImageMemoryRequirements(self.device, image, &reqs);
+        const type_idx = vk.findMemoryType(&self.mem_props, reqs.memoryTypeBits, vk.VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) orelse {
+            log.err("no device-local memory for render target", .{});
+            setVkInitError(21, -1);
+            return false;
+        };
+        const alloc_info = vk.VkMemoryAllocateInfo{
+            .allocationSize = reqs.size,
+            .memoryTypeIndex = type_idx,
+        };
+        var mem: vk.VkDeviceMemory = 0;
+        if (self.funcs.allocateMemory(self.device, &alloc_info, null, &mem) != vk.VK_SUCCESS) {
+            log.err("vkAllocateMemory failed for render target", .{});
+            setVkInitError(22, -1);
+            return false;
+        }
+        self.rt_mem = mem;
+        if (self.funcs.bindImageMemory(self.device, image, mem, 0) != vk.VK_SUCCESS) return false;
+
+        const view_ci = vk.VkImageViewCreateInfo{
+            .image = image,
+            .format = vk.VK_FORMAT_R8G8B8A8_UNORM,
+        };
+        var view: vk.VkImageView = 0;
+        if (self.funcs.createImageView(self.device, &view_ci, null, &view) != vk.VK_SUCCESS) {
+            log.err("vkCreateImageView failed", .{});
+            setVkInitError(23, -1);
+            return false;
+        }
+        self.rt_view = view;
+        return true;
+    }
+
+    fn destroyRenderTarget(self: *VulkanRenderer) void {
+        if (self.rt_view != 0) self.funcs.destroyImageView(self.device, self.rt_view, null);
+        if (self.rt_image != 0) self.funcs.destroyImage(self.device, self.rt_image, null);
+        if (self.rt_mem != 0) self.funcs.freeMemory(self.device, self.rt_mem, null);
+    }
+
+    // ---- Pipeline ----
+
+    fn createPipeline(self: *VulkanRenderer) bool {
+        // Render pass
+        const attachment = vk.VkAttachmentDescription{
+            .format = vk.VK_FORMAT_R8G8B8A8_UNORM,
+        };
+        const color_ref = vk.VkAttachmentReference{};
+        const subpass = vk.VkSubpassDescription{
+            .colorAttachmentCount = 1,
+            .pColorAttachments = @ptrCast(&color_ref),
+        };
+        const dependency = vk.VkSubpassDependency{};
+        const rp_ci = vk.VkRenderPassCreateInfo{
+            .attachmentCount = 1,
+            .pAttachments = @ptrCast(&attachment),
+            .subpassCount = 1,
+            .pSubpasses = @ptrCast(&subpass),
+            .dependencyCount = 1,
+            .pDependencies = @ptrCast(&dependency),
+        };
+        var rp: vk.VkRenderPass = 0;
+        if (self.funcs.createRenderPass(self.device, &rp_ci, null, &rp) != vk.VK_SUCCESS) {
+            log.err("vkCreateRenderPass failed", .{});
+            setVkInitError(30, -1);
+            return false;
+        }
+        self.render_pass = rp;
+
+        // Framebuffer
+        const fb_ci = vk.VkFramebufferCreateInfo{
+            .renderPass = rp,
+            .attachmentCount = 1,
+            .pAttachments = @ptrCast(&self.rt_view),
+            .width = self.width,
+            .height = self.height,
+        };
+        var fb: vk.VkFramebuffer = 0;
+        if (self.funcs.createFramebuffer(self.device, &fb_ci, null, &fb) != vk.VK_SUCCESS) {
+            log.err("vkCreateFramebuffer failed", .{});
+            setVkInitError(31, -1);
+            return false;
+        }
+        self.framebuffer = fb;
+
+        // Descriptor set layout (binding 0 = cell storage buffer)
+        const binding = vk.VkDescriptorSetLayoutBinding{
+            .binding = 0,
+            .descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT,
+        };
+        const dsl_ci = vk.VkDescriptorSetLayoutCreateInfo{
+            .bindingCount = 1,
+            .pBindings = @ptrCast(&binding),
+        };
+        var dsl: vk.VkDescriptorSetLayout = 0;
+        if (self.funcs.createDescriptorSetLayout(self.device, &dsl_ci, null, &dsl) != vk.VK_SUCCESS) {
+            log.err("vkCreateDescriptorSetLayout failed", .{});
+            setVkInitError(32, -1);
+            return false;
+        }
+        self.desc_set_layout = dsl;
+
+        // Push constant range (48 bytes: viewport/cell/atlas params)
+        const pc_range = vk.VkPushConstantRange{
+            .stageFlags = vk.VK_SHADER_STAGE_VERTEX_BIT,
+            .offset = 0,
+            .size = 48,
+        };
+        const pl_ci = vk.VkPipelineLayoutCreateInfo{
+            .setLayoutCount = 1,
+            .pSetLayouts = @ptrCast(&dsl),
+            .pushConstantRangeCount = 1,
+            .pPushConstantRanges = @ptrCast(&pc_range),
+        };
+        var pl: vk.VkPipelineLayout = 0;
+        if (self.funcs.createPipelineLayout(self.device, &pl_ci, null, &pl) != vk.VK_SUCCESS) {
+            log.err("vkCreatePipelineLayout failed", .{});
+            setVkInitError(33, -1);
+            return false;
+        }
+        self.pipeline_layout = pl;
+
+        // Shader modules (SPIR-V embedded at compile time)
+        const vert_spv = @embedFile("shaders/terminal.vert.spv");
+        const frag_spv = @embedFile("shaders/terminal.frag.spv");
+
+        const vert_ci = vk.VkShaderModuleCreateInfo{
+            .codeSize = vert_spv.len,
+            .pCode = @ptrCast(@alignCast(vert_spv.ptr)),
+        };
+        var vert_mod: vk.VkShaderModule = 0;
+        if (self.funcs.createShaderModule(self.device, &vert_ci, null, &vert_mod) != vk.VK_SUCCESS) {
+            log.err("vkCreateShaderModule failed (vertex)", .{});
+            setVkInitError(34, -1);
+            return false;
+        }
+
+        const frag_ci = vk.VkShaderModuleCreateInfo{
+            .codeSize = frag_spv.len,
+            .pCode = @ptrCast(@alignCast(frag_spv.ptr)),
+        };
+        var frag_mod: vk.VkShaderModule = 0;
+        if (self.funcs.createShaderModule(self.device, &frag_ci, null, &frag_mod) != vk.VK_SUCCESS) {
+            log.err("vkCreateShaderModule failed (fragment)", .{});
+            setVkInitError(35, -1);
+            self.funcs.destroyShaderModule(self.device, vert_mod, null);
+            return false;
+        }
+
+        // Graphics pipeline
+        const stages = [_]vk.VkPipelineShaderStageCreateInfo{
+            .{ .stage = vk.VK_SHADER_STAGE_VERTEX_BIT, .module = vert_mod },
+            .{ .stage = vk.VK_SHADER_STAGE_FRAGMENT_BIT, .module = frag_mod },
+        };
+        const vert_input = vk.VkPipelineVertexInputStateCreateInfo{};
+        const input_assembly = vk.VkPipelineInputAssemblyStateCreateInfo{};
+        const viewport_state = vk.VkPipelineViewportStateCreateInfo{};
+        const rasterization = vk.VkPipelineRasterizationStateCreateInfo{};
+        const multisample = vk.VkPipelineMultisampleStateCreateInfo{};
+        const blend_attach = vk.VkPipelineColorBlendAttachmentState{};
+        const color_blend = vk.VkPipelineColorBlendStateCreateInfo{
+            .attachmentCount = 1,
+            .pAttachments = @ptrCast(&blend_attach),
+        };
+        const dyn_states = [_]i32{ vk.VK_DYNAMIC_STATE_VIEWPORT, vk.VK_DYNAMIC_STATE_SCISSOR };
+        const dynamic = vk.VkPipelineDynamicStateCreateInfo{
+            .dynamicStateCount = 2,
+            .pDynamicStates = &dyn_states,
+        };
+        const gp_ci = [_]vk.VkGraphicsPipelineCreateInfo{.{
+            .stageCount = 2,
+            .pStages = &stages,
+            .pVertexInputState = &vert_input,
+            .pInputAssemblyState = &input_assembly,
+            .pViewportState = &viewport_state,
+            .pRasterizationState = &rasterization,
+            .pMultisampleState = &multisample,
+            .pColorBlendState = &color_blend,
+            .pDynamicState = &dynamic,
+            .layout = pl,
+            .renderPass = rp,
+        }};
+        var pipeline: vk.VkPipeline = 0;
+        if (self.funcs.createGraphicsPipelines(self.device, 0, 1, &gp_ci, null, &pipeline) != vk.VK_SUCCESS) {
+            log.err("vkCreateGraphicsPipelines failed", .{});
+            setVkInitError(36, -1);
+            self.funcs.destroyShaderModule(self.device, vert_mod, null);
+            self.funcs.destroyShaderModule(self.device, frag_mod, null);
+            return false;
+        }
+        self.pipeline = pipeline;
+
+        // Shader modules no longer needed
+        self.funcs.destroyShaderModule(self.device, vert_mod, null);
+        self.funcs.destroyShaderModule(self.device, frag_mod, null);
+
+        // Descriptor pool + set
+        const pool_size = vk.VkDescriptorPoolSize{
+            .type_ = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+        };
+        const dp_ci = vk.VkDescriptorPoolCreateInfo{
+            .maxSets = 1,
+            .poolSizeCount = 1,
+            .pPoolSizes = @ptrCast(&pool_size),
+        };
+        var dp: vk.VkDescriptorPool = 0;
+        if (self.funcs.createDescriptorPool(self.device, &dp_ci, null, &dp) != vk.VK_SUCCESS) {
+            log.err("vkCreateDescriptorPool failed", .{});
+            setVkInitError(37, -1);
+            return false;
+        }
+        self.desc_pool = dp;
+
+        const ds_ai = vk.VkDescriptorSetAllocateInfo{
+            .descriptorPool = dp,
+            .descriptorSetCount = 1,
+            .pSetLayouts = @ptrCast(&dsl),
+        };
+        var ds: vk.VkDescriptorSet = 0;
+        if (self.funcs.allocateDescriptorSets(self.device, &ds_ai, &ds) != vk.VK_SUCCESS) {
+            log.err("vkAllocateDescriptorSets failed", .{});
+            setVkInitError(38, -1);
+            return false;
+        }
+        self.desc_set = ds;
+
+        // Write descriptor (cell buffer → binding 0)
+        const buf_info = vk.VkDescriptorBufferInfo{ .buffer = self.cell_buf };
+        const write = [_]vk.VkWriteDescriptorSet{.{
+            .dstSet = ds,
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk.VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pBufferInfo = &buf_info,
+        }};
+        self.funcs.updateDescriptorSets(self.device, 1, &write, 0, null);
+
+        log.info("Vulkan pipeline created: render_pass + framebuffer + pipeline + descriptors", .{});
+        return true;
+    }
+
+    fn destroyPipeline(self: *VulkanRenderer) void {
+        if (self.desc_pool != 0) self.funcs.destroyDescriptorPool(self.device, self.desc_pool, null);
+        if (self.pipeline != 0) self.funcs.destroyPipeline(self.device, self.pipeline, null);
+        if (self.pipeline_layout != 0) self.funcs.destroyPipelineLayout(self.device, self.pipeline_layout, null);
+        if (self.desc_set_layout != 0) self.funcs.destroyDescriptorSetLayout(self.device, self.desc_set_layout, null);
+        if (self.framebuffer != 0) self.funcs.destroyFramebuffer(self.device, self.framebuffer, null);
+        if (self.render_pass != 0) self.funcs.destroyRenderPass(self.device, self.render_pass, null);
+    }
+
     fn destroyReadbackBuffer(self: *VulkanRenderer) void {
         if (self.readback_buf != 0) self.funcs.destroyBuffer(self.device, self.readback_buf, null);
         if (self.readback_mem != 0) self.funcs.freeMemory(self.device, self.readback_mem, null);
@@ -385,6 +689,17 @@ pub const VulkanRenderer = struct {
 
     /// Upload cell data and render to readback buffer.
     /// Returns pointer to CPU-readable RGBA pixels, or null on error.
+    /// Push constants layout (matches GLSL push_constant block)
+    const PushConstants = extern struct {
+        viewport_size: [2]f32,
+        cell_size: [2]f32,
+        atlas_pitch_inv: [2]f32,
+        atlas_glyph_inv: [2]f32,
+        term_cols: f32,
+        atlas_grid_cols: f32,
+        _pad: [2]f32,
+    };
+
     pub fn renderFrame(
         self: *VulkanRenderer,
         cells: [*]const gpu.GpuCellData,
@@ -393,35 +708,131 @@ pub const VulkanRenderer = struct {
         cell_width: f32,
         cell_height: f32,
     ) ?[*]const u8 {
-        // TODO: use for pipeline uniform upload
-        _ = term_cols;
-        _ = cell_width;
-        _ = cell_height;
         if (!self.initialized) return null;
         const count: u32 = @min(cell_count, MAX_CELLS);
+        if (count == 0) return self.readback_mapped;
 
-        // Upload cell data
+        // Upload cell data to host-visible storage buffer
         if (self.cell_mapped) |mapped| {
             const dst: [*]gpu.GpuCellData = @ptrCast(@alignCast(mapped));
             @memcpy(dst[0..count], cells[0..count]);
         }
 
-        // TODO: Record command buffer with instanced draw
-        // For now, clear readback to bg color from first cell
-        if (self.readback_mapped) |rb| {
-            const pixel_count = self.width * self.height;
-            const bg = if (count > 0) cells[0].bg_rgba else 0xFF000000;
-            const r: u8 = @intCast((bg >> 16) & 0xFF);
-            const g: u8 = @intCast((bg >> 8) & 0xFF);
-            const b: u8 = @intCast(bg & 0xFF);
-            const a: u8 = @intCast((bg >> 24) & 0xFF);
-            for (0..pixel_count) |i| {
-                rb[i * 4 + 0] = r;
-                rb[i * 4 + 1] = g;
-                rb[i * 4 + 2] = b;
-                rb[i * 4 + 3] = a;
-            }
-        }
+        // Wait for previous frame's fence
+        _ = self.funcs.waitForFences(self.device, 1, @ptrCast(&self.fence), vk.VK_TRUE, 1_000_000_000);
+        _ = self.funcs.resetFences(self.device, 1, @ptrCast(&self.fence));
+
+        // Record command buffer
+        _ = self.funcs.resetCommandBuffer(self.cmd_buf, 0);
+        const begin_info = vk.VkCommandBufferBeginInfo{};
+        _ = self.funcs.beginCommandBuffer(self.cmd_buf, &begin_info);
+
+        // Begin render pass (clear to bg color)
+        const bg = cells[0].bg_rgba;
+        const clear_color = vk.VkClearValue{ .color = .{ .float32 = .{
+            @as(f32, @floatFromInt((bg >> 16) & 0xFF)) / 255.0,
+            @as(f32, @floatFromInt((bg >> 8) & 0xFF)) / 255.0,
+            @as(f32, @floatFromInt(bg & 0xFF)) / 255.0,
+            @as(f32, @floatFromInt((bg >> 24) & 0xFF)) / 255.0,
+        } } };
+        const rp_begin = vk.VkRenderPassBeginInfo{
+            .renderPass = self.render_pass,
+            .framebuffer = self.framebuffer,
+            .renderArea = .{ .extent = .{ .width = self.width, .height = self.height } },
+            .clearValueCount = 1,
+            .pClearValues = @ptrCast(&clear_color),
+        };
+        self.funcs.cmdBeginRenderPass(self.cmd_buf, &rp_begin, 0); // INLINE
+
+        // Bind pipeline + descriptor set
+        self.funcs.cmdBindPipeline(self.cmd_buf, vk.VK_PIPELINE_BIND_POINT_GRAPHICS, self.pipeline);
+        self.funcs.cmdBindDescriptorSets(
+            self.cmd_buf,
+            vk.VK_PIPELINE_BIND_POINT_GRAPHICS,
+            self.pipeline_layout,
+            0,
+            1,
+            @ptrCast(&self.desc_set),
+            0,
+            null,
+        );
+
+        // Push constants
+        const pc = PushConstants{
+            .viewport_size = .{ @floatFromInt(self.width), @floatFromInt(self.height) },
+            .cell_size = .{ cell_width, cell_height },
+            .atlas_pitch_inv = .{ 0, 0 }, // TODO: atlas wiring
+            .atlas_glyph_inv = .{ 0, 0 },
+            .term_cols = @floatFromInt(term_cols),
+            .atlas_grid_cols = 0,
+            ._pad = .{ 0, 0 },
+        };
+        self.funcs.cmdPushConstants(
+            self.cmd_buf,
+            self.pipeline_layout,
+            vk.VK_SHADER_STAGE_VERTEX_BIT,
+            0,
+            @sizeOf(PushConstants),
+            @ptrCast(&pc),
+        );
+
+        // Dynamic viewport + scissor
+        const viewport = [_]vk.VkViewport{.{
+            .width = @floatFromInt(self.width),
+            .height = @floatFromInt(self.height),
+        }};
+        self.funcs.cmdSetViewport(self.cmd_buf, 0, 1, &viewport);
+        const scissor = [_]vk.VkRect2D{.{
+            .extent = .{ .width = self.width, .height = self.height },
+        }};
+        self.funcs.cmdSetScissor(self.cmd_buf, 0, 1, &scissor);
+
+        // Instanced draw: 6 verts/cell × count instances
+        self.funcs.cmdDraw(self.cmd_buf, 6, count, 0, 0);
+
+        self.funcs.cmdEndRenderPass(self.cmd_buf);
+
+        // Transition RT → TRANSFER_SRC, then copy to readback buffer
+        const barrier = [_]vk.VkImageMemoryBarrier{.{
+            .srcAccessMask = vk.VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+            .dstAccessMask = vk.VK_ACCESS_TRANSFER_READ_BIT,
+            .oldLayout = vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, // render pass finalLayout
+            .newLayout = vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            .image = self.rt_image,
+        }};
+        self.funcs.cmdPipelineBarrier(
+            self.cmd_buf,
+            vk.VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+            vk.VK_PIPELINE_STAGE_TRANSFER_BIT,
+            0,
+            0, null,
+            0, null,
+            1, &barrier,
+        );
+
+        const copy_region = [_]vk.VkBufferImageCopy{.{
+            .imageExtent = .{ .width = self.width, .height = self.height, .depth = 1 },
+        }};
+        self.funcs.cmdCopyImageToBuffer(
+            self.cmd_buf,
+            self.rt_image,
+            vk.VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+            self.readback_buf,
+            1,
+            &copy_region,
+        );
+
+        _ = self.funcs.endCommandBuffer(self.cmd_buf);
+
+        // Submit
+        const submit = vk.VkSubmitInfo{
+            .commandBufferCount = 1,
+            .pCommandBuffers = @ptrCast(&self.cmd_buf),
+        };
+        _ = self.funcs.queueSubmit(self.queue, 1, &submit, self.fence);
+
+        // Wait for completion (readback is synchronous in offscreen mode)
+        _ = self.funcs.waitForFences(self.device, 1, @ptrCast(&self.fence), vk.VK_TRUE, 1_000_000_000);
 
         return self.readback_mapped;
     }
@@ -447,6 +858,8 @@ pub const VulkanRenderer = struct {
         if (self.initialized) {
             _ = self.funcs.deviceWaitIdle(self.device);
         }
+        self.destroyPipeline();
+        self.destroyRenderTarget();
         self.destroyReadbackBuffer();
         self.destroyCellBuffer();
         self.destroyCommandResources();
