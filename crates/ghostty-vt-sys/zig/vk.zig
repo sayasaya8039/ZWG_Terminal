@@ -762,10 +762,25 @@ pub const VkFuncs = struct {
     destroySampler: *const fn (VkDevice, VkSampler, ?*const anyopaque) callconv(.c) void = undefined,
 
     pub fn loadInstance(gipa: PFN_vkGetInstanceProcAddr, instance: VkInstance) VkFuncs {
+        @setEvalBranchQuota(10_000);
         var self: VkFuncs = .{};
         inline for (@typeInfo(VkFuncs).@"struct".fields) |field| {
             if (field.name[0] != '_') {
-                const name = @as([*:0]const u8, @ptrCast(field.name.ptr));
+                // Vulkan API requires "vk" prefix: field "createInstance" → "vkCreateInstance"
+                const vk_name = comptime blk: {
+                    const raw = field.name;
+                    var buf: [raw.len + 2:0]u8 = undefined;
+                    buf[0] = 'v';
+                    buf[1] = 'k';
+                    // Capitalize first letter
+                    buf[2] = if (raw[0] >= 'a' and raw[0] <= 'z') raw[0] - 32 else raw[0];
+                    for (raw[1..], 0..) |c, i| {
+                        buf[3 + i] = c;
+                    }
+                    buf[raw.len + 2] = 0;
+                    break :blk buf;
+                };
+                const name: [*:0]const u8 = &vk_name;
                 if (gipa(instance, name)) |fp| {
                     @field(self, field.name) = @ptrCast(fp);
                 }
