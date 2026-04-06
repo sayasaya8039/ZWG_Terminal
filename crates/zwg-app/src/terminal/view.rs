@@ -1926,7 +1926,8 @@ impl TerminalPane {
             };
             #[cfg(target_os = "windows")]
             {
-                if snapshot_can_present_natively(&render_snapshot) {
+                let backend_can_present = gpu.lock().can_present_natively();
+                if backend_can_present && snapshot_can_present_natively(&render_snapshot) {
                     gpu_terminal_canvas(
                         Arc::clone(&render_snapshot),
                         cursor,

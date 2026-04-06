@@ -911,9 +911,13 @@ pub const VulkanRenderer = struct {
             return false;
         }
 
-        const metrics_height = @as(u32, metrics.ascent) + @as(u32, metrics.descent);
+        // ascent/descent are in design units — scale to pixels using designUnitsPerEm.
+        const em: f32 = @floatFromInt(@max(metrics.designUnitsPerEm, @as(u16, 1)));
+        const px_ascent: f32 = @as(f32, @floatFromInt(metrics.ascent)) * font_size / em;
+        const px_descent: f32 = @as(f32, @floatFromInt(metrics.descent)) * font_size / em;
+        const metrics_height: u32 = @intFromFloat(@ceil(px_ascent + px_descent));
         self.glyph_cell_h = @max(self.glyph_cell_h, @max(metrics_height, 1));
-        self.glyph_baseline = @as(f32, @floatFromInt(@min(metrics.ascent, @as(u16, @intCast(self.glyph_cell_h)))));
+        self.glyph_baseline = @min(px_ascent, @as(f32, @floatFromInt(self.glyph_cell_h)));
 
         const slot_pitch_h = self.glyph_cell_h + GLYPH_PAD;
         if (slot_pitch_h == 0 or slot_pitch_h > ATLAS_SIZE) {

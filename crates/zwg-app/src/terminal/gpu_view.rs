@@ -62,23 +62,27 @@ pub(super) struct GpuTerminalState {
 }
 
 impl GpuTerminalState {
-    /// Try to create a GPU renderer. Tries Vulkan first, then DX12.
+    /// Try to create a GPU renderer. DX12 preferred (has native swapchain presenter),
+    /// Vulkan kept as fallback for when Vulkan swapchain (P1-C) is implemented.
     /// Returns None if both fail.
     pub fn new(width: u32, height: u32, font_size: f32) -> Option<Self> {
-        let backend = if let Ok(vk) = ghostty_vt::VulkanRenderer::new(width, height, font_size) {
+        // DX12 first — it has a working NativeGpuPresenter (DXGI swapchain).
+        // Vulkan swapchain (P1-C) is not yet implemented, so Vulkan backend
+        // cannot present to screen and would result in invisible text.
+        let backend = if let Ok(dx) = ghostty_vt::GpuRenderer::new(width, height, font_size) {
             log::info!(
-                "Vulkan GPU renderer initialized: {}x{} font_size={:.1}",
-                width, height, font_size
-            );
-            GpuBackend::Vulkan(vk)
-        } else if let Ok(dx) = ghostty_vt::GpuRenderer::new(width, height, font_size) {
-            log::info!(
-                "DX12 GPU renderer initialized (Vulkan unavailable): {}x{} font_size={:.1}",
+                "DX12 GPU renderer initialized: {}x{} font_size={:.1}",
                 width, height, font_size
             );
             GpuBackend::Dx12(dx)
+        } else if let Ok(vk) = ghostty_vt::VulkanRenderer::new(width, height, font_size) {
+            log::info!(
+                "Vulkan GPU renderer initialized (DX12 unavailable): {}x{} font_size={:.1}",
+                width, height, font_size
+            );
+            GpuBackend::Vulkan(vk)
         } else {
-            log::warn!("No GPU renderer available (Vulkan and DX12 both failed)");
+            log::warn!("No GPU renderer available (DX12 and Vulkan both failed)");
             return None;
         };
         Some(Self {
@@ -93,6 +97,12 @@ impl GpuTerminalState {
             #[cfg(target_os = "windows")]
             native_presenter: None,
         })
+    }
+
+    /// Whether this backend can present to screen via a native swapchain.
+    /// Vulkan swapchain (P1-C) is not yet implemented, so only DX12 qualifies.
+    pub fn can_present_natively(&self) -> bool {
+        matches!(self.backend, GpuBackend::Dx12(_))
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> bool {

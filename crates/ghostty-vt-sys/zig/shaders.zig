@@ -77,6 +77,16 @@ pub const VS_SOURCE: []const u8 =
 
 /// Pixel shader (ps_5_0)
 pub const PS_SOURCE: []const u8 =
+    \\cbuffer Constants : register(b0) {
+    \\    float2 viewport_size;
+    \\    float2 cell_size;
+    \\    float2 atlas_pitch_inv_size;
+    \\    float2 atlas_glyph_inv_size;
+    \\    float term_cols;
+    \\    float atlas_grid_cols;
+    \\    float2 _pad0;
+    \\};
+    \\
     \\Texture2D<float4> atlas : register(t1);
     \\SamplerState samp : register(s0);
     \\
