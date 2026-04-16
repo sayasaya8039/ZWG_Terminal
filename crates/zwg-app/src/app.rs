@@ -1124,23 +1124,61 @@ impl RootView {
         log::info!("IPC server started for tmux compatibility");
 
         // ── Auto-close listener: close panes whose process exited with auto_close ──
+        // Searches ALL tabs (not just the active tab) so teammates in
+        // non-active tabs are still reaped when their process exits.
+        // When the target pane is the last leaf in its split, we close the
+        // entire tab (kill_pane_by_id refuses to remove the last leaf).
         let (auto_close_tx, auto_close_rx) = flume::unbounded::<u32>();
         PANE_AUTO_CLOSE.set(auto_close_tx).ok();
         let this_close = cx.entity().downgrade();
         cx.spawn(async move |_, cx: &mut AsyncApp| {
             while let Ok(pane_id) = auto_close_rx.recv_async().await {
                 let _ = this_close.update(cx, |root_view: &mut RootView, cx| {
-                    // Collect split entities (cloned) before any mutable access
-                    let splits: Vec<_> = {
+                    // Phase 1: find owning tab and pane count (read-only borrow)
+                    let hit = {
                         let state = root_view.state.read(cx);
-                        state.tabs.iter().filter_map(Tab::split_cloned).collect()
-                    };
-                    for split in splits {
-                        let killed = split.update(cx, |sc, cx| sc.kill_pane_by_id(pane_id, cx));
-                        if killed {
-                            log::info!("auto-close: pane %{} (process exited)", pane_id);
-                            break;
+                        let mut found = None;
+                        for (idx, tab) in state.tabs.iter().enumerate() {
+                            if let Some(split) = tab.split() {
+                                let panes = split.read(cx).list_panes();
+                                if panes.iter().any(|(pid, _, _)| *pid == pane_id) {
+                                    found = Some((idx, split.clone(), panes.len()));
+                                    break;
+                                }
+                            }
                         }
+                        found
+                    };
+                    let Some((tab_idx, split, pane_count)) = hit else {
+                        log::warn!(
+                            "auto-close: pane %{} not found in any tab",
+                            pane_id
+                        );
+                        return;
+                    };
+
+                    // Phase 2: kill the pane or close the tab
+                    if pane_count > 1 {
+                        let killed =
+                            split.update(cx, |sc, cx| sc.kill_pane_by_id(pane_id, cx));
+                        if killed {
+                            log::info!(
+                                "auto-close: pane %{} removed from tab {} ({} panes left)",
+                                pane_id,
+                                tab_idx,
+                                pane_count - 1
+                            );
+                        }
+                    } else {
+                        // Last pane in tab — close the entire tab so the UI
+                        // doesn't leave an empty split. close_tab is a no-op
+                        // if this is the only remaining tab.
+                        root_view.state.update(cx, |s, _| s.close_tab(tab_idx));
+                        log::info!(
+                            "auto-close: pane %{} was last in tab {} → tab closed",
+                            pane_id,
+                            tab_idx
+                        );
                     }
                 });
             }
