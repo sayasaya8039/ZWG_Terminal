@@ -354,8 +354,14 @@ mod windows_impl {
     }
 
     pub fn spawn(config: &ConPtyConfig) -> io::Result<PtyPair> {
-        // Validate shell path before proceeding
         validate_shell_path(&config.shell)?;
+
+        const PSEUDOCONSOLE_PASSTHROUGH_MODE: u32 = 2;
+        const CREATE_BREAKAWAY_FROM_JOB: windows::Win32::System::Threading::PROCESS_CREATION_FLAGS =
+            windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(0x0100_0000);
+
+        let try_passthrough = std::env::var("ZWG_NO_PASSTHROUGH")
+            .map_or(true, |v| v != "1");
 
         unsafe {
             let mut pty_input_read = HANDLE::default();
@@ -381,65 +387,21 @@ mod windows_impl {
                 X: safe_cols.max(1),
                 Y: safe_rows.max(1),
             };
-            // H7: PipeHandle RAII will auto-close on error path
-            let hpc = CreatePseudoConsole(size, pty_input_read.0, pty_output_write.0, 0)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-            // RAII guard: ClosePseudoConsole on error via Drop
-            let hpc_raw = hpc.0;
-            let mut pc_guard = Some(PseudoConsoleHandle(hpc));
-
-            // These handles are now owned by the pseudo console — drop our copies
-            drop(pty_input_read);
-            drop(pty_output_write);
-
-            let mut attr_size: usize = 0;
-            let _ = InitializeProcThreadAttributeList(
-                Some(LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut())),
-                1,
-                Some(0),
-                &mut attr_size,
-            );
-
-            let mut attr_buf = vec![0u8; attr_size];
-            let attr_list = LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut _);
-
-            InitializeProcThreadAttributeList(Some(attr_list), 1, Some(0), &mut attr_size)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-            UpdateProcThreadAttribute(
-                attr_list,
-                0,
-                PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
-                Some(hpc_raw as *const _),
-                std::mem::size_of::<HPCON>(),
-                None,
-                None,
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
-
-            // Build environment block — collect OS vars, layer config overrides,
-            // and inject ZWG teammate-mode environment variables.
+            // Pre-build environment block (invariant across retries)
             let env_block: Option<Vec<u16>> = {
-                // Estimate capacity: typical Windows env has ~60 vars
                 let mut env_map: std::collections::HashMap<String, String> =
                     std::collections::HashMap::with_capacity(64);
-                // Use std::env::vars() (already String); override with config entries
                 for (key, val) in std::env::vars() {
                     env_map.insert(key, val);
                 }
-                // Override / add config env vars
                 for (key, val) in &config.env {
                     env_map.insert(key.clone(), val.clone());
                 }
-                // Add ZWG teammate-mode environment variables
                 for (key, val) in super::zwg_env_vars(0) {
                     env_map.insert(key, val);
                 }
-                // Pre-allocate block: rough estimate of 40 UTF-16 code units per entry
                 let mut block: Vec<u16> = Vec::with_capacity(env_map.len() * 40);
                 for (key, val) in &env_map {
-                    // Write key=val\0 directly without intermediate String allocation
                     block.extend(key.encode_utf16());
                     block.push(b'=' as u16);
                     block.extend(val.encode_utf16());
@@ -448,25 +410,17 @@ mod windows_impl {
                 block.push(0);
                 Some(block)
             };
+            let env_ptr = env_block
+                .as_ref()
+                .map(|b| b.as_ptr() as *const std::ffi::c_void);
 
-            let mut si = STARTUPINFOEXW::default();
-            si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
-            si.lpAttributeList = attr_list;
-            // Fix: Prevent parent's redirected stdout/stderr from being duplicated
-            // to the child. Without this flag, when the parent process runs inside
-            // another terminal (e.g., Claude Code, VS Code), Windows duplicates the
-            // parent's non-console handles to the child, bypassing ConPTY entirely.
-            // See: https://github.com/microsoft/terminal/issues/11276
-            si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
-
-            let mut pi = PROCESS_INFORMATION::default();
+            // Pre-build command line (invariant across retries)
             let (exe, args) = split_shell_command(&config.shell);
             let cmdline = if args.is_empty() {
                 quote_cmd(&exe)
             } else {
                 format!("{} {}", quote_cmd(&exe), args)
             };
-            let mut cmd: Vec<u16> = cmdline.encode_utf16().chain(std::iter::once(0)).collect();
             let app_name_buf: Option<Vec<u16>> =
                 if exe.contains('\\') || exe.contains('/') || exe.contains(':') {
                     Some(exe.encode_utf16().chain(std::iter::once(0)).collect())
@@ -478,31 +432,116 @@ mod windows_impl {
                 .map(|b| PCWSTR(b.as_ptr()))
                 .unwrap_or(PCWSTR::null());
 
-            let env_ptr = env_block
-                .as_ref()
-                .map(|b| b.as_ptr() as *const std::ffi::c_void);
-            let create_flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+            // Retry loop: passthrough mode / breakaway may fail on some Windows builds.
+            // Pipe handles kept alive across retries (CreatePseudoConsole dups them internally).
+            let mut conpty_flags: u32 = if try_passthrough {
+                PSEUDOCONSOLE_PASSTHROUGH_MODE
+            } else {
+                0
+            };
+            let mut use_breakaway = true;
 
-            CreateProcessW(
-                app_name,
-                Some(PWSTR(cmd.as_mut_ptr())),
-                None,
-                None,
-                false,
-                create_flags,
-                env_ptr,
-                None,
-                &si.StartupInfo,
-                &mut pi,
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+            let (pc_guard, pi) = loop {
+                let hpc = CreatePseudoConsole(
+                    size,
+                    pty_input_read.0,
+                    pty_output_write.0,
+                    conpty_flags,
+                )
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                let hpc_raw = hpc.0;
 
-            DeleteProcThreadAttributeList(attr_list);
+                let mut attr_size: usize = 0;
+                let _ = InitializeProcThreadAttributeList(
+                    Some(LPPROC_THREAD_ATTRIBUTE_LIST(std::ptr::null_mut())),
+                    1,
+                    Some(0),
+                    &mut attr_size,
+                );
+                let mut attr_buf = vec![0u8; attr_size];
+                let attr_list =
+                    LPPROC_THREAD_ATTRIBUTE_LIST(attr_buf.as_mut_ptr() as *mut _);
+                InitializeProcThreadAttributeList(
+                    Some(attr_list),
+                    1,
+                    Some(0),
+                    &mut attr_size,
+                )
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+                UpdateProcThreadAttribute(
+                    attr_list,
+                    0,
+                    PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE as usize,
+                    Some(hpc_raw as *const _),
+                    std::mem::size_of::<HPCON>(),
+                    None,
+                    None,
+                )
+                .map_err(|e| io::Error::new(io::ErrorKind::Other, e.to_string()))?;
+
+                let mut si = STARTUPINFOEXW::default();
+                si.StartupInfo.cb = std::mem::size_of::<STARTUPINFOEXW>() as u32;
+                si.lpAttributeList = attr_list;
+                si.StartupInfo.dwFlags |= STARTF_USESTDHANDLES;
+
+                let mut create_flags =
+                    EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT;
+                if use_breakaway {
+                    create_flags |= CREATE_BREAKAWAY_FROM_JOB;
+                }
+
+                // Rebuild cmd buffer each attempt (CreateProcessW may modify it)
+                let mut cmd: Vec<u16> =
+                    cmdline.encode_utf16().chain(std::iter::once(0)).collect();
+                let mut pi = PROCESS_INFORMATION::default();
+                let result = CreateProcessW(
+                    app_name,
+                    Some(PWSTR(cmd.as_mut_ptr())),
+                    None,
+                    None,
+                    false,
+                    create_flags,
+                    env_ptr,
+                    None,
+                    &si.StartupInfo,
+                    &mut pi,
+                );
+
+                DeleteProcThreadAttributeList(attr_list);
+                drop(attr_buf);
+
+                match result {
+                    Ok(()) => break (PseudoConsoleHandle(hpc), pi),
+                    Err(e) => {
+                        windows::Win32::System::Console::ClosePseudoConsole(hpc);
+                        let is_err_87 = e.code().0 as u32 == 0x8007_0057;
+                        if conpty_flags != 0 && is_err_87 {
+                            log::warn!(
+                                "ConPTY passthrough rejected (error 87), retrying without"
+                            );
+                            conpty_flags = 0;
+                            continue;
+                        }
+                        if use_breakaway {
+                            log::warn!(
+                                "CREATE_BREAKAWAY_FROM_JOB failed, retrying without"
+                            );
+                            use_breakaway = false;
+                            continue;
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::Other,
+                            e.to_string(),
+                        ));
+                    }
+                }
+            };
+
+            drop(pty_input_read);
+            drop(pty_output_write);
             let _ = CloseHandle(pi.hThread);
-            // pi.hProcess kept alive via ProcessHandle for child process monitoring
 
             let child_pid = pi.dwProcessId;
-            // H7: take ownership from PipeHandle RAII wrappers
             let read_file = File::from_raw_handle(pty_output_read.take().0 as RawHandle);
             let write_file = File::from_raw_handle(pty_input_write.take().0 as RawHandle);
 
@@ -510,7 +549,7 @@ mod windows_impl {
                 master_read: Arc::new(Mutex::new(Box::new(read_file))),
                 master_write: Arc::new(Mutex::new(Box::new(write_file))),
                 child_pid,
-                pseudo_console: pc_guard.take(),
+                pseudo_console: Some(pc_guard),
                 process_handle: Some(ProcessHandle(pi.hProcess)),
             })
         }

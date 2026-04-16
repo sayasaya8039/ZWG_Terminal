@@ -31,6 +31,12 @@ use anyhow::{anyhow, Result};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Default RAM disk size in megabytes.
 const DEFAULT_SIZE_MB: u32 = 512;
 
@@ -155,6 +161,7 @@ impl RamDisk {
 
         let output = Command::new("cmd.exe")
             .args(["/c", &cmd_line])
+            .creation_flags(CREATE_NO_WINDOW)
             .output()
             .map_err(|e| anyhow!("failed to run imdisk via cmd: {e}"))?;
 
@@ -339,6 +346,7 @@ fn unmount_drive_force(imdisk: &Path, letter: char) -> Result<()> {
     // Try graceful removal first
     let output = Command::new(imdisk)
         .args(["-D", "-m", &mount_arg])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
 
     if let Ok(ref out) = output {
@@ -354,6 +362,7 @@ fn unmount_drive_force(imdisk: &Path, letter: char) -> Result<()> {
         let unit_str = unit.to_string();
         let probe = Command::new(imdisk)
             .args(["-l", "-u", &unit_str])
+            .creation_flags(CREATE_NO_WINDOW)
             .output();
 
         if let Ok(ref out) = probe {
@@ -362,6 +371,7 @@ fn unmount_drive_force(imdisk: &Path, letter: char) -> Result<()> {
                 log::warn!("Emergency removing ImDisk unit {} ({}:)", unit, letter);
                 let _ = Command::new(imdisk)
                     .args(["-R", "-u", &unit_str])
+                    .creation_flags(CREATE_NO_WINDOW)
                     .output();
                 std::thread::sleep(std::time::Duration::from_millis(300));
                 return Ok(());
@@ -377,6 +387,7 @@ fn find_imdisk() -> Option<PathBuf> {
     // Check PATH first
     if Command::new(IMDISK_EXE)
         .arg("--version")
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .is_ok()
     {
@@ -431,6 +442,7 @@ fn unmount_drive(letter: char) -> Result<()> {
 
     let output = Command::new(&imdisk)
         .args(["-D", "-m", &mount_arg])
+        .creation_flags(CREATE_NO_WINDOW)
         .output()
         .map_err(|e| anyhow!("failed to run imdisk -D: {e}"))?;
 

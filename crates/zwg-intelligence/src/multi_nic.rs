@@ -18,6 +18,12 @@ use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+#[cfg(windows)]
+use std::os::windows::process::CommandExt;
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Network interface kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NicKind {
@@ -49,6 +55,7 @@ pub fn discover_nics() -> Vec<NicInfo> {
                 if ($ip) { "$($_.Name)|$ip|$($_.InterfaceDescription)" }
             }"#,
         ])
+        .creation_flags(CREATE_NO_WINDOW)
         .output();
 
     let output = match output {

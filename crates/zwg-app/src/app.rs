@@ -1320,31 +1320,47 @@ impl RootView {
                 let _ = resp_tx.send(GpuiResponse::SendKeysAllOk { count });
             }
 
-            GpuiCommand::ListPanes { resp_tx } => {
-                let split = {
-                    let state = self.state.read(cx);
-                    let Some(s) = state.active_split().cloned() else {
+            GpuiCommand::ListPanes { all_tabs, resp_tx } => {
+                let state = self.state.read(cx);
+                if all_tabs {
+                    // Traverse all tabs
+                    let mut pane_infos: Vec<PaneInfo> = Vec::new();
+                    for tab in &state.tabs {
+                        let Some(split) = tab.split() else { continue };
+                        let focused = split.read(cx).focused_pane_id();
+                        for (pid, _uuid, term) in split.read(cx).list_panes() {
+                            let (cols, rows) = term.read(cx).terminal_size();
+                            pane_infos.push(PaneInfo {
+                                pane_id: pid,
+                                width: cols,
+                                height: rows,
+                                active: Some(pid) == focused,
+                            });
+                        }
+                    }
+                    let _ = resp_tx.send(GpuiResponse::PaneList(pane_infos));
+                } else {
+                    // Active tab only
+                    let Some(split) = state.active_split().cloned() else {
                         let _ = resp_tx.send(GpuiResponse::PaneList(Vec::new()));
                         return;
                     };
-                    s
-                };
-                let focused_pane_id = split.read(cx).focused_pane_id();
-                let panes = split.read(cx).list_panes();
-
-                let pane_infos: Vec<PaneInfo> = panes
-                    .iter()
-                    .map(|(pid, _uuid, term)| {
-                        let (cols, rows) = term.read(cx).terminal_size();
-                        PaneInfo {
-                            pane_id: *pid,
-                            width: cols,
-                            height: rows,
-                            active: Some(*pid) == focused_pane_id,
-                        }
-                    })
-                    .collect();
-                let _ = resp_tx.send(GpuiResponse::PaneList(pane_infos));
+                    let focused_pane_id = split.read(cx).focused_pane_id();
+                    let panes = split.read(cx).list_panes();
+                    let pane_infos: Vec<PaneInfo> = panes
+                        .iter()
+                        .map(|(pid, _uuid, term)| {
+                            let (cols, rows) = term.read(cx).terminal_size();
+                            PaneInfo {
+                                pane_id: *pid,
+                                width: cols,
+                                height: rows,
+                                active: Some(*pid) == focused_pane_id,
+                            }
+                        })
+                        .collect();
+                    let _ = resp_tx.send(GpuiResponse::PaneList(pane_infos));
+                }
             }
 
             GpuiCommand::SelectPane { pane_id, resp_tx } => {
@@ -1413,7 +1429,16 @@ impl RootView {
             }
 
             GpuiCommand::CapturePane { pane_id, resp_tx } => {
-                let terminal = self.find_pane_terminal(pane_id, cx);
+                // Clamp pane_id=0 to active/focused pane
+                let effective_id = if pane_id == 0 {
+                    let state = self.state.read(cx);
+                    state.active_split()
+                        .and_then(|s| s.read(cx).focused_pane_id())
+                        .unwrap_or(0)
+                } else {
+                    pane_id
+                };
+                let terminal = self.find_pane_terminal(effective_id, cx);
                 match terminal {
                     Some(term) => {
                         let content = term.read(cx).capture_screen();
@@ -1421,7 +1446,7 @@ impl RootView {
                     }
                     None => {
                         let _ = resp_tx.send(GpuiResponse::Error(
-                            format!("pane %{} not found", pane_id),
+                            format!("pane %{} not found", effective_id),
                         ));
                     }
                 }

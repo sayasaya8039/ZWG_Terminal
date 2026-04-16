@@ -60,6 +60,11 @@ const SAME_ROUTE_COMMIT_DUPLICATE_WINDOW_MS: u64 = 100;
 /// Interval between periodic session saves to RAMdisk (30 seconds).
 const SESSION_SAVE_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Max paste payload before truncation (1 MB).
+const PASTE_MAX_SIZE: usize = 1_048_576;
+/// Suppress duplicate pastes within this window after a successful paste.
+const PASTE_SUPPRESS_WINDOW: Duration = Duration::from_secs(2);
+
 /// Session state file name on RAMdisk.
 const SESSION_SNAPSHOT_FILE: &str = "session_snapshot.json";
 
@@ -968,6 +973,8 @@ pub struct TerminalPane {
     initial_working_directory: Option<String>,
     /// Last time session was saved to RAMdisk (for periodic 30s saves)
     last_session_save: Instant,
+    /// Suppress duplicate clipboard pastes until this instant.
+    paste_suppress_until: Option<Instant>,
 }
 
 impl TerminalPane {
@@ -1395,6 +1402,7 @@ impl TerminalPane {
             max_scrollback_lines: settings.scrollback_lines,
             initial_working_directory: saved_working_directory,
             last_session_save: Instant::now(),
+            paste_suppress_until: None,
         }
     }
 
@@ -2502,17 +2510,38 @@ impl TerminalPane {
     }
 
     pub fn paste_text(&mut self, text: &str) -> bool {
-        let bytes = normalize_terminal_newlines(text);
+        let mut bytes = normalize_terminal_newlines(text);
         if bytes.is_empty() {
             return false;
         }
 
+        // Truncate oversized pastes to prevent terminal flooding
+        if bytes.len() > PASTE_MAX_SIZE {
+            log::warn!(
+                "Paste truncated from {} to {} bytes",
+                bytes.len(),
+                PASTE_MAX_SIZE
+            );
+            bytes.truncate(PASTE_MAX_SIZE);
+        }
+
         self.clear_selection();
         self.write_terminal_bytes(&bytes);
+        // Suppress duplicate pastes for a short window
+        self.paste_suppress_until = Some(Instant::now() + PASTE_SUPPRESS_WINDOW);
         true
     }
 
     fn paste_from_clipboard(&mut self, cx: &mut Context<Self>) -> bool {
+        // Suppress duplicate pastes within the debounce window
+        if let Some(until) = self.paste_suppress_until {
+            if Instant::now() < until {
+                log::debug!("Paste suppressed (duplicate window)");
+                return false;
+            }
+            self.paste_suppress_until = None;
+        }
+
         // Try GPUI clipboard first, fall back to native Windows API
         let text = cx
             .read_from_clipboard()

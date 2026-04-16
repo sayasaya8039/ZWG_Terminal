@@ -26,6 +26,7 @@ pub enum GpuiCommand {
         resp_tx: flume::Sender<GpuiResponse>,
     },
     ListPanes {
+        all_tabs: bool,
         resp_tx: flume::Sender<GpuiResponse>,
     },
     SelectPane {
@@ -280,8 +281,9 @@ pub fn register_handlers(server: &super::IpcServer, cmd_tx: CommandSender) {
     // ── list-panes ──────────────────────────────────────────────────
     let tx = cmd_tx.clone();
     server.on_command("list-panes", move |req| {
+        let all_tabs = req.args.iter().any(|a| a == "-a");
         let (resp_tx, resp_rx) = flume::bounded(1);
-        let cmd = GpuiCommand::ListPanes { resp_tx };
+        let cmd = GpuiCommand::ListPanes { all_tabs, resp_tx };
 
         if tx.send(cmd).is_err() {
             return super::IpcResponse::err(req.id, "GPUI bridge disconnected");
