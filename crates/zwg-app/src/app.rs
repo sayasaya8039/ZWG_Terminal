@@ -52,6 +52,10 @@ use crate::split::{FocusDir, SplitContainer, SplitDirection};
 use crate::template_editor::{TemplateEditorModal, TemplateEditorOutcome};
 use crate::terminal::TerminalSettings;
 use crate::terminal::view::{CELL_HEIGHT_ESTIMATE, CELL_WIDTH_ESTIMATE, WINDOW_CHROME_HEIGHT};
+use crate::vcc::{
+    self, VccExperimentOutput, VccRunnerField, VccRunnerState, VccSourceRef, VccViewerState,
+    VccMode,
+};
 use crate::{
     ClosePane, CloseTab, FocusNext, FocusPrev, MaximizePane, NewTab, OpenSettings, Quit,
     SplitDown, SplitRight,
@@ -567,11 +571,91 @@ fn pick_background_image_file() -> Option<PathBuf> {
         .pick_file()
 }
 
+fn pick_vcc_jsonl_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("JSONL", &["jsonl"])
+        .pick_file()
+}
+
+fn pick_markdown_file() -> Option<PathBuf> {
+    rfd::FileDialog::new()
+        .add_filter("Markdown", &["md"])
+        .pick_file()
+}
+
 /// Per-tab state.
 pub struct Tab {
     pub title: String,
-    pub shell_type: ShellType,
-    pub split: Entity<SplitContainer>,
+    pub kind: TabKind,
+}
+
+pub enum TabKind {
+    Terminal {
+        shell_type: ShellType,
+        split: Entity<SplitContainer>,
+    },
+    Vcc {
+        viewer: VccViewerState,
+    },
+    Runner {
+        runner: VccRunnerState,
+    },
+}
+
+impl Tab {
+    fn shell_type(&self) -> Option<&ShellType> {
+        match &self.kind {
+            TabKind::Terminal { shell_type, .. } => Some(shell_type),
+            TabKind::Vcc { .. } | TabKind::Runner { .. } => None,
+        }
+    }
+
+    fn split(&self) -> Option<&Entity<SplitContainer>> {
+        match &self.kind {
+            TabKind::Terminal { split, .. } => Some(split),
+            TabKind::Vcc { .. } | TabKind::Runner { .. } => None,
+        }
+    }
+
+    fn split_cloned(&self) -> Option<Entity<SplitContainer>> {
+        self.split().cloned()
+    }
+
+    fn viewer(&self) -> Option<&VccViewerState> {
+        match &self.kind {
+            TabKind::Terminal { .. } | TabKind::Runner { .. } => None,
+            TabKind::Vcc { viewer } => Some(viewer),
+        }
+    }
+
+    fn viewer_mut(&mut self) -> Option<&mut VccViewerState> {
+        match &mut self.kind {
+            TabKind::Terminal { .. } | TabKind::Runner { .. } => None,
+            TabKind::Vcc { viewer } => Some(viewer),
+        }
+    }
+
+    fn runner(&self) -> Option<&VccRunnerState> {
+        match &self.kind {
+            TabKind::Runner { runner } => Some(runner),
+            TabKind::Terminal { .. } | TabKind::Vcc { .. } => None,
+        }
+    }
+
+    fn runner_mut(&mut self) -> Option<&mut VccRunnerState> {
+        match &mut self.kind {
+            TabKind::Runner { runner } => Some(runner),
+            TabKind::Terminal { .. } | TabKind::Vcc { .. } => None,
+        }
+    }
+
+    fn icon(&self) -> &'static str {
+        match &self.kind {
+            TabKind::Terminal { shell_type, .. } => shell_icon(shell_type),
+            TabKind::Vcc { .. } => "V",
+            TabKind::Runner { .. } => "R",
+        }
+    }
 }
 
 /// Shell entry for the shell selector.
@@ -861,8 +945,7 @@ impl AppState {
         Self {
             tabs: vec![Tab {
                 title,
-                shell_type,
-                split,
+                kind: TabKind::Terminal { shell_type, split },
             }],
             active_tab: 0,
             available_shells,
@@ -885,8 +968,28 @@ impl AppState {
 
         self.tabs.push(Tab {
             title,
-            shell_type,
-            split,
+            kind: TabKind::Terminal { shell_type, split },
+        });
+        self.active_tab = self.tabs.len() - 1;
+    }
+
+    pub fn add_vcc_tab(&mut self) {
+        let viewer = VccViewerState::from_config(
+            self.config.vcc_output_location.clone(),
+            self.config.vcc_recent_sources.clone(),
+        );
+        self.tabs.push(Tab {
+            title: "VCC Viewer".into(),
+            kind: TabKind::Vcc { viewer },
+        });
+        self.active_tab = self.tabs.len() - 1;
+    }
+
+    pub fn add_vcc_runner_tab(&mut self) {
+        let runner = VccRunnerState::new(vcc::VccRunnerBridge::shared());
+        self.tabs.push(Tab {
+            title: "VCC Runner".into(),
+            kind: TabKind::Runner { runner },
         });
         self.active_tab = self.tabs.len() - 1;
     }
@@ -902,7 +1005,7 @@ impl AppState {
     }
 
     pub fn active_split(&self) -> Option<&Entity<SplitContainer>> {
-        self.tabs.get(self.active_tab).map(|t| &t.split)
+        self.tabs.get(self.active_tab).and_then(Tab::split)
     }
 
     pub fn apply_config(&mut self, config: AppConfig, cx: &mut App) {
@@ -912,9 +1015,11 @@ impl AppState {
             terminal_settings_from_config(&self.config, self.terminal_input_suppressed.clone());
         for tab in &self.tabs {
             let terminal_settings = terminal_settings.clone();
-            tab.split.update(cx, |split, cx| {
-                split.update_terminal_settings(terminal_settings, cx);
-            });
+            if let Some(split) = tab.split() {
+                split.update(cx, |split, cx| {
+                    split.update_terminal_settings(terminal_settings, cx);
+                });
+            }
         }
     }
 }
@@ -1028,7 +1133,7 @@ impl RootView {
                     // Collect split entities (cloned) before any mutable access
                     let splits: Vec<_> = {
                         let state = root_view.state.read(cx);
-                        state.tabs.iter().map(|t| t.split.clone()).collect()
+                        state.tabs.iter().filter_map(Tab::split_cloned).collect()
                     };
                     for split in splits {
                         let killed = split.update(cx, |sc, cx| sc.kill_pane_by_id(pane_id, cx));
@@ -1114,8 +1219,28 @@ impl RootView {
                         }
                     }
                     None => {
+                        // Dump known pane IDs so leader↔teammate routing failures
+                        // can be diagnosed from logs without attaching a debugger.
+                        let known: Vec<u32> = {
+                            let state = self.state.read(cx);
+                            let mut ids = Vec::new();
+                            for tab in &state.tabs {
+                                if let Some(split) = tab.split() {
+                                    for (pid, _uuid, _term) in split.read(cx).list_panes() {
+                                        ids.push(pid);
+                                    }
+                                }
+                            }
+                            ids
+                        };
+                        log::warn!(
+                            "[IPC] send-keys: pane %{} not found (known panes: {:?}, data_len={})",
+                            pane_id,
+                            known,
+                            data.len()
+                        );
                         let _ = resp_tx.send(GpuiResponse::Error(
-                            format!("pane %{} not found", pane_id),
+                            format!("pane %{} not found (known: {:?})", pane_id, known),
                         ));
                     }
                 }
@@ -1125,7 +1250,10 @@ impl RootView {
                 let mut count = 0usize;
                 let state = self.state.read(cx);
                 for tab in &state.tabs {
-                    let panes = tab.split.read(cx).list_panes();
+                    let Some(split) = tab.split() else {
+                        continue;
+                    };
+                    let panes = split.read(cx).list_panes();
                     for (_pid, _uuid, term) in &panes {
                         if term.read(cx).write_to_pty(&data).is_ok() {
                             count += 1;
@@ -1186,7 +1314,7 @@ impl RootView {
                 // Search all tabs, not just active tab
                 let splits: Vec<_> = {
                     let state = self.state.read(cx);
-                    state.tabs.iter().map(|t| t.split.clone()).collect()
+                    state.tabs.iter().filter_map(Tab::split_cloned).collect()
                 };
                 let mut killed = false;
                 for split in splits {
@@ -1208,7 +1336,7 @@ impl RootView {
                 // Collect all splits across all tabs
                 let splits: Vec<_> = {
                     let state = self.state.read(cx);
-                    state.tabs.iter().map(|t| t.split.clone()).collect()
+                    state.tabs.iter().filter_map(Tab::split_cloned).collect()
                 };
                 let mut killed = 0usize;
                 for split in &splits {
@@ -1259,7 +1387,10 @@ impl RootView {
         }
         // Search all tabs
         for tab in &state.tabs {
-            if let Some(term) = tab.split.read(cx).find_pane_by_id(pane_id) {
+            let Some(split) = tab.split() else {
+                continue;
+            };
+            if let Some(term) = split.read(cx).find_pane_by_id(pane_id) {
                 return Some(term);
             }
         }
@@ -1423,7 +1554,7 @@ impl RootView {
                 state
                     .tabs
                     .iter()
-                    .map(|tab| (tab.title.clone(), tab.split.clone()))
+                    .filter_map(|tab| tab.split_cloned().map(|split| (tab.title.clone(), split)))
                     .collect::<Vec<_>>(),
             )
         };
@@ -1453,6 +1584,432 @@ impl RootView {
                 }
             }
         }
+    }
+
+    fn open_vcc_viewer_tab(&mut self, cx: &mut Context<Self>) {
+        self.show_shell_menu = false;
+        self.show_settings = false;
+        self.state.update(cx, |state, _| {
+            state.add_vcc_tab();
+        });
+        self.refresh_vcc_logs(cx);
+        cx.notify();
+    }
+
+    fn open_vcc_runner_tab(&mut self, cx: &mut Context<Self>) {
+        self.show_shell_menu = false;
+        self.show_settings = false;
+        self.state.update(cx, |state, _| {
+            state.add_vcc_runner_tab();
+        });
+        cx.notify();
+    }
+
+    fn persist_active_vcc_preferences(&mut self, cx: &mut Context<Self>) {
+        let Some((output_location, recent_sources)) = self.state.read(cx).tabs.get(self.state.read(cx).active_tab).and_then(Tab::viewer).map(|viewer| {
+            (
+                viewer.output_location.as_config_value().to_string(),
+                viewer.recent_sources.clone(),
+            )
+        }) else {
+            return;
+        };
+
+        self.persist_config_update(cx, move |config| {
+            config.vcc_output_location = output_location;
+            config.vcc_recent_sources = recent_sources;
+        });
+    }
+
+    pub(crate) fn refresh_vcc_logs(&mut self, cx: &mut Context<Self>) {
+        let scanned = vcc::VccBridge::default().scan_log_sources();
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.replace_scanned_sources(scanned);
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn open_vcc_jsonl(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = pick_vcc_jsonl_file() else {
+            return;
+        };
+        let source = VccSourceRef::manual(path.clone());
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.push_recent_source(path.clone());
+                viewer.select_source(source.clone());
+            }
+        });
+        self.persist_active_vcc_preferences(cx);
+        self.load_vcc_source(source, cx);
+    }
+
+    pub(crate) fn select_vcc_source(&mut self, source: VccSourceRef, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.select_source(source.clone());
+            }
+        });
+        self.load_vcc_source(source, cx);
+    }
+
+    fn load_vcc_source(&mut self, source: VccSourceRef, cx: &mut Context<Self>) {
+        let output_location = self
+            .state
+            .read(cx)
+            .tabs
+            .get(self.state.read(cx).active_tab)
+            .and_then(Tab::viewer)
+            .map(|viewer| viewer.output_location);
+        let Some(output_location) = output_location else {
+            return;
+        };
+        let snapshot = vcc::VccBridge::default()
+            .load_cached_snapshot(&source, output_location)
+            .unwrap_or_else(|err| {
+                log::warn!("Failed to load cached VCC snapshot: {}", err);
+                None
+            });
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.apply_snapshot(source.clone(), snapshot);
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_vcc_output_location(&mut self, cx: &mut Context<Self>) {
+        let selected_source = self.state.update(cx, |state, _| {
+            let active = state.active_tab;
+            state
+                .tabs
+                .get_mut(active)
+                .and_then(Tab::viewer_mut)
+                .map(|viewer| {
+                    viewer.cycle_output_location();
+                    viewer.selected_source.clone()
+                })
+                .flatten()
+        });
+        self.persist_active_vcc_preferences(cx);
+        if let Some(source) = selected_source {
+            self.load_vcc_source(source, cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn select_vcc_mode(&mut self, mode: VccMode, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.selected_mode = mode;
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn select_vcc_chain(&mut self, chain_index: usize, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.select_chain(chain_index);
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn focus_vcc_search(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.search_focused = true;
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn open_vcc_reference(&mut self, line: &str, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.open_reference_from_line(line);
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn compile_vcc(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.queue_compile();
+            }
+        });
+        self.flush_vcc_request(window, cx);
+    }
+
+    pub(crate) fn confirm_vcc_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.search_focused = false;
+                viewer.confirm_search();
+            }
+        });
+        self.flush_vcc_request(window, cx);
+    }
+
+    fn append_vcc_search_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.draft_search_query.push_str(text);
+            }
+        });
+        cx.notify();
+    }
+
+    fn pop_vcc_search_text(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.draft_search_query.pop();
+            }
+        });
+        cx.notify();
+    }
+
+    fn blur_vcc_search(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(viewer) = state.tabs.get_mut(state.active_tab).and_then(Tab::viewer_mut) {
+                viewer.search_focused = false;
+            }
+        });
+        cx.notify();
+    }
+
+    fn flush_vcc_request(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let compile_job = self.state.update(cx, |state, _| {
+            let active = state.active_tab;
+            state
+                .tabs
+                .get_mut(active)
+                .and_then(Tab::viewer_mut)
+                .and_then(|viewer| {
+                    let request = viewer.take_pending_request()?;
+                    let bridge = viewer.bridge.clone();
+                    let source = request.source.clone();
+                    viewer.mark_compiling(request.grep_pattern.is_some());
+                    Some((bridge, source, request))
+                })
+        });
+        let Some((bridge, source, request)) = compile_job else {
+            return;
+        };
+
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_, cx: &mut AsyncApp| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { bridge.execute(&request) })
+                .await;
+
+            let _ = this.update(cx, |view: &mut RootView, cx| {
+                view.state.update(cx, |state, _| {
+                    for tab in &mut state.tabs {
+                        let Some(viewer) = tab.viewer_mut() else {
+                            continue;
+                        };
+                        let matches_source = viewer
+                            .selected_source
+                            .as_ref()
+                            .map(|selected| selected.stable_key() == source.stable_key())
+                            .unwrap_or(false);
+                        if !matches_source {
+                            continue;
+                        }
+
+                        match &result {
+                            Ok(output) => viewer.apply_compile_output(source.clone(), output.clone()),
+                            Err(err) => viewer.apply_error(err.to_string()),
+                        }
+                    }
+                });
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    pub(crate) fn focus_vcc_runner_field(
+        &mut self,
+        field: VccRunnerField,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.focus_field(field);
+            }
+        });
+        cx.notify();
+    }
+
+    fn append_vcc_runner_text(&mut self, text: &str, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.append_text(text);
+            }
+        });
+        cx.notify();
+    }
+
+    fn pop_vcc_runner_text(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.pop_text();
+            }
+        });
+        cx.notify();
+    }
+
+    fn blur_vcc_runner_field(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.blur_field();
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_vcc_runner_mode(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.cycle_mode();
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_vcc_runner_target_kind(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.cycle_target_kind();
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_vcc_runner_method(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.cycle_method();
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_vcc_runner_model(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.cycle_model();
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_vcc_runner_effort(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.cycle_effort();
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_vcc_runner_teacher_model(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.cycle_teacher_model();
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn cycle_vcc_runner_teacher_effort(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.cycle_teacher_effort();
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn toggle_vcc_runner_manual(&mut self, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.toggle_manual();
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn pick_vcc_runner_memory(&mut self, cx: &mut Context<Self>) {
+        let selected = pick_markdown_file();
+        self.state.update(cx, |state, _| {
+            if let Some(runner) = state.tabs.get_mut(state.active_tab).and_then(Tab::runner_mut) {
+                runner.set_memory_path(selected.clone());
+            }
+        });
+        cx.notify();
+    }
+
+    pub(crate) fn start_vcc_runner(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        let start_job = self.state.update(cx, |state, _| {
+            let active = state.active_tab;
+            let runner = state.tabs.get_mut(active).and_then(Tab::runner_mut)?;
+            match runner.build_request() {
+                Ok(request) => {
+                    let bridge = runner.bridge.clone();
+                    runner.mark_running(&request);
+                    Some((active, bridge, request))
+                }
+                Err(err) => {
+                    runner.apply_error(err.to_string(), String::new());
+                    None
+                }
+            }
+        });
+        cx.notify();
+
+        let Some((tab_index, bridge, request)) = start_job else {
+            return;
+        };
+
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_, cx: &mut AsyncApp| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { bridge.execute(&request) })
+                .await;
+
+            let _ = this.update(cx, |view: &mut RootView, cx| {
+                view.finish_vcc_runner_job(tab_index, result, cx);
+            });
+        })
+        .detach();
+    }
+
+    fn finish_vcc_runner_job(
+        &mut self,
+        tab_index: usize,
+        result: anyhow::Result<VccExperimentOutput>,
+        cx: &mut Context<Self>,
+    ) {
+        self.state.update(cx, |state, _| {
+            let Some(runner) = state.tabs.get_mut(tab_index).and_then(Tab::runner_mut) else {
+                return;
+            };
+            match result {
+                Ok(output) => runner.apply_success(output),
+                Err(err) => runner.apply_error(err.to_string(), String::new()),
+            }
+        });
+        cx.notify();
     }
 
     fn on_new_tab(&mut self, _action: &NewTab, window: &mut Window, cx: &mut Context<Self>) {
@@ -1748,7 +2305,7 @@ impl RootView {
             .read(cx)
             .tabs
             .iter()
-            .map(|tab| tab.split.clone())
+            .filter_map(Tab::split_cloned)
             .collect::<Vec<_>>();
 
         for split in splits {
@@ -1970,11 +2527,19 @@ impl RootView {
     }
 
     fn sync_terminal_input_suppression(&self, cx: &Context<Self>) {
+        let active_is_vcc = self
+            .state
+            .read(cx)
+            .tabs
+            .get(self.state.read(cx).active_tab)
+            .and_then(Tab::viewer)
+            .is_some();
         let suppressed = self.show_shell_menu
             || self.show_settings
             || self.show_close_confirm
             || self.show_snippet_palette
-            || self.template_editor.is_some();
+            || self.template_editor.is_some()
+            || active_is_vcc;
         self.state
             .read(cx)
             .terminal_input_suppressed
@@ -2597,6 +3162,100 @@ impl RootView {
         false
     }
 
+    fn handle_vcc_search_key(
+        &mut self,
+        event: &KeyDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let active_vcc_search = self
+            .state
+            .read(cx)
+            .tabs
+            .get(self.state.read(cx).active_tab)
+            .and_then(Tab::viewer)
+            .map(|viewer| viewer.search_focused)
+            .unwrap_or(false);
+        if !active_vcc_search {
+            return false;
+        }
+
+        match event.keystroke.key.as_ref() {
+            "escape" => {
+                self.blur_vcc_search(cx);
+                true
+            }
+            "enter" => {
+                self.confirm_vcc_search(window, cx);
+                true
+            }
+            "backspace" => {
+                self.pop_vcc_search_text(cx);
+                true
+            }
+            "v" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                    return true;
+                };
+                self.append_vcc_search_text(&text, cx);
+                true
+            }
+            _ => {
+                if let Some(text) = direct_text_from_input_keystroke(&event.keystroke) {
+                    self.append_vcc_search_text(&text, cx);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn handle_vcc_runner_key(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let active_runner_focused = self
+            .state
+            .read(cx)
+            .tabs
+            .get(self.state.read(cx).active_tab)
+            .and_then(Tab::runner)
+            .and_then(|runner| runner.focused_field)
+            .is_some();
+        if !active_runner_focused {
+            return false;
+        }
+
+        match event.keystroke.key.as_ref() {
+            "escape" | "enter" => {
+                self.blur_vcc_runner_field(cx);
+                true
+            }
+            "backspace" => {
+                self.pop_vcc_runner_text(cx);
+                true
+            }
+            "v" if event.keystroke.modifiers.control && !event.keystroke.modifiers.alt => {
+                let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
+                    return true;
+                };
+                self.append_vcc_runner_text(&text, cx);
+                true
+            }
+            _ => {
+                if let Some(text) = direct_text_from_input_keystroke(&event.keystroke) {
+                    self.append_vcc_runner_text(&text, cx);
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
     fn handle_global_shortcut_key(
         &mut self,
         event: &KeyDownEvent,
@@ -2650,6 +3309,16 @@ impl RootView {
         }
 
         if self.handle_snippet_palette_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.handle_vcc_runner_key(event, window, cx) {
+            cx.stop_propagation();
+            return;
+        }
+
+        if self.handle_vcc_search_key(event, window, cx) {
             cx.stop_propagation();
             return;
         }
@@ -3021,7 +3690,87 @@ impl RootView {
                                         .child("Install New Shell..."),
                                 )
                                 .child(div().text_size(px(13.0)).text_color(rgb(MUTED)).child(">")),
-                        ),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .px(px(12.0))
+                                .py(px(10.0))
+                                .rounded(px(10.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgba(0xffffff12)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.open_vcc_viewer_tab(cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(36.0))
+                                        .h(px(36.0))
+                                        .rounded(px(10.0))
+                                        .bg(rgba(0x34C75933))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(15.0))
+                                        .text_color(rgb(ACCENT_ALT))
+                                        .child("V"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(13.0))
+                                        .text_color(rgb(TEXT))
+                                        .child("Open VCC Viewer"),
+                                )
+                                .child(div().text_size(px(13.0)).text_color(rgb(MUTED)).child(">")),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .items_center()
+                                .gap(px(12.0))
+                                .px(px(12.0))
+                                .py(px(10.0))
+                                .rounded(px(10.0))
+                                .cursor_pointer()
+                                .hover(|style| style.bg(rgba(0xffffff12)))
+                                .on_mouse_down(
+                                    MouseButton::Left,
+                                    cx.listener(|this, _: &MouseDownEvent, _window, cx| {
+                                        this.open_vcc_runner_tab(cx);
+                                    }),
+                                )
+                                .child(
+                                    div()
+                                        .w(px(36.0))
+                                        .h(px(36.0))
+                                        .rounded(px(10.0))
+                                        .bg(rgba(0x64D2FF33))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .text_size(px(15.0))
+                                        .text_color(rgb(ACCENT))
+                                        .child("R"),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .font_family(UI_FONT)
+                                        .text_size(px(13.0))
+                                        .text_color(rgb(TEXT))
+                                        .child("Open VCC Runner"),
+                                )
+                                .child(div().text_size(px(13.0)).text_color(rgb(MUTED)).child(">")),
+                        )
                 )
                 .into_any_element(),
         )
@@ -4846,41 +5595,45 @@ impl Render for RootView {
         let state = self.state.read(cx);
         let active_tab = state.active_tab;
         let tab_count = state.tabs.len();
-        let active_split = state.tabs.get(active_tab).map(|tab| tab.split.clone());
+        let active_split = state.tabs.get(active_tab).and_then(Tab::split_cloned);
         let pane_count = active_split
             .as_ref()
             .map(|split| split.read(cx).all_terminals().len())
-            .unwrap_or(1);
+            .unwrap_or(0);
         let active_shell_name = state
             .tabs
             .get(active_tab)
             .map(|tab| tab.title.clone())
-            .unwrap_or_else(|| "PowerShell".to_string());
+            .unwrap_or_else(|| "ZWG".to_string());
         let config = state.config.clone();
         let tab_bar_visible = config.tab_bar_visible;
         let grid_label = format!(
             "{}x{}",
             config.default_window_cols, config.default_window_rows
         );
-        let tab_infos: Vec<(usize, String, ShellType, bool)> = state
+        let tab_infos: Vec<(usize, String, String, bool)> = state
             .tabs
             .iter()
             .enumerate()
             .map(|(idx, tab)| {
-                (
-                    idx,
-                    tab.title.clone(),
-                    tab.shell_type.clone(),
-                    idx == active_tab,
-                )
+                (idx, tab.title.clone(), tab.icon().to_string(), idx == active_tab)
             })
             .collect();
         let available_shells = state.available_shells.clone();
+        let active_vcc_viewer = state
+            .tabs
+            .get(active_tab)
+            .and_then(Tab::viewer)
+            .cloned();
+        let active_vcc_runner = state
+            .tabs
+            .get(active_tab)
+            .and_then(Tab::runner)
+            .cloned();
         let _ = state;
 
         let mut tab_elements: Vec<AnyElement> = Vec::new();
-        for (idx, title, shell_type, is_active) in tab_infos {
-            let icon = shell_icon(&shell_type);
+        for (idx, title, icon, is_active) in tab_infos {
 
             let mut tab = div()
                 .id(ElementId::Name(format!("tab-{idx}").into()))
@@ -5150,7 +5903,15 @@ impl Render for RootView {
                     .flex_1()
                     .overflow_hidden()
                     .bg(rgb(WINDOW_BG))
-                    .children(active_split),
+                    .children(active_split)
+                    .children(
+                        active_vcc_viewer
+                            .map(|viewer| vcc::view::render_vcc_viewer(&viewer, cx)),
+                    )
+                    .children(
+                        active_vcc_runner
+                            .map(|runner| vcc::runner_view::render_vcc_runner(&runner, cx)),
+                    ),
             )
             .when(self.state.read(cx).config.status_bar_visible, |root| {
                 root.child(Self::render_status_bar(

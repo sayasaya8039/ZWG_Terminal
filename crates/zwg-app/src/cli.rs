@@ -639,9 +639,46 @@ fn ipc_endpoint_from_env() -> Option<String> {
 
 fn send_ipc_named_pipe(request: &IpcRequest) -> anyhow::Result<IpcResponse> {
     let pipe_name = ipc_endpoint_from_env().unwrap_or_else(|| r"\\.\pipe\zwg".to_string());
-    let mut pipe = std::fs::OpenOptions::new().read(true).write(true)
-        .open(&pipe_name)
-        .map_err(|e| anyhow::anyhow!("named pipe {} not available: {}", pipe_name, e))?;
+
+    // Retry connection with backoff to tolerate the small window between
+    // the server accepting a client and creating the next pipe instance.
+    // Also handles transient ERROR_PIPE_BUSY when many teammates connect at once.
+    let mut pipe = {
+        let backoffs_ms = [0u64, 20, 50, 100, 200];
+        let mut last_err: Option<std::io::Error> = None;
+        let mut result = None;
+        for delay in backoffs_ms {
+            if delay > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay));
+            }
+            match std::fs::OpenOptions::new().read(true).write(true).open(&pipe_name) {
+                Ok(p) => { result = Some(p); break; }
+                Err(e) => {
+                    let kind = e.kind();
+                    let raw = e.raw_os_error();
+                    // Retry on transient errors only
+                    let retryable = matches!(
+                        kind,
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::WouldBlock
+                    ) || raw == Some(231) /* ERROR_PIPE_BUSY */
+                      || raw == Some(2)   /* ERROR_FILE_NOT_FOUND */;
+                    last_err = Some(e);
+                    if !retryable {
+                        break;
+                    }
+                }
+            }
+        }
+        match result {
+            Some(p) => p,
+            None => {
+                let err = last_err
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown".into());
+                return Err(anyhow::anyhow!("named pipe {} not available: {}", pipe_name, err));
+            }
+        }
+    };
     let json = serde_json::to_string(request)?;
     writeln!(pipe, "{}", json)?;
     pipe.flush()?;

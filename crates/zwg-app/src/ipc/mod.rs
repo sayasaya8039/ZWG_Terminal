@@ -178,29 +178,33 @@ impl IpcServer {
 
         log::info!(r"Named pipe IPC server starting on \\.\pipe\zwg");
 
+        let create_instance = || unsafe {
+            CreateNamedPipeW(
+                *PIPE_NAME,
+                PIPE_ACCESS_DUPLEX,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                64, // max instances — supports 8+ concurrent teammate agents
+                BUFFER_SIZE,
+                BUFFER_SIZE,
+                3000, // default timeout ms
+                None,
+            )
+        };
+
+        // Keep one listening instance armed at all times. When a client connects,
+        // immediately create the next instance before spawning the worker so new
+        // clients never hit an empty accept window (the root cause of dropped
+        // first messages for leader↔teammate IPC under load).
+        let mut pipe = create_instance();
+        if pipe == INVALID_HANDLE_VALUE || pipe.is_invalid() {
+            log::error!(
+                "CreateNamedPipeW failed: {}",
+                std::io::Error::last_os_error()
+            );
+            return Ok(());
+        }
+
         while *running.lock().unwrap_or_else(|e| e.into_inner()) {
-            // Create a new pipe instance for each connection
-            let pipe = unsafe {
-                CreateNamedPipeW(
-                    *PIPE_NAME,
-                    PIPE_ACCESS_DUPLEX,
-                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                    64, // max instances — supports 8+ concurrent teammate agents
-                    BUFFER_SIZE,
-                    BUFFER_SIZE,
-                    3000, // default timeout ms
-                    None,
-                )
-            };
-
-            if pipe == INVALID_HANDLE_VALUE || pipe.is_invalid() {
-                log::error!(
-                    "CreateNamedPipeW failed: {}",
-                    std::io::Error::last_os_error()
-                );
-                break;
-            }
-
             // Wait for client connection (blocking)
             let connected = unsafe { ConnectNamedPipe(pipe, None) };
             if connected.is_err() {
@@ -209,20 +213,52 @@ impl IpcServer {
                 if err.raw_os_error() != Some(535) {
                     log::warn!("ConnectNamedPipe error: {}", err);
                     unsafe { CloseHandle(pipe).ok() };
+                    pipe = create_instance();
+                    if pipe == INVALID_HANDLE_VALUE || pipe.is_invalid() {
+                        log::error!(
+                            "CreateNamedPipeW failed: {}",
+                            std::io::Error::last_os_error()
+                        );
+                        break;
+                    }
                     continue;
                 }
             }
 
+            // Immediately create the next instance so another client can connect
+            // while the current one is being handled. Closes the "no-listener gap".
+            let connected_pipe = pipe;
+            pipe = create_instance();
+            if pipe == INVALID_HANDLE_VALUE || pipe.is_invalid() {
+                log::error!(
+                    "CreateNamedPipeW failed (next): {}",
+                    std::io::Error::last_os_error()
+                );
+                // Still handle the current connection, then exit loop
+                let handlers_now = handlers.clone();
+                let raw = connected_pipe.0 as usize;
+                thread::spawn(move || {
+                    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+                    let p = HANDLE(raw as *mut _);
+                    Self::handle_named_pipe_connection(p, &handlers_now);
+                    unsafe {
+                        DisconnectNamedPipe(p).ok();
+                        CloseHandle(p).ok();
+                    }
+                });
+                break;
+            }
+
             let handlers = handlers.clone();
             // HANDLE is not Send (*mut c_void), so pass raw value
-            let pipe_raw = pipe.0 as usize;
+            let pipe_raw = connected_pipe.0 as usize;
             thread::spawn(move || {
                 use windows::Win32::Foundation::{CloseHandle, HANDLE};
-                let pipe = HANDLE(pipe_raw as *mut _);
-                Self::handle_named_pipe_connection(pipe, &handlers);
+                let p = HANDLE(pipe_raw as *mut _);
+                Self::handle_named_pipe_connection(p, &handlers);
                 unsafe {
-                    DisconnectNamedPipe(pipe).ok();
-                    CloseHandle(pipe).ok();
+                    DisconnectNamedPipe(p).ok();
+                    CloseHandle(p).ok();
                 }
             });
         }
