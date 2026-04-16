@@ -1190,11 +1190,30 @@ impl RootView {
                         env,
                         cx,
                     );
-                    // Auto-close panes spawned with an explicit command (e.g. teammate agents)
+                    // Auto-close panes spawned with an explicit command (e.g. teammate agents).
+                    // Diagnostic logs here prove that set_auto_close actually fires — without
+                    // them we can only infer the wiring from behavior.
                     if has_command {
-                        if let Some(term) = sc.find_pane_by_id(pane_id) {
-                            term.update(cx, |tp, _| tp.set_auto_close(pane_id));
+                        match sc.find_pane_by_id(pane_id) {
+                            Some(term) => {
+                                term.update(cx, |tp, _| tp.set_auto_close(pane_id));
+                                log::info!(
+                                    "[IPC] split-window: auto_close enabled for pane %{}",
+                                    pane_id
+                                );
+                            }
+                            None => {
+                                log::warn!(
+                                    "[IPC] split-window: pane %{} missing from split tree immediately after split_with_command — auto_close NOT set",
+                                    pane_id
+                                );
+                            }
                         }
+                    } else {
+                        log::debug!(
+                            "[IPC] split-window: no command → pane %{} spawned interactively (auto_close skipped)",
+                            pane_id
+                        );
                     }
                     let _ = resp_tx.send(GpuiResponse::SplitOk { pane_id });
                 });

@@ -1180,10 +1180,38 @@ impl TerminalPane {
                                 pane.pending_process_exit_status = Some(code);
                                 if pane.auto_close {
                                     if let Some(pane_id) = pane.auto_close_pane_id {
-                                        if let Some(tx) = crate::app::pane_auto_close_sender() {
-                                            let _ = tx.send(pane_id);
+                                        match crate::app::pane_auto_close_sender() {
+                                            Some(tx) => {
+                                                if tx.send(pane_id).is_ok() {
+                                                    log::info!(
+                                                        "[auto-close] requesting close for pane %{} (exit code {})",
+                                                        pane_id,
+                                                        code
+                                                    );
+                                                } else {
+                                                    log::warn!(
+                                                        "[auto-close] channel closed — pane %{} will not auto-close",
+                                                        pane_id
+                                                    );
+                                                }
+                                            }
+                                            None => {
+                                                log::warn!(
+                                                    "[auto-close] PANE_AUTO_CLOSE sender not initialized — pane %{} leaked",
+                                                    pane_id
+                                                );
+                                            }
                                         }
+                                    } else {
+                                        log::warn!(
+                                            "[auto-close] auto_close=true but auto_close_pane_id=None — split-window wiring bug?"
+                                        );
                                     }
+                                } else {
+                                    log::info!(
+                                        "[proc-exit] pane exited with code {} (auto_close not set, pane stays open)",
+                                        code
+                                    );
                                 }
                             })
                             .is_err()

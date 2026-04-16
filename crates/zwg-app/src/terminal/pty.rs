@@ -34,8 +34,45 @@ pub struct PtyPair {
     #[cfg(windows)]
     pseudo_console: Option<PseudoConsoleHandle>,
     #[cfg(windows)]
-    #[allow(dead_code)] // kept for Drop cleanup only
     process_handle: Option<ProcessHandle>,
+}
+
+#[cfg(windows)]
+impl PtyPair {
+    /// Duplicate the child process HANDLE so a watcher thread can wait on it
+    /// without racing against `OpenProcess(pid)`. Returns None if the PtyPair
+    /// was built without a process handle (e.g. test stubs) or the Win32 call
+    /// fails. The returned HANDLE must be CloseHandle'd by the caller.
+    pub fn duplicate_process_handle(&self) -> Option<windows::Win32::Foundation::HANDLE> {
+        use windows::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle, HANDLE};
+        use windows::Win32::System::Threading::GetCurrentProcess;
+        let src = self.process_handle.as_ref()?.0;
+        if src.is_invalid() {
+            return None;
+        }
+        let current = unsafe { GetCurrentProcess() };
+        let mut dup = HANDLE::default();
+        let result = unsafe {
+            DuplicateHandle(
+                current,
+                src,
+                current,
+                &mut dup,
+                0,
+                false,
+                DUPLICATE_SAME_ACCESS,
+            )
+        };
+        if result.is_err() {
+            log::warn!(
+                "[pty] DuplicateHandle failed for child pid {}: {}",
+                self.child_pid,
+                std::io::Error::last_os_error()
+            );
+            return None;
+        }
+        Some(dup)
+    }
 }
 
 unsafe impl Send for PtyPair {}
@@ -1025,6 +1062,7 @@ mod tests {
     fn spawn_pty_cmd_echo_produces_output() {
         let pty = spawn_pty(ConPtyConfig {
             shell: "cmd.exe /c echo ZWG_PTY_SMOKE_TEST".into(),
+            working_directory: None,
             cols: 80,
             rows: 24,
             env: Vec::new(),
@@ -1090,6 +1128,7 @@ mod tests {
                 "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
                 script_path.display()
             ),
+            working_directory: None,
             cols: 120,
             rows: 32,
             env: Vec::new(),
@@ -1170,6 +1209,7 @@ mod tests {
                 "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
                 script_path.display()
             ),
+            working_directory: None,
             cols: 120,
             rows: 32,
             env: Vec::new(),
@@ -1265,6 +1305,7 @@ mod tests {
                 "powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File \"{}\"",
                 script_path.display()
             ),
+            working_directory: None,
             cols: 120,
             rows: 32,
             env: Vec::new(),

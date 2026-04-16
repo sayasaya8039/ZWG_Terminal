@@ -380,12 +380,25 @@ impl TerminalSurface {
         let async_ptr: Option<usize> = None;
 
         // Windows: spawn a process-exit watcher as a safety net.
-        // ConPTY may not deliver EOF when grandchild processes hold console handles.
+        // ConPTY may not deliver EOF when grandchild processes hold console
+        // handles. Use the duplicated child HANDLE so the watcher can't race
+        // against a fast-exiting process (which previously silently dropped
+        // ProcessExited and broke pane auto-close).
         #[cfg(windows)]
         {
             let child_pid = pty.child_pid();
             let exit_tx = self.event_tx.clone();
-            Self::spawn_process_watcher(child_pid, exit_tx);
+            match pty.duplicate_process_handle() {
+                Some(handle) => {
+                    Self::spawn_process_watcher(handle, child_pid, exit_tx);
+                }
+                None => {
+                    log::warn!(
+                        "[proc-watcher] no duplicated HANDLE for pid {}; falling back to EOF-only exit detection",
+                        child_pid
+                    );
+                }
+            }
         }
 
         let handle = std::thread::Builder::new()
@@ -520,32 +533,33 @@ impl TerminalSurface {
 }
 
 impl TerminalSurface {
-    /// Spawn a background thread that monitors the child process and sends
-    /// ProcessExited when it terminates. This is a safety net for Windows
-    /// ConPTY which may not deliver EOF when grandchild processes hold handles.
+    /// Spawn a background thread that waits on a duplicated process HANDLE and
+    /// sends `ProcessExited` when it terminates. Passing a duplicated HANDLE
+    /// avoids the `OpenProcess(pid)` race that previously swallowed fast-exit
+    /// teammates (which caused auto-close to never fire). The HANDLE is owned
+    /// by the watcher thread and closed when it exits.
     #[cfg(windows)]
-    pub fn spawn_process_watcher(child_pid: u32, event_tx: Sender<TerminalEvent>) {
-        std::thread::Builder::new()
+    pub fn spawn_process_watcher(
+        handle: windows::Win32::Foundation::HANDLE,
+        child_pid: u32,
+        event_tx: Sender<TerminalEvent>,
+    ) {
+        // HANDLE is *mut c_void and therefore not Send. Smuggle it across the
+        // thread boundary as a raw usize — the RAII ownership transfer is
+        // documented by this function's contract.
+        let raw = handle.0 as usize;
+        // Keep a clone outside the closure so the failure path can still
+        // deliver a synthetic ProcessExited event.
+        let event_tx_for_failure = event_tx.clone();
+        let spawned = std::thread::Builder::new()
             .name("zwg-proc-watcher".into())
             .spawn(move || {
-                use windows::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+                use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
                 use windows::Win32::System::Threading::{
-                    GetExitCodeProcess, OpenProcess, WaitForSingleObject,
-                    PROCESS_QUERY_INFORMATION, PROCESS_SYNCHRONIZE,
+                    GetExitCodeProcess, WaitForSingleObject,
                 };
 
-                let handle = unsafe {
-                    OpenProcess(
-                        PROCESS_QUERY_INFORMATION | PROCESS_SYNCHRONIZE,
-                        false,
-                        child_pid,
-                    )
-                };
-
-                let Ok(handle) = handle else {
-                    log::warn!("[proc-watcher] failed to open process {}", child_pid);
-                    return;
-                };
+                let handle = HANDLE(raw as *mut _);
 
                 // Wait indefinitely for the process to exit
                 let wait = unsafe { WaitForSingleObject(handle, u32::MAX) };
@@ -555,19 +569,45 @@ impl TerminalSurface {
                     let _ = unsafe { GetExitCodeProcess(handle, &mut code) };
                     code as i32
                 } else {
+                    log::warn!(
+                        "[proc-watcher] WaitForSingleObject returned {:?} for pid {}",
+                        wait,
+                        child_pid
+                    );
                     -1
                 };
 
                 unsafe { let _ = CloseHandle(handle); }
 
                 log::info!(
-                    "[proc-watcher] child {} exited with code {}",
+                    "[proc-watcher] child pid {} exited with code {} (auto-close trigger)",
                     child_pid,
                     exit_code
                 );
-                let _ = event_tx.send(TerminalEvent::ProcessExited(exit_code));
-            })
-            .ok();
+                if event_tx.send(TerminalEvent::ProcessExited(exit_code)).is_err() {
+                    log::warn!(
+                        "[proc-watcher] event channel closed before ProcessExited({}) was delivered for pid {}",
+                        exit_code,
+                        child_pid
+                    );
+                }
+            });
+
+        if let Err(e) = spawned {
+            log::error!(
+                "[proc-watcher] failed to spawn watcher thread for pid {}: {}",
+                child_pid,
+                e
+            );
+            // Reclaim the HANDLE so it's not leaked
+            use windows::Win32::Foundation::{CloseHandle, HANDLE};
+            unsafe {
+                let _ = CloseHandle(HANDLE(raw as *mut _));
+            }
+            // Send a synthetic exit so auto-close still fires instead of
+            // hanging forever on a missing ProcessExited event.
+            let _ = event_tx_for_failure.send(TerminalEvent::ProcessExited(-1));
+        }
     }
 }
 
