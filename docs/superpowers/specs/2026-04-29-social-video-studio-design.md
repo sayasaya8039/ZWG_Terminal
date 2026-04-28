@@ -1,8 +1,10 @@
 # Social Video Studio Design
 
 **Date:** 2026-04-29  
-**Project:** ZWG Terminal  
-**Scope:** Full local operations platform for daily short-form social video packs, implemented first as an independent Remotion/React/Node app with future ZWG integration
+**Project:** Social Video Studio  
+**Spec Location:** ZWG Terminal docs  
+**Implementation Root:** `D:/NEXTCLOUD/Windows_app/SocialVideoStudio`  
+**Scope:** Full local operations platform for daily short-form social video packs, implemented as a separate Remotion/React/Node project with future optional ZWG integration
 
 ## Goal
 
@@ -18,7 +20,7 @@
 - AI 生成は **台本、字幕構成、投稿コメント、ハッシュタグ** を対象にする。
 - **AI 音声は生成しない**。
 - 出口は **Web ダッシュボード + 日付フォルダ出力** の両方にする。
-- 実装場所は **独立アプリを先に作り、後で ZWG Terminal 連携** とする。
+- 実装場所は **ZWG Terminal リポジトリ外の独立アプリ** とし、後で ZWG Terminal 連携する。
 - 毎朝 6:00 の起動は **Windows タスクスケジューラ** を使う。
 - AI provider は **OpenAI API 優先 + ローカル LLM 差し替え可能** とする。
 - X.com トレンドは **外部情報源 + ログイン済みブラウザ読み取り** の両方を使う。
@@ -35,13 +37,14 @@
 - X.com のログイン情報、Cookie、API キーなどの秘密情報をアプリ DB に保存すること。
 - ニュース記事本文や画像を権利確認なしに再配布すること。
 - ZWG Terminal 本体へ最初から深く組み込むこと。
+- ZWG Terminal リポジトリ配下に Remotion/React/Node アプリ本体を作ること。
 - 音声ナレーション生成。
 
 ## Phased Delivery
 
 ### Phase 1: Daily Generation Core
 
-独立した `apps/social-video-studio` サブプロジェクトとして、毎朝生成の中核を作る。
+ZWG Terminal とは別フォルダの `D:/NEXTCLOUD/Windows_app/SocialVideoStudio` に独立プロジェクトとして作り、毎朝生成の中核を実装する。ZWG Terminal リポジトリには、この設計書と将来連携用の仕様だけを置く。
 
 - 最低限の RSS/API collector
 - Manual override collector
@@ -82,7 +85,7 @@ Phase 1 だけではブラウザ取得や X.com 読み取りを含む本運用�
 
 ## Architecture
 
-`apps/social-video-studio` を追加し、既存 ZWG Terminal 本体とは疎結合にする。
+`D:/NEXTCLOUD/Windows_app/SocialVideoStudio` を独立した実装ルートにし、既存 ZWG Terminal 本体とは疎結合にする。ZWG Terminal との連携は Phase 3 まで実装せず、将来の起動、監視、通知リング連携も明示的な IPC または launcher 境界を通す。
 
 ### React/Vite Dashboard
 
@@ -108,7 +111,7 @@ Phase 1 だけではブラウザ取得や X.com 読み取りを含む本運用�
 
 `generate-today` は API サーバー非依存の Node CLI として動作する。Windows タスクスケジューラは UI/API サーバーを起動せず、CLI が SQLite と `exports/YYYY-MM-DD/` に直接書き込む。ダッシュボードは後から SQLite と manifest を読み、生成済み成果物を表示する。
 
-タスクスケジューラ登録時は working directory を `apps/social-video-studio` に固定し、必要なら `--env-file <path>` で明示的に env ファイルを指定できるようにする。
+タスクスケジューラ登録時は working directory を `D:/NEXTCLOUD/Windows_app/SocialVideoStudio` に固定し、必要なら `--env-file <path>` で明示的に env ファイルを指定できるようにする。
 
 ### Remotion
 
@@ -275,7 +278,7 @@ OpenAI API を優先し、ローカル LLM へ差し替え可能な interface �
 
 - X.com は読み取り専用にする。
 - 投稿、いいね、フォロー、DM、フォーム送信は自動化しない。
-- OpenAI API キーなどは `apps/social-video-studio/.env` または `--env-file` で指定したファイルから読み、Git 管理しない。
+- OpenAI API キーなどは `D:/NEXTCLOUD/Windows_app/SocialVideoStudio/.env` または `--env-file` で指定したファイルから読み、Git 管理しない。
 - `.env.example` を用意し、必須キー名と任意設定だけを記載する。
 - 起動時に必須 secret の不足を検出する。
 - OpenAI provider を使う場合は `OPENAI_API_KEY` を必須にし、ローカル LLM provider を使う場合は secret 不要で起動できるようにする。
