@@ -1122,8 +1122,8 @@ git commit -m "feat: add posting dashboard"
 ## Task 15: Add Browser and X.com Readonly Collectors
 
 **Files:**
-- Modify: `src/server/collectors/browser.ts`
-- Modify: `src/server/collectors/xReadonly.ts`
+- Create: `src/server/collectors/browser.ts`
+- Create: `src/server/collectors/xReadonly.ts`
 - Modify: `src/server/collectors/policy.ts`
 - Test: `tests/unit/collectors/browserPolicy.test.ts`
 - Test: `tests/unit/collectors/xReadonly.test.ts`
@@ -1192,6 +1192,8 @@ Expected generated task:
 - Records/displays the Windows execution user used for task registration.
 - Logs to `logs/scheduler-YYYY-MM-DD.log`.
 - Creates the log directory before writing.
+- Writes `data/schedule-manifest.json` with `TaskName`, `Time`, resolved `EnvFile`, `RunAsUser`, working directory, action command, and log path.
+- Reads the manifest back in the unit test to verify persisted values match the registered task action.
 
 - [ ] **Step 2: Run tests**
 
@@ -1203,13 +1205,20 @@ Expected: FAIL.
 
 - [ ] **Step 3: Implement scripts**
 
-`run-generate.ps1` should call:
+`run-generate.ps1` should accept an `-EnvFile` parameter with default `.env`:
 
 ```powershell
-npm run generate:today -- --env-file .env
+param(
+  [string]$EnvFile = ".env"
+)
+npm run generate:today -- --env-file $EnvFile
 ```
 
-and append stdout/stderr to `logs`. `install-schedule.ps1` should accept `-TaskName`, `-Time`, `-EnvFile`, and `-RunAsUser` parameters, echo the resolved values, and write the same values to a local schedule manifest for dashboard display.
+and append stdout/stderr to `logs`. `install-schedule.ps1` should accept `-TaskName`, `-Time`, `-EnvFile`, and `-RunAsUser` parameters, echo the resolved values, write the same values to a local schedule manifest for dashboard display, and register the task action as:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\run-generate.ps1 -EnvFile "<resolved-env-file>"
+```
 
 - [ ] **Step 4: Run tests**
 
