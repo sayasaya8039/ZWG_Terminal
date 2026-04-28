@@ -43,6 +43,8 @@
 
 独立した `apps/social-video-studio` サブプロジェクトとして、毎朝生成の中核を作る。
 
+- 最低限の RSS/API collector
+- Manual override collector
 - Remotion による 9:16 共通動画生成
 - SNS 別コメントとハッシュタグ生成
 - SQLite 保存
@@ -50,6 +52,8 @@
 - React/Vite ダッシュボード
 - Windows タスクスケジューラから呼べる `generate-today` CLI
 - 手動実行ボタン
+
+Phase 1 だけではブラウザ取得や X.com 読み取りを含む本運用要件は満たさない。Phase 1 は「RSS/API と手動差し込みで 10 本生成できる内部 alpha」とし、ユーザー承認済み MVP は Phase 1 と Phase 2 の基礎範囲を合わせて満たす。
 
 ### Phase 2: Collection and Trust
 
@@ -102,6 +106,10 @@
 - `schedule:install`: Windows タスクスケジューラ登録
 - `schedule:run`: 手動検証用に同じ生成ジョブを実行
 
+`generate-today` は API サーバー非依存の Node CLI として動作する。Windows タスクスケジューラは UI/API サーバーを起動せず、CLI が SQLite と `exports/YYYY-MM-DD/` に直接書き込む。ダッシュボードは後から SQLite と manifest を読み、生成済み成果物を表示する。
+
+タスクスケジューラ登録時は working directory を `apps/social-video-studio` に固定し、必要なら `--env-file <path>` で明示的に env ファイルを指定できるようにする。
+
 ### Remotion
 
 音声なしのショート動画を生成する。
@@ -130,6 +138,28 @@ collector はプラグイン式に分け、1 つ失敗しても全体を止め�
 - X.com readonly collector
 - Manual override collector
 
+collector 共通ポリシー:
+
+- RSS/API と公式公開ページを優先する。
+- robots.txt、サイト利用規約、公開 API の rate limit に従う。
+- ログイン回避、CAPTCHA 回避、ペイウォール回避、アクセス制限回避は行わない。
+- 取得頻度は source ごとに設定し、既定では毎朝 1 回の生成ジョブ内に制限する。
+- 保存対象は title、URL、公開日時、短い抜粋、構造化メタデータ、画像候補メタデータに限定する。
+- 記事本文の丸ごと保存や再配布をしない。
+- 生 HTML や取得本文のキャッシュはデバッグ用の短期保持に限定し、既定保持期間は 30 日以内にする。
+- 取得不可、利用規約不明、robots.txt で拒否、rate limit 到達の場合は該当 source を skipped とし、他 source と manual override にフォールバックする。
+
+### X.com Readonly Policy
+
+X.com collector は補助情報源として扱う。外部情報源で候補を作り、ログイン済みブラウザ読み取りはトレンド確認と補強に限定する。
+
+- 読み取り専用にし、投稿、いいね、フォロー、DM、フォーム送信、通知操作はしない。
+- アプリは X.com のユーザー名、パスワード、Cookie、セッション情報を保存しない。
+- ブラウザプロファイルはユーザー管理とし、アプリは認証情報へ直接アクセスしない。
+- ログイン壁、CAPTCHA、警告画面、アカウント制限表示、明示的な取得禁止、異常な rate limit を検出した場合は即座に X.com collector を停止する。
+- 停止時は外部情報源と manual override にフォールバックし、UI に「X.com 要確認」と表示する。
+- X.com 由来データは trend label、表示テキスト、参照 URL、取得時刻、取得方式だけを保存し、画面全文や個人情報を広く保存しない。
+
 ### AI Provider Layer
 
 OpenAI API を優先し、ローカル LLM へ差し替え可能な interface にする。
@@ -143,15 +173,16 @@ OpenAI API を優先し、ローカル LLM へ差し替え可能な interface �
 ## Data Flow
 
 1. Windows タスクスケジューラが毎朝 6:00 に `generate-today` を起動する。
-2. collectors が候補を集める。
-3. 候補を共通形式へ正規化する。
-4. 鮮度、話題性、カテゴリ最低枠、重複、出典信頼度、画像利用可否をスコアリングする。
-5. 各カテゴリ最低 1 本を確保し、残り枠を話題性スコアで埋めて 10 本を選ぶ。
-6. AI provider が動画用テキスト、字幕構成、SNS 別コメント、ハッシュタグを生成する。
-7. Remotion が 10 本の共通 9:16 動画を生成する。
-8. 信頼度が高いものは投稿パック入り、低いものは要確認にする。
-9. SQLite に履歴を保存し、`exports/YYYY-MM-DD/` にファイルを出力する。
-10. ダッシュボードで当日分を確認し、コピー、再生成、投稿済み管理を行う。
+2. `generate-today` が env、設定、SQLite 接続、出力先を初期化する。
+3. collectors が候補を集める。Phase 1 では RSS/API と manual override、MVP 完了時点では RSS/API、公式ページ、ブラウザ取得、X.com 読み取りを含める。
+4. 候補を共通形式へ正規化する。
+5. 鮮度、話題性、カテゴリ最低枠、重複、出典信頼度、画像利用可否をスコアリングする。
+6. 各カテゴリ最低 1 本を確保し、残り枠を話題性スコアで埋めて 10 本を選ぶ。
+7. AI provider が動画用テキスト、字幕構成、SNS 別コメント、ハッシュタグを生成する。
+8. Remotion が 10 本の共通 9:16 動画を生成する。
+9. 信頼度が高いものは投稿パック入り、低いものは要確認にする。
+10. SQLite に履歴を保存し、`exports/YYYY-MM-DD/` にファイルを出力する。
+11. ダッシュボードで当日分を確認し、コピー、再生成、投稿済み管理を行う。
 
 ## Candidate Selection
 
@@ -185,6 +216,18 @@ OpenAI API を優先し、ローカル LLM へ差し替え可能な interface �
 - 保存したくなる短い CTA
 
 ニュース、AI/LLM、X.com トレンドはテキスト中心にし、権利が不明な記事画像は使わない。商品系は公式画像が取得でき、利用条件が許容できる場合だけ差し込む。
+
+画像候補ごとに最低限次の情報を保存する。
+
+- `sourceUrl`
+- `sourcePublisher`
+- `licenseStatus`: `allowed` / `unknown` / `restricted`
+- `usageDecision`: `embed` / `metadata-only` / `reject`
+- `requiresReview`
+- `downloadedAt`
+- `localPath`
+
+`licenseStatus` が `unknown` または `restricted` の画像は動画へ埋め込まない。`requiresReview` が true の場合は、動画を投稿パックに入れても UI 上では要確認として表示する。
 
 ## Dashboard UX
 
@@ -232,8 +275,11 @@ OpenAI API を優先し、ローカル LLM へ差し替え可能な interface �
 
 - X.com は読み取り専用にする。
 - 投稿、いいね、フォロー、DM、フォーム送信は自動化しない。
-- OpenAI API キーなどは `.env` に置き、Git 管理しない。
+- OpenAI API キーなどは `apps/social-video-studio/.env` または `--env-file` で指定したファイルから読み、Git 管理しない。
+- `.env.example` を用意し、必須キー名と任意設定だけを記載する。
 - 起動時に必須 secret の不足を検出する。
+- OpenAI provider を使う場合は `OPENAI_API_KEY` を必須にし、ローカル LLM provider を使う場合は secret 不要で起動できるようにする。
+- Windows タスクスケジューラ登録時は実行ユーザー、working directory、env file path、ログ出力先を明示する。
 - API キー、Cookie、認証情報をログに出さない。
 - 各動画に出典 URL と画像利用状態を保存する。
 - ニュース系画像は原則使わず、テキスト中心にする。
@@ -298,6 +344,4 @@ OpenAI API を優先し、ローカル LLM へ差し替え可能な interface �
 - ブラウザ取得に使う実行基盤。
 - OpenAI のモデル初期値。
 - ローカル LLM の初期対応範囲。
-- 商品画像の利用可否判定ルールの細部。
 - ZWG Terminal との通知リング連携を Phase 3 のどこで扱うか。
-
