@@ -187,11 +187,13 @@ Use npm scripts:
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "api": "tsx src/server/api/server.ts",
+    "serve": "tsx src/server/cli.ts serve",
     "generate:today": "tsx src/server/cli.ts generate-today",
     "schedule:run": "powershell -ExecutionPolicy Bypass -File scripts/run-generate.ps1",
     "schedule:install": "powershell -ExecutionPolicy Bypass -File scripts/install-schedule.ps1",
     "remotion:studio": "remotion studio src/remotion/index.ts",
     "remotion:still": "remotion still src/remotion/index.ts BriefingVideo out/still.png --frame=30 --scale=0.25",
+    "remotion:sample": "remotion render src/remotion/index.ts BriefingVideo out/sample.mp4 --frames=0-90 --scale=0.25",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
@@ -494,19 +496,22 @@ git add src/server/db tests/integration/db
 git commit -m "feat: add sqlite persistence"
 ```
 
-## Task 5: Implement Collector Policy, Manual Collector, and RSS Collector
+## Task 5: Implement Collector Policy, Manual Collector, RSS Collector, and Official Page Collector
 
 **Files:**
 - Create: `src/server/collectors/types.ts`
 - Create: `src/server/collectors/policy.ts`
 - Create: `src/server/collectors/manual.ts`
 - Create: `src/server/collectors/rss.ts`
+- Create: `src/server/collectors/officialPage.ts`
 - Create: `src/server/collectors/index.ts`
 - Create: `tests/fixtures/manual-overrides.json`
 - Create: `tests/fixtures/rss/ai.xml`
+- Create: `tests/fixtures/html/convenience-new-items.html`
 - Test: `tests/unit/collectors/policy.test.ts`
 - Test: `tests/unit/collectors/manual.test.ts`
 - Test: `tests/unit/collectors/rss.test.ts`
+- Test: `tests/unit/collectors/officialPage.test.ts`
 
 - [ ] **Step 1: Write failing collector policy tests**
 
@@ -516,9 +521,10 @@ Cover:
 - Marks unknown terms as `requiresReview`.
 - Applies per-source once-per-job default.
 
-- [ ] **Step 2: Write failing manual and RSS tests**
+- [ ] **Step 2: Write failing manual, RSS, and official-page tests**
 
 Manual collector should convert JSON items into canonical candidates. RSS collector should parse fixture XML without network.
+Official-page collector should parse a local HTML fixture, apply source policy, extract title, URL, published date when present, and product image metadata without downloading remote images.
 
 - [ ] **Step 3: Run tests**
 
@@ -546,9 +552,10 @@ export interface Collector {
 }
 ```
 
-- [ ] **Step 5: Implement manual and RSS collectors**
+- [ ] **Step 5: Implement manual, RSS, and official-page collectors**
 
 Use fixtures in tests. Do not perform live network calls in unit tests.
+Official-page collector must not bypass robots.txt or terms policy. It should accept a source config with explicit selectors and return skipped results if the source is not allowed.
 
 - [ ] **Step 6: Run tests**
 
@@ -562,7 +569,7 @@ Expected: PASS.
 
 ```powershell
 git add src/server/collectors tests/fixtures tests/unit/collectors
-git commit -m "feat: add manual and rss collectors"
+git commit -m "feat: add source collectors"
 ```
 
 ## Task 6: Implement Scoring, Deduplication, and Selection
@@ -857,17 +864,19 @@ Do not commit generated `out/still.png`.
 
 **Files:**
 - Create: `src/remotion/render/renderVideo.ts`
+- Create: `src/remotion/render/renderSample.ts`
 - Modify: `src/server/db/repositories/packs.ts`
 - Test: `tests/integration/remotion/renderStill.test.ts`
+- Test: `tests/integration/remotion/renderSample.test.ts`
 
 - [ ] **Step 1: Write failing render service test**
 
-Test should render one low-scale still or verify render command wiring with a fake renderer if CI is too slow.
+Test should render one low-scale still and one short low-scale mp4 sample with a long headline fixture. Fake renderer wiring is allowed only for `generate-today` job tests, not for this render smoke test.
 
 - [ ] **Step 2: Run test**
 
 ```powershell
-npm test -- tests/integration/remotion/renderStill.test.ts
+npm test -- tests/integration/remotion/renderStill.test.ts tests/integration/remotion/renderSample.test.ts
 ```
 
 Expected: FAIL.
@@ -875,6 +884,7 @@ Expected: FAIL.
 - [ ] **Step 3: Implement render wrapper**
 
 Use `@remotion/renderer` from server-side code. Render one item at a time and record failures per pack.
+The sample render path must render frames `0-90` at `scale=0.25` and fail if output is missing or zero bytes.
 
 - [ ] **Step 4: Run still verification**
 
@@ -884,7 +894,15 @@ npm run remotion:still
 
 Expected: PASS and visually inspect the still.
 
-- [ ] **Step 5: Commit**
+- [ ] **Step 5: Run short mp4 render verification**
+
+```powershell
+npm run remotion:sample
+```
+
+Expected: `out/sample.mp4` exists, is nonzero, and the long headline remains inside the frame.
+
+- [ ] **Step 6: Commit**
 
 ```powershell
 git add src/remotion/render src/server/db/repositories tests/integration/remotion
@@ -944,6 +962,14 @@ Support:
 npm run generate:today -- --date 2026-04-29 --env-file .env
 ```
 
+Also support:
+
+```powershell
+npm run serve -- --host 127.0.0.1 --port 4173 --env-file .env
+```
+
+`serve` must start the local API server and serve the built dashboard assets when they exist. In development, `npm run api` plus `npm run dev` is allowed, but `serve` is the production/local operations command documented for users.
+
 - [ ] **Step 5: Run tests**
 
 ```powershell
@@ -976,8 +1002,13 @@ git commit -m "feat: add daily generation cli"
 - Create: `src/server/api/routes/packs.ts`
 - Create: `src/server/api/routes/settings.ts`
 - Create: `src/server/api/routes/regenerate.ts`
+- Create: `src/server/api/routes/generate.ts`
+- Create: `src/server/api/routes/candidates.ts`
 - Test: `tests/integration/api/today.test.ts`
 - Test: `tests/integration/api/settings.test.ts`
+- Test: `tests/integration/api/regenerate.test.ts`
+- Test: `tests/integration/api/generate.test.ts`
+- Test: `tests/integration/api/candidates.test.ts`
 
 - [ ] **Step 1: Write failing API tests**
 
@@ -986,6 +1017,9 @@ Expected:
 - `GET /api/today?date=2026-04-29` returns 10 packs.
 - `POST /api/packs/:id/posting-status` marks a pack posted.
 - `POST /api/regenerate/comment` regenerates comment only through fake provider.
+- `POST /api/regenerate/video` queues or runs video regeneration for one pack.
+- `POST /api/candidates/:packId/replace` replaces one selected candidate and regenerates related text/render state.
+- `POST /api/generate/today` triggers the same generation path as CLI for manual dashboard execution.
 
 - [ ] **Step 2: Run tests**
 
@@ -998,6 +1032,7 @@ Expected: FAIL.
 - [ ] **Step 3: Implement Express app factory**
 
 Do not bind a port during tests. Export `createServer()`.
+All manual execution endpoints must be local-only and must reject concurrent generation jobs with a clear 409 response.
 
 - [ ] **Step 4: Run tests**
 
@@ -1037,6 +1072,9 @@ Cover:
 - Low-trust item displays review reason.
 - SNS copy buttons render for all four SNS targets.
 - Posted checkbox calls API client.
+- Manual "generate today" button calls `POST /api/generate/today` and shows running/success/error states.
+- Detail page exposes comment regeneration, video regeneration, and candidate replacement actions.
+- Candidate replacement UI shows available alternatives and requires confirmation before replacing.
 
 - [ ] **Step 2: Run tests**
 
@@ -1056,6 +1094,7 @@ Design rules:
 - Icons from `lucide-react`.
 - No nested cards.
 - Buttons use icons where obvious.
+- Long labels must wrap without resizing fixed toolbars or action rows.
 
 - [ ] **Step 4: Run component tests**
 
@@ -1149,7 +1188,10 @@ Expected generated task:
 - Time: 06:00
 - Working directory: `D:\NEXTCLOUD\Windows_app\SocialVideoStudio`
 - Command: `powershell -ExecutionPolicy Bypass -File scripts\run-generate.ps1`
+- Includes `--env-file .env` by default, or a custom env file when passed.
+- Records/displays the Windows execution user used for task registration.
 - Logs to `logs/scheduler-YYYY-MM-DD.log`.
+- Creates the log directory before writing.
 
 - [ ] **Step 2: Run tests**
 
@@ -1167,7 +1209,7 @@ Expected: FAIL.
 npm run generate:today -- --env-file .env
 ```
 
-and append stdout/stderr to `logs`.
+and append stdout/stderr to `logs`. `install-schedule.ps1` should accept `-TaskName`, `-Time`, `-EnvFile`, and `-RunAsUser` parameters, echo the resolved values, and write the same values to a local schedule manifest for dashboard display.
 
 - [ ] **Step 4: Run tests**
 
@@ -1213,6 +1255,9 @@ Flow:
 6. Copy X text.
 7. Mark posted.
 8. Trigger comment regeneration.
+9. Trigger video regeneration and verify render status changes.
+10. Replace a candidate and verify the detail page reflects the new source/title.
+11. Click the manual generate button and verify the UI shows the generation job state.
 
 - [ ] **Step 2: Run E2E test**
 
@@ -1281,6 +1326,7 @@ npm run typecheck
 npm test
 npm run build
 npm run remotion:still
+npm run remotion:sample
 npm run schedule:run
 ```
 
@@ -1362,6 +1408,7 @@ npm run typecheck
 npm test
 npm run build
 npm run remotion:still
+npm run remotion:sample
 npm run schedule:run
 npm run test:e2e
 ```
@@ -1374,4 +1421,5 @@ Also verify:
 - X.com collector is disabled by default.
 - Browser collectors are disabled by default.
 - Fake provider can create a full 10-item export without secrets.
-
+- `serve` starts the local operational app without relying on the Vite dev server.
+- Short mp4 sample render passes with a long headline fixture.
