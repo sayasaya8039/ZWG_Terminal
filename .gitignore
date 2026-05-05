@@ -27,3 +27,9 @@ tmp_*.png
 
 # vendor/ghostty is a git submodule, do not ignore
 pix-captures/
+.aider*
+
+# Beads / Dolt files (added by bd init)
+.dolt/
+*.db
+.beads-credential-key

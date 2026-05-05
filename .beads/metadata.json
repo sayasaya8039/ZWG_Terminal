@@ -1,0 +1,7 @@
+{
+  "database": "dolt",
+  "backend": "dolt",
+  "dolt_mode": "embedded",
+  "dolt_database": "ZWG_Terminal",
+  "project_id": "411beaeb-0661-4c3c-9401-f7657e1364b2"
+}
