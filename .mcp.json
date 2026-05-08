@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "codex-app-server": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "mcp/codex-app-server/server.mjs"
+      ]
+    },
+    "higgsfield": {
+      "type": "http",
+      "url": "https://mcp.higgsfield.ai/mcp"
+    }
+  }
+}
