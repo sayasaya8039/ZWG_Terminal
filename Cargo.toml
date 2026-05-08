@@ -1,7 +1,6 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/note-writing-command-center",
     "crates/zwg-app",
     "crates/zwg-intelligence",
     "crates/ghostty-vt",
@@ -10,7 +9,7 @@ members = [
 exclude = ["conpty_test"]
 
 [workspace.package]
-version = "1.4.1"
+version = "1.4.0"
 edition = "2024"
 authors = ["ZWG Terminal contributors"]
 license = "MIT"
@@ -31,7 +30,6 @@ libc = "0.2"
 mimalloc = { version = "0.1", default-features = false }
 unicode-width = "0.2"
 ort = { version = "2.0.0-rc.12", features = ["directml"] }
-eframe = "0.33"
 
 [workspace.dependencies.windows]
 version = "0.61"

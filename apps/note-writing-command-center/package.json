@@ -1,0 +1,31 @@
+{
+  "name": "note-writing-command-center",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Windows desktop dashboard for planning, drafting, reviewing, and preparing note articles with Codex app-server assistance.",
+  "main": "dist-electron/electron/main.js",
+  "scripts": {
+    "dev": "vite --host 127.0.0.1",
+    "typecheck": "node node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "build:renderer": "node scripts/build-renderer.mjs",
+    "build:electron": "node node_modules/typescript/bin/tsc -p electron/tsconfig.json",
+    "build": "npm run typecheck && npm run build:renderer && npm run build:electron",
+    "start": "npm run build && electron .",
+    "test": "node node_modules/vitest/vitest.mjs run"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.17",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^42.0.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3",
+    "vitest": "^4.1.5"
+  }
+}
