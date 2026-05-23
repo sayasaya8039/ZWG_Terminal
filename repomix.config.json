@@ -1,0 +1,36 @@
+{
+  "output": {
+    "filePath": "repomix-output.txt",
+    "style": "xml",
+    "parsable": true
+  },
+  "ignore": {
+    "customPatterns": [
+      "**/target/**",
+      "**/.beads/**",
+      "**/.git/**",
+      "**/vendor/**",
+      "**/.aider.tags.cache.v4/**",
+      "**/*.png",
+      "**/*.jpg",
+      "**/*.ico",
+      "**/*.dll",
+      "**/*.pdb",
+      "**/*.exe",
+      "**/*.rlib",
+      "**/*.d",
+      "**/ime-debug.log",
+      "**/ime-test-log.txt",
+      "**/.beads",
+      "**/.cargo/**",
+      "**/.superpowers/**",
+      "**/.codex-temp/**",
+      "**/.antigravitycli/**",
+      "**/.tmp_*",
+      "**/tmp_*",
+      "**/node_modules/**"
+    ],
+    "useGitignore": true,
+    "useDefaultPatterns": true
+  }
+}
